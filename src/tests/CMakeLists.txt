@@ -28,6 +28,7 @@ add_executable(tests
     core/nx2_debug_server.cpp
     core/nx2_movie_pacing.cpp
     core/nx2_gpu_memory_registry.cpp
+    core/page_tracker.cpp
     core/priority_queue.cpp
     core/internal_network/network.cpp
     video_core/frame_dump_schedule.cpp

@@ -1216,6 +1216,10 @@ add_library(core STATIC
     memory/dmnt_cheat_types.h
     memory/dmnt_cheat_vm.cpp
     memory/dmnt_cheat_vm.h
+    memory/page_tracker.h
+    memory/page_tracker_state.cpp
+    memory/page_tracker_state.h
+    memory/read_traps.h
     perf_stats.cpp
     perf_stats.h
     reporter.cpp
