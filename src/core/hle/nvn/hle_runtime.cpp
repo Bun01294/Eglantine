@@ -28,6 +28,7 @@
 #include "core/hle/nvn/function_table.h"
 #include "core/hle/nvn/hle_runtime.h"
 #include "core/memory.h"
+#include "core/memory/page_tracker.h"
 #include "video_core/gpu.h"
 #include "video_core/nvn/sink.h"
 #include "video_core/nvn/timestamp_mode.h"
@@ -76,15 +77,43 @@ public:
     }
     bool Write(u64 va, const void* src, size_t size) override {
         return !stopped.load(std::memory_order_relaxed) &&
-               memory.WriteBlockUnsafe(va, src, size);
+               memory.WriteBlockUntracked(va, src, size);
     }
     u8* Pointer(u64 va) override {
         return stopped.load(std::memory_order_relaxed) ? nullptr : memory.GetPointerSilent(va);
     }
 
-    // No guest CPU write tracking (GuestMemory's defaults): Eglantine's memory has no page
-    // tracker, so the replay keeps device copies of guest memory in guest memory and does not use
-    // the guarded write-back merge.
+    u64 Track(u64 va, u64 size) override {
+        return stopped.load(std::memory_order_relaxed) ? 0
+                                                       : memory.PageTracker().Register(va, size, false);
+    }
+    void Untrack(u64 id) override {
+        memory.PageTracker().Unregister(id);
+    }
+    void Arm(u64 id, u64 va, u64 size) override {
+        memory.PageTracker().Arm(id, va, size);
+    }
+    void TakeWritten(u64 id, u64 va, u64 size, std::vector<std::pair<u64, u64>>& runs) override {
+        memory.PageTracker().CollectDirty(id, va, size, runs);
+    }
+    bool AnyWritten(u64 id, u64 va, u64 size) override {
+        return memory.PageTracker().AnyDirty(id, va, size);
+    }
+    std::shared_ptr<const std::atomic<u64>> WriteEpoch(u64 id) override {
+        return memory.PageTracker().WriteEpoch(id);
+    }
+    bool SupportsAccessTraps() const override {
+        return true;
+    }
+    void SetAccessCallback(u64 id, std::function<void(u64 va, u64 size)> callback) override {
+        memory.PageTracker().SetAccessCallback(id, std::move(callback));
+    }
+    void ArmAccessTrap(u64 id, u64 va, u64 size) override {
+        memory.PageTracker().ArmAccessTrap(id, va, size);
+    }
+    void DisarmAccessTrap(u64 id, u64 va, u64 size) override {
+        memory.PageTracker().DisarmAccessTrap(id, va, size);
+    }
 
 private:
     Core::Memory::Memory& memory;

@@ -44,6 +44,10 @@ emulated GPU.
   Vulkan command buffers and presents through the renderer's present manager. The game's compiled
   shaders are lowered by Eglantine's Ampere frontend and translated by the shader recompiler, with
   untracked global memory reached through buffer device addresses.
+- **Page tracker** (`src/core/memory/page_tracker*`): which guest pages the CPU wrote since the
+  replay took their contents, and traps on the next CPU access for the lazy write-back of GPU
+  results. VTX-HLE turns it on when it hooks a game; with the emulated GPU it stays off and
+  tracks nothing.
 
 The design is documented for developers in
 [`src/video_core/renderer_vulkan/nvn/DESIGN.md`](../src/video_core/renderer_vulkan/nvn/DESIGN.md).
@@ -59,8 +63,6 @@ does not have:
   post-processing) on the replay's frames: the replay presents with its plain blit. These settings
   are greyed out while VTX-HLE is selected.
 - HDR output.
-- The CPU page tracker: device copies of guest memory stay in guest memory and the guarded
-  write-back is not used (the replay's documented fallback).
 - FUKKO's performance HUD, GPU command capture, native shader registry and MCP tools.
 
 ## Credits

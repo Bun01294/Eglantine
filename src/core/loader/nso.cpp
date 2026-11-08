@@ -386,6 +386,8 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
             Core::NvnHle::Bridge::Instance().SetHle(choice.hle);
             if (choice.hle) {
                 Core::NvnHle::Hle::RegisterAll(Core::NvnHle::Bridge::Instance());
+                // VTX-HLE's pool mirrors track guest writes; turned on before the game runs.
+                process.GetMemory().EnablePageTracker();
             }
             Core::NvnHle::Bridge::Instance().PrepareSdk(
                 {std::span{codeset.memory}, nvn_region_offset, load_base,
