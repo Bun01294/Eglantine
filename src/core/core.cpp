@@ -119,8 +119,6 @@ FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
     return vfs->OpenFile(path, FileSys::OpenMode::Read);
 }
 
-namespace {
-
 // Detect the platform before initializing the kernel memory layout and guest clock.
 bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id, std::size_t program_index) {
     FileSys::ProgramMetadata metadata;
@@ -163,8 +161,6 @@ bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id, std::siz
     return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
            metadata.IsSwitch2();
 }
-
-} // namespace
 
 struct System::Impl {
     explicit Impl(System& system)

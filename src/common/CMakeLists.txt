@@ -111,6 +111,8 @@ add_library(
     settings_input.cpp
     settings_input.h
     settings_setting.h
+    vtx_hle_settings.cpp
+    vtx_hle_settings.h
     frame_stats.cpp
     frame_stats.h
     diag_request.cpp

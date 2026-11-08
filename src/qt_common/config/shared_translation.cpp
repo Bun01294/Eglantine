@@ -140,6 +140,27 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Changes the output graphics API.\nVulkan is recommended."));
     INSERT(Settings, vulkan_device, tr("Device:"),
            tr("This setting selects the GPU to use (Vulkan only)."));
+    INSERT(Settings, graphics_path, tr("Graphics path:"),
+           tr("Selects how Switch 2 games' graphics run.\n"
+              "Emulated GPU (the default) emulates the console's GPU instruction by instruction.\n"
+              "VTX-HLE (NVN) replays the game's own NVN graphics calls directly on Vulkan: much "
+              "faster in the games it supports, but it does not apply every graphics setting "
+              "(those are greyed out while it is selected).\n"
+              "Switch 1 games, games without NVN and Vulkan devices that cannot run VTX-HLE always "
+              "use the emulated GPU. Takes effect at the next game start."));
+    INSERT(Settings, nvn_in_pass_queries, tr("Occlusion queries inside render passes"),
+           tr("Keeps the game's occlusion queries inside the GPU's render passes instead of ending "
+              "the pass at each result: faster GPU work in games that use many occlusion queries, "
+              "same picture. VTX-HLE only. Takes effect at the next game start."));
+    INSERT(Settings, nvn_pipeline_library,
+           tr("Fast-linked pipelines (no skipped draws while compiling)"),
+           tr("Draws whose shaders are still compiling use a quickly linked pipeline instead of "
+              "being skipped: less pop-in and stutter in new areas, still under test. VTX-HLE "
+              "only. Takes effect at the next game start."));
+    INSERT(Settings, nvn_sync_diet, tr("Fewer GPU syncs between render passes"),
+           tr("Drops the two full GPU syncs each render pass carried at its start and end; the one "
+              "barrier between passes stays, so the picture is the same. Slightly less GPU time per "
+              "frame. VTX-HLE only. Takes effect at the next game start."));
     INSERT(Settings, resolution_setup, tr("Resolution:"),
            tr("Forces to render at a different resolution.\n"
               "Higher resolutions require more VRAM and bandwidth.\n"
@@ -498,6 +519,11 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
              PAIR(ResolutionSetup, Res7X, tr("7X (5040p/7560p)")),
              PAIR(ResolutionSetup, Res8X, tr("8X (5760p/8640p)")),
          }});
+    translations->insert({Settings::EnumMetadata<Settings::GraphicsPath>::Index(),
+                          {
+                              PAIR(GraphicsPath, Hle, tr("VTX-HLE (NVN)")),
+                              PAIR(GraphicsPath, Emulated, tr("Emulated GPU")),
+                          }});
     translations->insert({Settings::EnumMetadata<Settings::FrameGenType>::Index(),
                           {
                               PAIR(FrameGenType, Lsfg, tr("Lossless Scaling (LSFG)")),

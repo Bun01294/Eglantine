@@ -4,7 +4,9 @@
 // SPDX-FileCopyrightText: 2016 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <functional>
+#include <map>
 #include <vector>
 #include <QBoxLayout>
 #include <QCheckBox>
@@ -37,6 +39,7 @@
 #include "yuzu/configuration/configure_graphics.h"
 #include "yuzu/configuration/nvidia_dlss_panel.h"
 #include "yuzu/configuration/shared_widget.h"
+#include "yuzu/configuration/vtx_hle_grey.h"
 
 #ifdef HAS_RESHADE
 #include "yuzu/configuration/configure_post_processing.h"
@@ -53,6 +56,7 @@ ConfigureGraphics::ConfigureGraphics(
       records{records_}, expose_compute_option{expose_compute_option_},
       update_aspect_ratio{update_aspect_ratio_}, system{system_},
       combobox_translations{builder.ComboboxTranslations()} {
+    vtx_hle = &builder.VtxHle();
     vulkan_device = Settings::values.vulkan_device.GetValue();
     RetrieveVulkanDevices();
 
@@ -206,6 +210,12 @@ void ConfigureGraphics::UpdateDeviceSelection(int device) {
 
 ConfigureGraphics::~ConfigureGraphics() = default;
 
+void ConfigureGraphics::showEvent(QShowEvent* event) {
+    // A running game's path settles a moment after its boot.
+    vtx_hle->Refresh();
+    QWidget::showEvent(event);
+}
+
 void ConfigureGraphics::SetConfiguration() {}
 
 void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
@@ -220,6 +230,14 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     std::map<u32, QWidget*> hold_graphics;
     std::vector<QWidget*> hold_api;
     QCheckBox* frame_gen_checkbox = nullptr;
+    // The 'Graphics path' group: the path and VTX-HLE's own options.
+    std::map<u32, ConfigurationShared::Widget*> hold_path;
+    const auto is_path_setting = [](u32 id) {
+        return id == Settings::values.graphics_path.Id() ||
+               id == Settings::values.nvn_in_pass_queries.Id() ||
+               id == Settings::values.nvn_pipeline_library.Id() ||
+               id == Settings::values.nvn_sync_diet.Id();
+    };
 
     for (const auto setting : Settings::values.linkage.by_category[Settings::Category::Renderer]) {
 #ifndef HAS_RESHADE
@@ -347,8 +365,49 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         } else if (setting->Id() == Settings::values.frame_gen.Id()) {
             frame_gen_checkbox = widget->checkbox;
             hold_graphics.emplace(setting->Id(), widget);
+        } else if (is_path_setting(setting->Id())) {
+            hold_path.emplace(setting->Id(), widget);
         } else {
             hold_graphics.emplace(setting->Id(), widget);
+        }
+    }
+
+    {
+        QLayout& path_layout = *ui->graphics_path_widget->layout();
+        for (const auto& [id, widget] : hold_path) {
+            path_layout.addWidget(widget);
+        }
+        // VTX-HLE's options only show while it is selected (hidden rather than disabled: a
+        // disabled widget would read as using the global value).
+        const auto path_it = hold_path.find(Settings::values.graphics_path.Id());
+        QComboBox* const path_box = path_it != hold_path.end() ? path_it->second->combobox : nullptr;
+        if (path_box != nullptr) {
+            const auto find_path_widget = [&](const Settings::BasicSetting& setting) -> QWidget* {
+                const auto it = hold_path.find(setting.Id());
+                return it != hold_path.end() ? it->second : nullptr;
+            };
+            const std::array<QWidget*, 3> hle_only{
+                find_path_widget(Settings::values.nvn_in_pass_queries),
+                find_path_widget(Settings::values.nvn_pipeline_library),
+                find_path_widget(Settings::values.nvn_sync_diet)};
+            const auto update_path_options = [path_box, hle_only]() {
+                const bool hle = static_cast<Settings::GraphicsPath>(
+                                     path_box->currentData().toUInt()) ==
+                                 Settings::GraphicsPath::Hle;
+                for (QWidget* const widget : hle_only) {
+                    if (widget != nullptr) {
+                        widget->setVisible(hle);
+                    }
+                }
+            };
+            connect(path_box, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+                    [update_path_options](int) { update_path_options(); });
+            update_path_options();
+            // The settings VTX-HLE does not apply grey out while the dropdown says VTX-HLE (and
+            // no running game decides otherwise); every tab shares the Builder's VtxHleGrey.
+            path_combobox = path_box;
+            connect(path_box, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+                    [this](int) { UpdateVtxHle(); });
         }
     }
 
@@ -517,6 +576,18 @@ void ConfigureGraphics::UpdateAPILayout() {
     if (is_vulkan && int(vulkan_device) < vulkan_device_combobox->count()) {
         vulkan_device_combobox->setCurrentIndex(vulkan_device);
     }
+
+    UpdateVtxHle();
+}
+
+void ConfigureGraphics::UpdateVtxHle() {
+    // The Advanced and Extensions tabs follow the same way: the Builder's greying is shared.
+    if (path_combobox == nullptr) {
+        return;
+    }
+    vtx_hle->SetPathSelection(
+        static_cast<Settings::GraphicsPath>(path_combobox->currentData().toUInt()),
+        GetCurrentGraphicsBackend() == Settings::RendererBackend::Vulkan);
 }
 
 void ConfigureGraphics::RetrieveVulkanDevices() {

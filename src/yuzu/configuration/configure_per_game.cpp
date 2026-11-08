@@ -43,6 +43,7 @@
 #include "yuzu/configuration/configure_input_per_game.h"
 #include "yuzu/configuration/configure_network.h"
 #include "yuzu/configuration/configure_per_game.h"
+#include "yuzu/configuration/vtx_hle_grey.h"
 #include "yuzu/configuration/configure_per_game_addons.h"
 #include "yuzu/configuration/configure_system.h"
 #include "yuzu/util/util.h"
@@ -145,6 +146,12 @@ void ConfigurePerGame::HandleApplyButtonClicked() {
 
 void ConfigurePerGame::LoadFromFile(FileSys::VirtualFile file_) {
     file = std::move(file_);
+    // Which graphics path the game gets decides what the Graphics pages grey out: VTX-HLE only
+    // exists for Switch 2 programs, and a running game keeps the path it started on.
+    ConfigurationShared::VtxHleGrey& vtx_hle = builder->VtxHle();
+    vtx_hle.SetSwitch2Program(Core::IsSwitch2Program(file, title_id, 0));
+    vtx_hle.SetTargetIsRunningGame(system.IsPoweredOn() &&
+                                   title_id == system.GetApplicationProcessProgramID());
     LoadConfiguration();
 }
 
