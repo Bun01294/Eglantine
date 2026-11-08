@@ -348,6 +348,17 @@ public:
         IAdd, SMin, UMin, SMax, UMax, Inc, Dec, And, Or, Xor, Exchange, AddF32, Count,
     };
     std::array<Id, static_cast<size_t>(GlobalAtomic::Count)> global_atomic_funcs{};
+    /// VTX-HLE raw global memory: the load/write_global_func_* above and the atomics go through
+    /// PhysicalStorageBuffer64 pointers (see DefineRawGlobalMemoryFunctions).
+    /// `raw_global_atomic_funcs[opcode - GlobalAtomicIAdd32]` is the function
+    /// `result(guest address, value)` defined for each GlobalAtomic* opcode the program uses
+    /// (Info::global_atomics); invalid for the ones with no definition.
+    static constexpr size_t NUM_GLOBAL_ATOMICS{static_cast<size_t>(IR::Opcode::GlobalAtomicMaxF32x2) -
+                                               static_cast<size_t>(IR::Opcode::GlobalAtomicIAdd32) + 1};
+    std::array<Id, NUM_GLOBAL_ATOMICS> raw_global_atomic_funcs{};
+    bool raw_global_memory{};
+    /// void(aligned guest word address, value, bit offset, bit count): a 8/16-bit raw store.
+    Id raw_global_subword_write_func{};
 
     bool need_input_position_indirect{};
     Id input_position{};
@@ -428,6 +439,7 @@ private:
     void DefineAttributeMemAccess(const Info& info);
     void DefineWriteStorageCasLoopFunction(const Info& info);
     void DefineGlobalMemoryFunctions(const IR::Program& program);
+    void DefineRawGlobalMemoryFunctions(const Info& info);
     void DefineRescalingInput(const Info& info);
     void DefineRescalingInputPushConstant();
     void DefineRescalingInputUniformConstant();
