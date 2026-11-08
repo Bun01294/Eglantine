@@ -1,0 +1,570 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 seedds (nxnative)
+// SPDX-FileCopyrightText: Copyright 2026 Vortex727 (FUKKO)
+// SPDX-License-Identifier: GPL-3.0-or-later AND MIT
+
+#include <algorithm>
+#include <bit>
+#include <utility>
+
+#include "common/logging.h"
+#include "video_core/nx2.h"
+#include "video_core/renderer_vulkan/nvn/nvn_sparse.h"
+
+namespace Vulkan::Nvn {
+namespace {
+
+/// Sparse storages smaller than this stay ordinary images (a remap re-uploads them whole, which is
+/// cheap at this size).
+constexpr u64 MIN_SPARSE_STORAGE_BYTES = u64{8} << 20;
+
+/// Tiles one `NextVerifyTile` call looks at before giving up.
+constexpr u32 VERIFY_SCAN_LIMIT = 4096;
+
+u32 CeilDiv(u32 value, u32 divisor) {
+    return (value + divisor - 1) / divisor;
+}
+
+} // Anonymous namespace
+
+// ---- SparsePagePool ---------------------------------------------------------------------------
+
+SparsePagePool::SparsePagePool(const MemoryAllocator& allocator, u64 budget_bytes)
+    : allocator_{allocator}, budget_{budget_bytes} {}
+
+SparsePagePool::~SparsePagePool() {
+    for (const Block& block : blocks_) {
+        allocator_.FreeSparseMemory(block.allocation);
+    }
+}
+
+u32 SparsePagePool::Allocate(u32 memory_type_bits) {
+    std::scoped_lock lock{mutex_};
+    if (used_ + PageBytes > budget_) {
+        return NoPage;
+    }
+    // A block was allocated for one mask of allowed memory types and the allocator picked one of
+    // them (it does not say which): only an image with the same mask is sure to accept it.
+    const auto usable = [&](u32 page) {
+        return blocks_[page / PagesPerBlock].type_bits == memory_type_bits;
+    };
+    for (size_t i = free_.size(); i-- > 0;) {
+        if (usable(free_[i])) {
+            const u32 page = free_[i];
+            free_[i] = free_.back();
+            free_.pop_back();
+            used_ += PageBytes;
+            return page;
+        }
+    }
+    const VkMemoryRequirements requirements{
+        .size = PageBytes * PagesPerBlock,
+        .alignment = PageBytes,
+        .memoryTypeBits = memory_type_bits,
+    };
+    Block block;
+    block.allocation = allocator_.AllocateSparseMemory(requirements, block.where.memory,
+                                                       block.where.offset);
+    if (block.allocation == VK_NULL_HANDLE) {
+        return NoPage;
+    }
+    block.type_bits = memory_type_bits;
+    const u32 first = static_cast<u32>(blocks_.size()) * PagesPerBlock;
+    blocks_.push_back(block);
+    for (u32 i = PagesPerBlock; i-- > 1;) {
+        free_.push_back(first + i);
+    }
+    used_ += PageBytes;
+    return first;
+}
+
+void SparsePagePool::Free(u32 page) {
+    if (page == NoPage) {
+        return;
+    }
+    std::scoped_lock lock{mutex_};
+    free_.push_back(page);
+    used_ -= PageBytes;
+    ++free_generation_;
+}
+
+SparsePagePool::Where SparsePagePool::Get(u32 page) const {
+    std::scoped_lock lock{mutex_};
+    const Block& block = blocks_[page / PagesPerBlock];
+    return {block.where.memory, block.where.offset + PageBytes * (page % PagesPerBlock)};
+}
+
+u64 SparsePagePool::UsedBytes() const {
+    std::scoped_lock lock{mutex_};
+    return used_;
+}
+
+bool SparsePagePool::HasRoom() const {
+    std::scoped_lock lock{mutex_};
+    return used_ + PageBytes <= budget_;
+}
+
+// ---- SparseBacking ----------------------------------------------------------------------------
+
+std::shared_ptr<SparseBacking> SparseBacking::Make(const Storage& s, const Device& device,
+                                                   u64 pool_size, const char*& reason) {
+    if (!device.IsSparseResidencyImageSupported(VK_IMAGE_TYPE_2D) ||
+        !device.CanUseUnbackedSparseImages()) {
+        reason = "the device has no sparse residency images";
+        return nullptr;
+    }
+    if (!(s.desc.flags & TexFlag::Sparse)) {
+        reason = "the texture is not sparse";
+        return nullptr;
+    }
+    if (s.layout.size < MIN_SPARSE_STORAGE_BYTES) {
+        reason = "smaller than 8 MiB";
+        return nullptr;
+    }
+    if (s.pool_offset % SPARSE_TILE_BYTES != 0 || s.pool_offset > pool_size ||
+        s.layout.size > pool_size - s.pool_offset) {
+        reason = "not 64 KiB aligned or leaves its pool";
+        return nullptr;
+    }
+    if (s.host.needs_transcode && !VideoCore::Surface::IsPixelFormatASTC(s.host.pixel_format) &&
+        !VideoCore::Surface::IsPixelFormatBCn(s.host.pixel_format)) {
+        reason = "the format has no decoder";
+        return nullptr;
+    }
+    std::optional<SparseLayout> layout = BuildSparseLayout(s);
+    if (!layout) {
+        reason = "no tile layout (not 2D, multisampled, packaged, or too small for tiles)";
+        return nullptr;
+    }
+    return FromLayout(std::move(*layout));
+}
+
+std::shared_ptr<SparseBacking> SparseBacking::FromLayout(SparseLayout layout) {
+    std::shared_ptr<SparseBacking> backing{new SparseBacking};
+    backing->layout_ = std::move(layout);
+    backing->tile_flags_.assign(backing->layout_.TileCount(), 0);
+    backing->tail_flags_.assign(backing->layout_.layers, 0);
+    backing->tile_hash_.assign(backing->layout_.TileCount(), 0);
+    return backing;
+}
+
+SparseBacking::~SparseBacking() {
+    if (!pool_) {
+        return;
+    }
+    for (const u32 page : tile_pages_) {
+        pool_->Free(page);
+    }
+    for (const std::vector<u32>& pages : tail_pages_) {
+        for (const u32 page : pages) {
+            pool_->Free(page);
+        }
+    }
+}
+
+bool SparseBacking::Attach(Context::Impl& impl, const Storage& s, const char*& reason) {
+    const auto requirements = impl.device.GetLogical().GetImageSparseMemoryRequirements(*s.image);
+    const VkImageAspectFlags wanted_aspect =
+        s.host.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    const VkSparseImageMemoryRequirements* color = nullptr;
+    for (const VkSparseImageMemoryRequirements& entry : requirements) {
+        if (entry.formatProperties.aspectMask == wanted_aspect) {
+            color = &entry;
+            break;
+        }
+    }
+    if (!color) {
+        reason = "the image reports no sparse requirements for its aspect";
+        return false;
+    }
+    const VkSparseImageFormatProperties& props = color->formatProperties;
+    if ((props.flags & VK_SPARSE_IMAGE_FORMAT_SINGLE_MIPTAIL_BIT) != 0) {
+        reason = "the mip tail is shared by the layers";
+        return false;
+    }
+    if (props.imageGranularity.depth != 1 || props.imageGranularity.width == 0 ||
+        props.imageGranularity.height == 0) {
+        reason = "no 2D sparse block shape";
+        return false;
+    }
+    const VkMemoryRequirements memory = impl.device.GetLogical().GetImageMemoryRequirements(*s.image);
+    granule_x_ = props.imageGranularity.width;
+    granule_y_ = props.imageGranularity.height;
+    const u64 granule_bytes =
+        s.host.needs_transcode
+            ? static_cast<u64>(granule_x_) * granule_y_ * DecodedTexelBytes(s.host)
+            : static_cast<u64>(granule_x_) * granule_y_ * layout_.block.bytes /
+                  (layout_.block.width * layout_.block.height);
+    if (memory.alignment != SPARSE_TILE_BYTES || granule_bytes != SPARSE_TILE_BYTES) {
+        reason = "the host sparse block is not 64 KiB";
+        return false;
+    }
+    if (layout_.tile_width % granule_x_ != 0 || layout_.tile_height % granule_y_ != 0) {
+        reason = "a guest tile is not a whole number of host sparse blocks";
+        return false;
+    }
+    host_per_x_ = layout_.tile_width / granule_x_;
+    host_per_y_ = layout_.tile_height / granule_y_;
+    tail_first_lod_ = (std::min)(color->imageMipTailFirstLod, s.levels);
+    if (tail_first_lod_ < layout_.level.size()) {
+        reason = "the host mip tail starts inside the tiled levels";
+        return false;
+    }
+    memory_type_bits_ = memory.memoryTypeBits;
+    aspect_ = props.aspectMask;
+    tail_size_ = 0;
+    if (tail_first_lod_ < s.levels) {
+        tail_size_ = color->imageMipTailSize;
+        tail_resource_offset_ = color->imageMipTailOffset;
+        tail_stride_ = color->imageMipTailStride;
+        if (tail_size_ == 0 || tail_size_ % SPARSE_TILE_BYTES != 0 ||
+            tail_resource_offset_ % SPARSE_TILE_BYTES != 0 ||
+            (layout_.layers > 1 && tail_stride_ % SPARSE_TILE_BYTES != 0)) {
+            reason = "the host mip tail is not made of 64 KiB pages";
+            return false;
+        }
+    }
+    if (!layout_.HasTail() && tail_first_lod_ != s.levels) {
+        reason = "the host has a mip tail the guest layout does not";
+        return false;
+    }
+    // Levels the guest keeps in its tail but the host binds in sparse blocks.
+    tail_host_tiles_.clear();
+    u32 slot = 0;
+    for (u32 level = static_cast<u32>(layout_.level.size()); level < tail_first_lod_; ++level) {
+        const u32 width = (std::max)(s.extent.width >> level, 1u);
+        const u32 height = (std::max)(s.extent.height >> level, 1u);
+        for (u32 y = 0; y < CeilDiv(height, granule_y_); ++y) {
+            for (u32 x = 0; x < CeilDiv(width, granule_x_); ++x) {
+                tail_host_tiles_.push_back({level, x * granule_x_, y * granule_y_,
+                                            (std::min)(granule_x_, width - x * granule_x_),
+                                            (std::min)(granule_y_, height - y * granule_y_), slot++});
+            }
+        }
+    }
+    tile_pages_.assign(static_cast<size_t>(layout_.TileCount()) * host_per_x_ * host_per_y_,
+                       SparsePagePool::NoPage);
+    tail_pages_.assign(layout_.layers, {});
+    tail_plan_ = PlanSparseTail(s, layout_);
+    if (tail_plan_.unsupported) {
+        reason = tail_plan_.unsupported;
+        return false;
+    }
+    if (!impl.sparse_pages) {
+        // 40% of the device-local heaps (not the texture cache's smaller allowance), but no more
+        // than 12 GiB and no less than 1 GiB: the decoded stand-ins of compressed formats are
+        // several times their guest size.
+        const VkPhysicalDeviceMemoryProperties2 properties =
+            impl.device.GetPhysical().GetMemoryProperties();
+        u64 local = 0;
+        for (u32 i = 0; i < properties.memoryProperties.memoryHeapCount; ++i) {
+            const VkMemoryHeap& heap = properties.memoryProperties.memoryHeaps[i];
+            if ((heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
+                local += heap.size;
+            }
+        }
+        impl.sparse_pages = std::make_shared<SparsePagePool>(
+            *impl.allocator, (std::clamp)(local / 5 * 2, u64{1} << 30, u64{12} << 30));
+    }
+    pool_ = impl.sparse_pages;
+    return true;
+}
+
+void SparseBacking::Queue(u8& flags, u32 id, bool tail) {
+    starved_only_ = false;
+    if ((flags & Queued) == 0) {
+        flags |= Queued;
+        (tail ? pending_tails_ : pending_tiles_).push_back(id);
+    }
+}
+
+void SparseBacking::SetMapped(u8& flags, u32 id, bool tail, bool mapped) {
+    const bool was = (flags & Mapped) != 0;
+    if (mapped) {
+        if (!was) {
+            flags |= Mapped;
+            mapped_tiles_ += tail ? 0 : 1;
+        }
+        flags |= Dirty;
+        Queue(flags, id, tail);
+    } else {
+        if (was) {
+            flags &= static_cast<u8>(~Mapped);
+            mapped_tiles_ -= tail ? 0 : 1;
+        }
+        flags &= static_cast<u8>(~Dirty);
+        if ((flags & Bound) != 0) {
+            Queue(flags, id, tail);
+        }
+    }
+}
+
+void SparseBacking::ContentChanged(u64 begin, u64 end) {
+    layout_.ForEachUnit(
+        begin, end,
+        [&](u32 id) {
+            if ((tile_flags_[id] & Mapped) != 0) {
+                tile_flags_[id] |= Dirty;
+                Queue(tile_flags_[id], id, false);
+            }
+        },
+        [&](u32 layer) {
+            if ((tail_flags_[layer] & Mapped) != 0) {
+                tail_flags_[layer] |= Dirty;
+                Queue(tail_flags_[layer], layer, true);
+            }
+        });
+}
+
+void SparseBacking::MarkAllDirty() {
+    ContentChanged(0, static_cast<u64>(layout_.layers) * layout_.layer_size);
+}
+
+void SparseBacking::MarkTileDirty(u32 id) {
+    if ((tile_flags_[id] & Mapped) != 0) {
+        tile_flags_[id] |= Dirty;
+        Queue(tile_flags_[id], id, false);
+    }
+}
+
+u32 SparseBacking::NextVerifyTile() {
+    const u32 count = layout_.TileCount();
+    for (u32 scanned = 0; scanned < (std::min)(count, VERIFY_SCAN_LIMIT); ++scanned) {
+        const u32 id = verify_cursor_;
+        verify_cursor_ = verify_cursor_ + 1 >= count ? 0 : verify_cursor_ + 1;
+        constexpr u8 want = Mapped | Bound;
+        if ((tile_flags_[id] & (want | Dirty | Queued)) == want) {
+            return id;
+        }
+    }
+    return ~0u;
+}
+
+void SparseBacking::HostTilesOfTile(u32 id, std::vector<HostTile>& out) const {
+    out.clear();
+    const SparseTileRef ref = layout_.Tile(id);
+    const SparseLevel& level = layout_.level[ref.level];
+    for (u32 ky = 0; ky < host_per_y_; ++ky) {
+        for (u32 kx = 0; kx < host_per_x_; ++kx) {
+            const u32 x = ref.x * layout_.tile_width + kx * granule_x_;
+            const u32 y = ref.y * layout_.tile_height + ky * granule_y_;
+            const u32 slot = ky * host_per_x_ + kx;
+            if (x >= level.width || y >= level.height) {
+                continue; // past the edge of the level: the host has no block there
+            }
+            out.push_back({ref.level, x, y, (std::min)(granule_x_, level.width - x),
+                           (std::min)(granule_y_, level.height - y), slot});
+        }
+    }
+}
+
+bool SparseBacking::BindUnit(Context::Impl& impl, const Storage& s, bool tail, u32 id, bool bind,
+                             std::vector<VkSparseImageMemoryBind>& image_binds,
+                             std::vector<VkSparseMemoryBind>& opaque_binds) {
+    static_cast<void>(impl);
+    const u32 layer = tail ? id : layout_.Tile(id).layer;
+    std::vector<HostTile> tiles;
+    u32 slots = 0;
+    u32* pages = nullptr;
+    std::vector<u32>* tail_vector = nullptr;
+    u32 opaque_count = 0;
+    if (tail) {
+        tiles = tail_host_tiles_;
+        opaque_count = static_cast<u32>(tail_size_ / SPARSE_TILE_BYTES);
+        tail_vector = &tail_pages_[id];
+        if (bind) {
+            tail_vector->assign(tiles.size() + opaque_count, SparsePagePool::NoPage);
+        }
+        slots = static_cast<u32>(tail_vector->size());
+        pages = tail_vector->data();
+    } else {
+        HostTilesOfTile(id, tiles);
+        slots = host_per_x_ * host_per_y_;
+        pages = &tile_pages_[static_cast<size_t>(id) * slots];
+    }
+    const auto release = [&](u32 index) {
+        pool_->Free(pages[index]);
+        pages[index] = SparsePagePool::NoPage;
+    };
+    if (bind) {
+        // Memory for every host block first: a failure leaves nothing bound.
+        const auto need = [&](u32 index) {
+            if (pages[index] == SparsePagePool::NoPage) {
+                pages[index] = pool_->Allocate(memory_type_bits_);
+            }
+            return pages[index] != SparsePagePool::NoPage;
+        };
+        bool ok = true;
+        for (const HostTile& tile : tiles) {
+            ok = ok && need(tile.slot);
+        }
+        for (u32 i = 0; ok && i < opaque_count; ++i) {
+            ok = need(static_cast<u32>(tiles.size()) + i);
+        }
+        if (!ok) {
+            for (u32 i = 0; i < slots; ++i) {
+                release(i);
+            }
+            return false;
+        }
+    }
+    const auto memory_of = [&](u32 index) {
+        return bind ? pool_->Get(pages[index]) : SparsePagePool::Where{};
+    };
+    for (const HostTile& tile : tiles) {
+        const SparsePagePool::Where where = memory_of(tile.slot);
+        image_binds.push_back({
+            .subresource{.aspectMask = aspect_, .mipLevel = tile.level, .arrayLayer = layer},
+            .offset{static_cast<s32>(tile.x), static_cast<s32>(tile.y), 0},
+            .extent{tile.width, tile.height, 1},
+            .memory = where.memory,
+            .memoryOffset = where.offset,
+            .flags = 0,
+        });
+    }
+    for (u32 i = 0; i < opaque_count; ++i) {
+        const SparsePagePool::Where where = memory_of(static_cast<u32>(tiles.size()) + i);
+        opaque_binds.push_back({
+            .resourceOffset = tail_resource_offset_ + layer * tail_stride_ + i * SPARSE_TILE_BYTES,
+            .size = SPARSE_TILE_BYTES,
+            .memory = where.memory,
+            .memoryOffset = where.offset,
+            .flags = 0,
+        });
+    }
+    if (!bind) {
+        deferred_free_.insert(deferred_free_.end(), pages, pages + slots);
+        std::fill(pages, pages + slots, SparsePagePool::NoPage);
+    }
+    bound_pages_ += bind ? tiles.size() + opaque_count : 0;
+    bound_pages_ -= bind ? 0 : (std::min<u64>)(bound_pages_, tiles.size() + opaque_count);
+    return true;
+}
+
+bool SparseBacking::Prepare(Context::Impl& impl, const Storage& s, Uploads& uploads) {
+    std::vector<VkSparseImageMemoryBind> image_binds;
+    std::vector<VkSparseMemoryBind> opaque_binds;
+    std::vector<std::pair<bool, u32>> bound_now;
+    u64 binds = 0;
+    u64 unbinds = 0;
+    // The first unit that finds no page ends the allocating of this call; the generation is read
+    // first, so a page freed meanwhile makes the units worth trying again.
+    bool exhausted = false;
+    const u64 generation = pool_->FreeGeneration();
+    const auto process = [&](bool tail, std::vector<u32>& pending, std::vector<u8>& flags_vector) {
+        std::vector<u32> keep;
+        for (const u32 id : pending) {
+            u8& flags = flags_vector[id];
+            const bool want = (flags & Mapped) != 0;
+            const bool have = (flags & Bound) != 0;
+            if (want && !have) {
+                if (exhausted || !pool_->HasRoom() ||
+                    !BindUnit(impl, s, tail, id, true, image_binds, opaque_binds)) {
+                    exhausted = true;
+                    if (!std::exchange(starved_logged_, true)) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "[nvn] sparse texture {}x{}x{}: out of device memory for tiles "
+                                    "({} MiB of {} MiB in use); they read as zero until memory is "
+                                    "free",
+                                    s.extent.width, s.extent.height, layout_.layers,
+                                    pool_->UsedBytes() >> 20, pool_->BudgetBytes() >> 20);
+                    }
+                    keep.push_back(id); // tried again at the next use
+                    continue;
+                }
+                flags |= Bound;
+                bound_now.emplace_back(tail, id);
+                ++binds;
+            } else if (!want && have) {
+                BindUnit(impl, s, tail, id, false, image_binds, opaque_binds);
+                flags &= static_cast<u8>(~Bound);
+                ++unbinds;
+            }
+            flags &= static_cast<u8>(~Queued);
+            if (want && (flags & Dirty) != 0) {
+                (tail ? uploads.tails : uploads.tiles).push_back(id);
+            }
+        }
+        pending = std::move(keep);
+    };
+    process(false, pending_tiles_, tile_flags_);
+    process(true, pending_tails_, tail_flags_);
+    starved_ = static_cast<u32>(pending_tiles_.size() + pending_tails_.size());
+    starved_only_ = starved_ != 0;
+    starved_generation_ = generation;
+    if (!image_binds.empty() || !opaque_binds.empty()) {
+        const VkSparseImageMemoryBindInfo image_info{
+            .image = *s.image,
+            .bindCount = static_cast<u32>(image_binds.size()),
+            .pBinds = image_binds.data(),
+        };
+        const VkSparseImageOpaqueMemoryBindInfo opaque_info{
+            .image = *s.image,
+            .bindCount = static_cast<u32>(opaque_binds.size()),
+            .pBinds = opaque_binds.data(),
+        };
+        const VkBindSparseInfo info{
+            .sType = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO,
+            .pNext = nullptr,
+            .waitSemaphoreCount = 0,
+            .pWaitSemaphores = nullptr,
+            .bufferBindCount = 0,
+            .pBufferBinds = nullptr,
+            .imageOpaqueBindCount = opaque_binds.empty() ? 0U : 1U,
+            .pImageOpaqueBinds = opaque_binds.empty() ? nullptr : &opaque_info,
+            .imageBindCount = image_binds.empty() ? 0U : 1U,
+            .pImageBinds = image_binds.empty() ? nullptr : &image_info,
+            .signalSemaphoreCount = 0,
+            .pSignalSemaphores = nullptr,
+        };
+        vk::Fence fence = impl.device.GetLogical().CreateFence(VkFenceCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+        });
+        VkResult result;
+        {
+            std::scoped_lock lock{impl.submit_mutex};
+            result = impl.queue.BindSparse(info, *fence);
+        }
+        if (result == VK_SUCCESS) {
+            result = fence.Wait();
+        }
+        if (result != VK_SUCCESS) {
+            LOG_ERROR(Render_Vulkan, "[nvn] sparse texture {}x{}x{}: binding {} blocks failed ({})",
+                      s.extent.width, s.extent.height, layout_.layers,
+                      image_binds.size() + opaque_binds.size(), static_cast<int>(result));
+            // Nothing can be said about what is bound: give the new tiles' memory back, the
+            // units are tried again at the next use.
+            for (const auto& [tail, id] : bound_now) {
+                u8& flags = tail ? tail_flags_[id] : tile_flags_[id];
+                flags &= static_cast<u8>(~Bound);
+                Queue(flags, id, tail);
+                std::vector<VkSparseImageMemoryBind> unused_image;
+                std::vector<VkSparseMemoryBind> unused_opaque;
+                BindUnit(impl, s, tail, id, false, unused_image, unused_opaque);
+            }
+            uploads.tiles.clear();
+            uploads.tails.clear();
+            for (const u32 page : deferred_free_) {
+                pool_->Free(page);
+            }
+            deferred_free_.clear();
+            return false;
+        }
+        impl.stats.virtual_sparse_binds.fetch_add(image_binds.size() + opaque_binds.size(),
+                                                  std::memory_order_relaxed);
+    }
+    for (const u32 page : deferred_free_) {
+        pool_->Free(page);
+    }
+    deferred_free_.clear();
+    for (const u32 id : uploads.tiles) {
+        tile_flags_[id] &= static_cast<u8>(~Dirty);
+    }
+    for (const u32 id : uploads.tails) {
+        tail_flags_[id] &= static_cast<u8>(~Dirty);
+    }
+    return true;
+}
+
+} // namespace Vulkan::Nvn

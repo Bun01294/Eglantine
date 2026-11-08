@@ -398,6 +398,43 @@ add_library(core STATIC
     hle/kernel/svc_results.h
     hle/kernel/svc_types.h
     hle/result.h
+    hle/nvn/aapcs64.h
+    hle/nvn/bridge.cpp
+    hle/nvn/bridge.h
+    hle/nvn/config.h
+    hle/nvn/dynsym.cpp
+    hle/nvn/dynsym.h
+    hle/nvn/function_table.cpp
+    hle/nvn/function_table.h
+    hle/nvn/functions_buffer.cpp
+    hle/nvn/functions_cmdbuf.cpp
+    hle/nvn/functions_cmdbuf_bind.cpp
+    hle/nvn/functions_device.cpp
+    hle/nvn/functions_dlss.cpp
+    hle/nvn/functions_event.cpp
+    hle/nvn/functions_native_image.cpp
+    hle/nvn/functions_nv.cpp
+    hle/nvn/functions_pool.cpp
+    hle/nvn/functions_program.cpp
+    hle/nvn/functions_queue.cpp
+    hle/nvn/functions_sampler.cpp
+    hle/nvn/functions_state.cpp
+    hle/nvn/functions_sync.cpp
+    hle/nvn/functions_texture.cpp
+    hle/nvn/functions_window.cpp
+    hle/nvn/hle_call.h
+    hle/nvn/hle_running.h
+    hle/nvn/hle_runtime.cpp
+    hle/nvn/hle_runtime.h
+    hle/nvn/present_pacing.h
+    hle/nvn/sdk_device_info.cpp
+    hle/nvn/sdk_device_info.h
+    hle/nvn/sdk_dlss_layout.cpp
+    hle/nvn/sdk_dlss_layout.h
+    hle/nvn/sdk_impl_table.cpp
+    hle/nvn/sdk_impl_table.h
+    hle/nvn/thunk_encoding.cpp
+    hle/nvn/thunk_encoding.h
     hle/service/acc/acc.cpp
     hle/service/acc/acc.h
     hle/service/acc/async_context.cpp
@@ -1050,6 +1087,8 @@ add_library(core STATIC
     hle/service/nx2_streamplay.h
     hle/service/nx2_stub_interface.h
     hle/service/nx2_gsv.h
+    hle/service/nx2_native_image_directory.h
+    hle/service/nx2_native_pool.h
     hle/service/services.cpp
     hle/service/services.h
     hle/service/set/factory_settings_server.cpp

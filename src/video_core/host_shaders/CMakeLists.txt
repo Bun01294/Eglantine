@@ -44,6 +44,11 @@ set(SHADER_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/full_screen_triangle.vert
     ${CMAKE_CURRENT_SOURCE_DIR}/fxaa.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/fxaa.vert
+    ${CMAKE_CURRENT_SOURCE_DIR}/nvn_alias_transfer.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/nvn_counter.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/nvn_mesh_indirect.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/nvn_vertex_stage.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/nvn_wb_merge.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/opengl_convert_s8d24.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/opengl_copy_bc4.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/opengl_fidelityfx_fsr.frag
