@@ -22,6 +22,7 @@ class System;
 
 namespace VideoCore {
 class RendererBase;
+class LoadProgressSink;
 class ShaderNotify;
 } // namespace VideoCore
 
@@ -215,6 +216,10 @@ public:
 
     /// Returns a const reference to the shader notifier.
     [[nodiscard]] const VideoCore::ShaderNotify& ShaderNotify() const;
+
+    /// Where a disk cache that loads after the frontend's load call (VTX-HLE's pipeline cache)
+    /// reports to the loading screen.
+    [[nodiscard]] VideoCore::LoadProgressSink& LoadProgress();
 
     [[nodiscard]] u64 GetTicks() const;
 

@@ -183,7 +183,10 @@ void MemoryCommit::Release() {
 }
 
 MemoryAllocator::MemoryAllocator(const Device &device_)
-        : device{device_}, allocator{device.GetAllocator()},
+        : MemoryAllocator{device_, device_.GetAllocator()} {}
+
+MemoryAllocator::MemoryAllocator(const Device &device_, VmaAllocator allocator_)
+        : device{device_}, allocator{allocator_},
             properties{device_.GetPhysical().GetMemoryProperties().memoryProperties},
             buffer_image_granularity{
                     device_.GetPhysical().GetProperties().limits.bufferImageGranularity} {
@@ -344,7 +347,8 @@ VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &
         vmaFindMemoryTypeIndex(allocator, requirements.memoryTypeBits, &alloc_ci, &memory_type) ==
             VK_SUCCESS) {
         if (const VmaPool pool =
-                device.GetSeparatePool(Device::SeparatePool::SparsePages, memory_type)) {
+                device.GetSeparatePool(Device::SeparatePool::SparsePages, memory_type,
+                                       allocator)) {
             VmaAllocationCreateInfo pool_ci = alloc_ci;
             pool_ci.pool = pool;
             if (vmaAllocateMemory(allocator, &requirements, &pool_ci, &allocation, &info) ==
@@ -391,7 +395,8 @@ bool MemoryAllocator::CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, M
             return false;
         }
     }
-    const VmaPool pool = device.GetSeparatePool(Device::SeparatePool::DeviceBuffers, memory_type);
+    const VmaPool pool =
+        device.GetSeparatePool(Device::SeparatePool::DeviceBuffers, memory_type, allocator);
     if (pool == VK_NULL_HANDLE) {
         return false;
     }

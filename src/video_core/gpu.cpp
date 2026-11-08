@@ -40,6 +40,7 @@
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_base.h"
+#include "video_core/load_progress.h"
 #include "video_core/shader_notify.h"
 
 namespace Tegra {
@@ -380,6 +381,7 @@ struct GPU::Impl {
     s32 new_channel_id{1};
     /// Shader build notifier
     VideoCore::ShaderNotify shader_notify;
+    VideoCore::LoadProgressSink load_progress;
     /// When true, we are about to shut down emulation session, so terminate outstanding tasks
     std::atomic_bool shutting_down{};
 
@@ -540,6 +542,10 @@ VideoCore::ShaderNotify& GPU::ShaderNotify() {
 
 const VideoCore::ShaderNotify& GPU::ShaderNotify() const {
     return impl->shader_notify;
+}
+
+VideoCore::LoadProgressSink& GPU::LoadProgress() {
+    return impl->load_progress;
 }
 
 void GPU::RequestComposite(std::vector<Tegra::FramebufferConfig>&& layers,

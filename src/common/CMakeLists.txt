@@ -110,6 +110,8 @@ add_library(
     settings_input.cpp
     settings_input.h
     settings_setting.h
+    hdr.cpp
+    hdr.h
     slot_vector.h
     socket_types.h
     sparse_large_vector.cpp

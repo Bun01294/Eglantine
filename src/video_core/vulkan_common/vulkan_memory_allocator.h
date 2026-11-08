@@ -100,6 +100,10 @@ namespace Vulkan {
          */
         explicit MemoryAllocator(const Device &device_);
 
+        /// Allocates from `allocator_` instead of the device's shared one (which is externally
+        /// synchronized). Used by VTX-HLE's replay, which must not race the render thread.
+        explicit MemoryAllocator(const Device &device_, VmaAllocator allocator_);
+
         ~MemoryAllocator();
 
         MemoryAllocator &operator=(const MemoryAllocator &) = delete;

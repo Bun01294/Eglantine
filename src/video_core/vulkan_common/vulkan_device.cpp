@@ -714,8 +714,9 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         break;
     }
 
-    // VK_EXT_vertex_input_dynamic_state
-    if (!Settings::values.vertex_input_dynamic_state.GetValue()) {
+    // VK_EXT_vertex_input_dynamic_state. VTX-HLE's replay uses it whenever the device has it (its
+    // pipelines then carry no vertex layout), so the setting does not switch it off there.
+    if (!Settings::values.vertex_input_dynamic_state.GetValue() && !Settings::ResolveNvnHle().hle) {
         RemoveExtensionFeature(extensions.vertex_input_dynamic_state, features.vertex_input_dynamic_state, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
     }
 
@@ -745,11 +746,21 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         RemoveExtensionFeature(extensions.descriptor_buffer, features.descriptor_buffer,
                                VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
     }
+    // VTX-HLE reads and writes guest memory through buffer device addresses (raw global memory).
+    // Core since Vulkan 1.2: the extension table only sets the flag for older instances. The flag
+    // also makes the allocator allocate with VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT.
+    const bool nvn_hle_device_address =
+        Settings::ResolveNvnHle().hle && features.buffer_device_address.bufferDeviceAddress;
 #ifdef EGLANTINE_STREAMLINE
     // NVIDIA's DLSS needs buffer device addresses: keep the feature enabled for
     // it, but leave Eglantine's own buffers as they are without descriptor buffers.
     const bool dlss_wants_device_address =
         streamline_extensions && features.buffer_device_address.bufferDeviceAddress;
+#endif
+    if (nvn_hle_device_address) {
+        extensions.buffer_device_address = true;
+    } else
+#ifdef EGLANTINE_STREAMLINE
     if (!extensions.descriptor_buffer && dlss_wants_device_address) {
         extensions.buffer_device_address = false;
     } else
@@ -773,11 +784,22 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     }
 #endif
 
+    allocator = CreateAllocator(true);
+
+    owns_static_pipeline_cache = surface != VkSurfaceKHR{};
+    LoadStaticPipelineCache();
+
+    // Initialize GPU logging if enabled
+    InitializeGPULogging();
+}
+
+VmaAllocator Device::CreateAllocator(bool externally_synchronized) const {
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr = dld.vkGetInstanceProcAddr;
     functions.vkGetDeviceProcAddr = dld.vkGetDeviceProcAddr;
 
-    VmaAllocatorCreateFlags flags = VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT;
+    VmaAllocatorCreateFlags flags =
+        externally_synchronized ? VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT : 0;
     if (extensions.memory_budget) {
         flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
     }
@@ -816,13 +838,13 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
             .pTypeExternalMemoryHandleTypes = nullptr,
     };
 
-    vk::Check(vmaCreateAllocator(&allocator_info, &allocator));
+    VmaAllocator result{};
+    vk::Check(vmaCreateAllocator(&allocator_info, &result));
+    return result;
+}
 
-    owns_static_pipeline_cache = surface != VkSurfaceKHR{};
-    LoadStaticPipelineCache();
-
-    // Initialize GPU logging if enabled
-    InitializeGPULogging();
+VmaAllocator Device::CreateThreadSafeAllocator() const {
+    return CreateAllocator(false);
 }
 
 Device::~Device() {
@@ -843,7 +865,11 @@ Device::~Device() {
     vmaDestroyAllocator(allocator);
 }
 
-VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
+VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type,
+                                VmaAllocator user) const {
+    if (user != allocator) {
+        return VK_NULL_HANDLE;
+    }
     std::scoped_lock lk{separate_pools_mutex};
     VmaPool& pool = separate_pools[static_cast<u32>(kind)][memory_type];
     if (pool == VK_NULL_HANDLE) {
@@ -1131,6 +1157,21 @@ bool Device::GetSuitability(bool requires_swapchain) {
     FOR_EACH_VK_FEATURE_EXT(FEATURE_EXTENSION);
     FOR_EACH_VK_EXTENSION(EXTENSION);
 
+    // VK_EXT_external_memory_host serves VTX-HLE only (it imports the game's memory pools): the
+    // emulated GPU creates exactly the device it always did. With a pre-1.1 instance its
+    // dependency VK_KHR_external_memory is not core and has to be enabled as well.
+    if (!Settings::ResolveNvnHle().hle) {
+        loaded_extensions.erase(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+        extensions.external_memory_host = false;
+    } else if (extensions.external_memory_host && instance_version < VK_API_VERSION_1_1) {
+        if (supported_extensions.contains(VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME)) {
+            loaded_extensions.insert(VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME);
+        } else {
+            loaded_extensions.erase(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+            extensions.external_memory_host = false;
+        }
+    }
+
     extensions.depth_stencil_resolve =
         extensions.depth_stencil_resolve &&
         (instance_version >= VK_API_VERSION_1_2 || extensions.create_renderpass2);
@@ -1328,6 +1369,15 @@ bool Device::GetSuitability(bool requires_swapchain) {
         properties.maintenance5.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_PROPERTIES_KHR;
         SetNext(next, properties.maintenance5);
+    }
+    if (extensions.graphics_pipeline_library) {
+        properties.graphics_pipeline_library.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT;
+        SetNext(next, properties.graphics_pipeline_library);
+    }
+    if (extensions.mesh_shader) {
+        properties.mesh_shader.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT;
+        SetNext(next, properties.mesh_shader);
     }
     if (extensions.custom_border_color) {
         properties.custom_border_color.sType =
@@ -1600,6 +1650,37 @@ void Device::RemoveUnsuitableExtensions() {
     extensions.mesh_shader = features.mesh_shader.taskShader && features.mesh_shader.meshShader;
     RemoveExtensionFeatureIfUnsuitable(extensions.mesh_shader, features.mesh_shader,
                                        VK_EXT_MESH_SHADER_EXTENSION_NAME);
+
+    // VK_EXT_graphics_pipeline_library, which needs VK_KHR_pipeline_library: only for VTX-HLE's
+    // fast-linked pipelines (the nvn_pipeline_library setting), and only when linking is fast
+    // (otherwise it saves nothing over a monolithic compile) and the vertex and fragment shaders
+    // may disagree on interpolation decorations (libraries are compiled separately).
+    {
+        const bool gpl_allowed =
+            Settings::values.nvn_pipeline_library.GetValue() && Settings::ResolveNvnHle().hle;
+        const auto& gpl_properties = properties.graphics_pipeline_library;
+        const bool gpl_usable =
+            features.graphics_pipeline_library.graphicsPipelineLibrary &&
+            extensions.pipeline_library &&
+            gpl_properties.graphicsPipelineLibraryFastLinking &&
+            gpl_properties.graphicsPipelineLibraryIndependentInterpolationDecoration;
+        if (gpl_allowed) {
+            LOG_INFO(Render_Vulkan,
+                     "VK_EXT_graphics_pipeline_library: fast linking {}, independent "
+                     "interpolation {}, {}",
+                     gpl_properties.graphicsPipelineLibraryFastLinking == VK_TRUE,
+                     gpl_properties.graphicsPipelineLibraryIndependentInterpolationDecoration ==
+                         VK_TRUE,
+                     gpl_usable ? "used" : "not used");
+        }
+        extensions.graphics_pipeline_library = gpl_allowed && gpl_usable;
+        RemoveExtensionFeatureIfUnsuitable(extensions.graphics_pipeline_library,
+                                           features.graphics_pipeline_library,
+                                           VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+        extensions.pipeline_library = extensions.graphics_pipeline_library;
+        RemoveExtensionIfUnsuitable(extensions.pipeline_library,
+                                    VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+    }
 
     // VK_KHR_shader_quad_control
     extensions.shader_quad_control = features.shader_quad_control.shaderQuadControl;
