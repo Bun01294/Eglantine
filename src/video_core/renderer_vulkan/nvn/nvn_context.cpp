@@ -236,6 +236,7 @@ Context::Impl::Impl(const Device& device_, std::mutex& submit_mutex_,
     mirror_hash_tracked = options.mirror_hash_tracked.value_or(!Debug::Get().mirror_hash_always);
     invalidate_wait_ms = options.invalidate_wait_ms.value_or(Debug::Get().try_invalidate_writeback);
     raw_keep_entries = options.raw_keep_entries.value_or(Debug::Get().try_raw_keep_entries);
+    refused_shadow = options.refused_shadow.value_or(Debug::Get().try_refused_shadow);
     storage_cache_budget = options.storage_cache_budget_bytes.value_or(
         Debug::Get().storage_budget_bytes != 0 ? Debug::Get().storage_budget_bytes
                                                : DEFAULT_STORAGE_CACHE_BUDGET);

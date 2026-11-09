@@ -536,6 +536,7 @@ private:
     /// Ranges the next draw or dispatch reads outside its descriptors (NoteExtraRead).
     std::vector<DrawPlan::RangeUse> extra_uses;
     std::set<std::tuple<u64, u64, u64>> shadow_logged; ///< EDEN_NX2_NVN_SHADOW_LOG only
+    std::set<std::tuple<u64, u64, u64>> host_write_logged; ///< EDEN_NX2_NVN_SHADOW_LOG only
     /// Guest -> mirror page runs ApplyMirrors collected: pool, [begin, end).
     struct MirrorCopy {
         Pool* pool;

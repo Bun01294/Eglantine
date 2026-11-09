@@ -152,6 +152,9 @@ struct ContextOptions {
     std::optional<u32> invalidate_wait_ms{};
     /// Test override for EDEN_NX2_TRY_RAW_KEEP_ENTRIES (raw-global draws keep mirror entries live).
     std::optional<bool> raw_keep_entries{};
+    /// Test override for EDEN_NX2_TRY_REFUSED_SHADOW (copy shadows for written ranges of pools
+    /// without a mirror while pool mirrors are on).
+    std::optional<bool> refused_shadow{};
     /// The status bar's shader build counter (PipelineCacheOptions::shader_notify). The renderer's
     /// context passes the GPU's notifier; tests leave it null.
     VideoCore::ShaderNotify* shader_notify{};

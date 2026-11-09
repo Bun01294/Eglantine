@@ -263,6 +263,11 @@ struct Config {
     /// ones) end at a conflicting use or the end of the command buffer. Plain copy shadows (pools
     /// without a table mirror) still end.
     bool try_raw_keep_entries{true};
+    /// EDEN_NX2_TRY_REFUSED_SHADOW=1 (candidate): with pool mirrors on, a written storage range of
+    /// at most EDEN_NX2_NVN_SHADOW_MAX_KIB in an imported pool that gets no mirror (over
+    /// TRY_STORAGE_VRAM_MAX_MIB, the budget, unaligned) is bound through a copy shadow, as with
+    /// mirrors off, instead of staying in host memory where its stores and atomics cross PCIe.
+    bool try_refused_shadow{false};
     /// EDEN_NX2_NVN_CONDITION_PREFETCH=0: every GPU render condition computes its own predicate at
     /// its point (no batch of the conditions ahead, Recorder::PrefetchConditions); on by default.
     bool condition_prefetch{true};

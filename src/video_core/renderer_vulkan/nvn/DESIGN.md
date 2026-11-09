@@ -1277,6 +1277,12 @@ mirrored pool for the existing fence/segment write-back merge. Pools larger than
 `EDEN_NX2_TRY_STORAGE_VRAM_MAX_MIB` (64 MiB) are not mirrored by this path; the ordinary global
 mirror budget still applies.
 
+A written range of a pool without a mirror stays in guest memory (`shadow_skipped_no_room`; with
+`EDEN_NX2_NVN_SHADOW_LOG=1` the first ones are logged as `written storage range stays in host
+memory`). OoT Kokiri has two such pools (305 and 88 MiB, imported) and ~62 of these bindings per present.
+`EDEN_NX2_TRY_REFUSED_SHADOW=1` (candidate) binds those of at most `EDEN_NX2_NVN_SHADOW_MAX_KIB` that
+are not in a raw-global plan through a copy shadow, as with mirrors off (at most 32 live copy shadows).
+
 **Validity** (`MirrorPages`: one bit per 4 KiB page). A page is valid when the mirror holds the guest
 bytes: it was copied in and no other writer has changed the guest page since. Invalid at creation, and
 made invalid by:

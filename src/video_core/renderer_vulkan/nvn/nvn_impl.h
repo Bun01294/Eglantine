@@ -1209,6 +1209,8 @@ struct Context::Impl {
     std::atomic<u64> commands_dispatched{0};
     /// ContextOptions::raw_keep_entries, else EDEN_NX2_TRY_RAW_KEEP_ENTRIES (set at construction).
     bool raw_keep_entries{false};
+    /// ContextOptions::refused_shadow, else EDEN_NX2_TRY_REFUSED_SHADOW (set at construction).
+    bool refused_shadow{false};
     bool vram_mirror_budget_logged{false};
     /// EDEN_NX2_NVN_COSTSPLIT (measurement only): null when off. Created before the profiler that
     /// reports into it, and destroyed after it.

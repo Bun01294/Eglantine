@@ -183,6 +183,13 @@ void DrawContext::ApplyMirrors(DrawPlan& plan, bool allow_create) {
         use.redirected = true;
         impl.stats.vram_bindings.fetch_add(1, std::memory_order_relaxed);
     };
+    // A mirror entry's buffer holds the pool at its own offsets, a copy shadow's slot does not.
+    const auto serve_entry = [&](DrawPlan::RangeUse& use, const Shadow& entry) {
+        scratch_buffers[use.info_index] = {entry.buffer, entry.offset + (use.offset - entry.begin),
+                                           use.size};
+        use.redirected = true;
+        impl.stats.vram_bindings.fetch_add(1, std::memory_order_relaxed);
+    };
     // A raw pointer can address any byte of a mirrored pool. Bring every stale page in before
     // dispatch, and snapshot the complete pool when the shader may write through that pointer.
     if (plan.raw_global) {
@@ -253,7 +260,7 @@ void DrawContext::ApplyMirrors(DrawPlan& plan, bool allow_create) {
         }
         const u64 use_end = use.offset + use.size;
         if (const size_t index = FindShadow(*use.pool, use.offset, use_end); index != shadows.size()) {
-            serve(use, shadows[index].buffer);
+            serve_entry(use, shadows[index]);
             continue;
         }
         if (!allow_create) {
@@ -269,7 +276,34 @@ void DrawContext::ApplyMirrors(DrawPlan& plan, bool allow_create) {
         }
         PoolMirror* const mirror = impl.VramMirror(*use.pool, true);
         if (mirror == nullptr) {
+            // No mirror for this pool (EDEN_NX2_TRY_REFUSED_SHADOW): a small range goes through a
+            // copy shadow as with mirrors off. Raw-global plans end copy shadows, so not for them.
+            const Debug::Config& debug = Debug::Get();
+            const bool copy_shadow =
+                impl.refused_shadow && !plan.raw_global && debug.shadow_storage &&
+                use.size <= debug.shadow_max_bytes && shadows.size() < MAX_LIVE_SHADOWS &&
+                std::ranges::count_if(shadows, [](const Shadow& entry) { return !entry.mirror; }) <
+                    static_cast<std::ptrdiff_t>(MAX_LIVE_COPY_SHADOWS);
+            bool created = false;
+            if (copy_shadow) {
+                const ShadowCopyBatch batch{*this};
+                created = CreateShadow(plan, use);
+            }
+            if (created) {
+                serve_entry(use, shadows.back());
+                continue;
+            }
             ++counters.shadow_skipped_no_room;
+            if (debug.shadow_log && host_write_logged.size() < MAX_LOGGED_SHADOWS &&
+                host_write_logged.emplace(use.pool->address, use.offset, use.size).second) {
+                LOG_INFO(Render_Vulkan,
+                         "[nvn] written storage range stays in host memory (pool has no mirror): "
+                         "pool {:#x} ({:#x} bytes, flags {:#x}) range {:#x}+{:#x} for {} "
+                         "vs={:016x} fs={:016x} cs={:016x}",
+                         use.pool->address, use.pool->size, use.pool->flags, use.offset, use.size,
+                         plan.graphics ? "a draw" : "a dispatch", ProfStageHash(0),
+                         ProfStageHash(4), ProfStageHash(STAGE_COMPUTE));
+            }
             continue;
         }
         if (shadows.size() >= MAX_LIVE_SHADOWS) {
@@ -316,7 +350,7 @@ void DrawContext::ApplyMirrors(DrawPlan& plan, bool allow_create) {
         }
         const u64 use_end = use.offset + use.size;
         if (const size_t index = FindShadow(*use.pool, use.offset, use_end); index != shadows.size()) {
-            serve(use, shadows[index].buffer);
+            serve_entry(use, shadows[index]);
             continue;
         }
         if (host_write_overlaps(use)) {

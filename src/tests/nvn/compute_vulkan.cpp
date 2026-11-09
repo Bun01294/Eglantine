@@ -1260,6 +1260,65 @@ TEST_CASE("NVN storage VRAM refuses pools above its configured size limit", "[nv
     REQUIRE(stats.vram_mirrors == 0);
     REQUIRE(stats.vram_mirror_refused == 1);
 }
+
+TEST_CASE("NVN storage VRAM: a written range of a refused pool goes through a copy shadow "
+          "(TRY_REFUSED_SHADOW)",
+          "[nvn][compute]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    for (const bool refused_shadow : {false, true}) {
+        INFO("refused_shadow " << refused_shadow);
+        ShadowRig rig(*vulkan, Vulkan::Nvn::ContextOptions{
+                                    .try_storage_vram = true,
+                                    .try_storage_vram_max_bytes = 32_KiB,
+                                    .refused_shadow = refused_shadow});
+        constexpr u64 ARGS = POOL_VA + 0x2000;
+        constexpr u64 TARGET = POOL_VA + 0x3000;
+        std::vector<u64> list;
+        Dispatch(list, PROGRAM, STORAGE_VA, 4096, 6);
+        Dispatch(list, PROGRAM_2, STORAGE_VA, 4096, 3);
+        // Groups 0-2 store 1, 2, 3: the indirect dispatch runs 1 x 2 x 3 groups, all with CTAID.X 0.
+        Dispatch(list, PROGRAM_ARGS, ARGS, 4096, 3);
+        BindCompute(list, PROGRAM_2, TARGET, 4096);
+        Push(list, VC::Op::Dispatch, VC::DispatchPayload{.indirect = ARGS});
+        rig.Run(1, std::move(list));
+        if (!rig.Imported()) {
+            SKIP("storage VRAM pool-size eligibility requires host-imported guest pools");
+        }
+
+        const u32 expected[] = {200, 201, 202, 103, 104, 105};
+        for (u32 i = 0; i < 6; ++i) {
+            INFO("word " << i);
+            REQUIRE(WordAt(rig.data, 0x1000 + i * 4) == expected[i]);
+        }
+        REQUIRE(WordAt(rig.data, 0x1000 + 6 * 4) == 0xCDCDCDCDu);
+        REQUIRE(WordAt(rig.data, 0x0FFC) == 0xCDCDCDCDu);
+        REQUIRE(WordAt(rig.data, 0x2000) == 1);
+        REQUIRE(WordAt(rig.data, 0x2004) == 2);
+        REQUIRE(WordAt(rig.data, 0x2008) == 3);
+        REQUIRE(WordAt(rig.data, 0x3000) == 200);
+        REQUIRE(WordAt(rig.data, 0x3004) == 0xCDCDCDCDu);
+        const Vulkan::Nvn::ContextStats stats = rig.context.Stats();
+        REQUIRE(stats.ops_failed == 0);
+        REQUIRE(stats.ops_unsupported == 0);
+        REQUIRE(stats.vram_mirrors == 0);
+        REQUIRE(stats.vram_mirror_refused == 1);
+        if (refused_shadow) {
+            // The two dispatches share the storage shadow; the indirect arguments' shadow goes
+            // back before the indirect dispatch reads them from the guest memory.
+            CHECK(stats.shadow_creates == 3);
+            CHECK(stats.shadow_skipped_no_room == 0);
+            CHECK(stats.shadow_flush_conflict == 1);
+            CHECK(stats.shadow_flush_segment == 2);
+            CHECK(stats.shadow_bytes_out == 3 * 4096);
+        } else {
+            CHECK(stats.shadow_creates == 0);
+            CHECK(stats.shadow_skipped_no_room >= 3);
+        }
+    }
+}
 TEST_CASE("NVN pool mirror: a written range stays in VRAM across submissions",
           "[nvn][compute]") {
     auto vulkan = MakeHeadlessVulkan();

@@ -157,6 +157,7 @@ Config Read() {
     config.vtxcov_diag = EnvFlag("EDEN_NX2_NVN_VTXCOV_DIAG", config.try_vtx_mirror ||
                                                                  config.try_vtxcov != 0);
     config.try_raw_keep_entries = EnvFlag("EDEN_NX2_TRY_RAW_KEEP_ENTRIES", true);
+    config.try_refused_shadow = EnvFlag("EDEN_NX2_TRY_REFUSED_SHADOW");
     config.diag_ro_raw_keep = EnvFlag("EDEN_NX2_NVN_DIAG_RO_RAW_KEEP");
     if (const char* mode = std::getenv("EDEN_NX2_NVN_DEPTH_MODE"); mode != nullptr && *mode != '\0') {
         config.depth_mode = std::atoi(mode) != 0 ? 1 : 0;
