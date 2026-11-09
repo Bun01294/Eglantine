@@ -235,6 +235,7 @@ Context::Impl::Impl(const Device& device_, std::mutex& submit_mutex_,
     flush_tracked = options.flush_tracked.value_or(Debug::Get().try_flush_tracked);
     mirror_hash_tracked = options.mirror_hash_tracked.value_or(!Debug::Get().mirror_hash_always);
     raw_split_import.store(Debug::Get().raw_split_import, std::memory_order_relaxed);
+    tex_hash_tracked = mirror_hash_tracked && !Debug::Get().tex_hash_always;
     invalidate_wait_ms = options.invalidate_wait_ms.value_or(Debug::Get().try_invalidate_writeback);
     raw_keep_entries = options.raw_keep_entries.value_or(Debug::Get().try_raw_keep_entries);
     refused_shadow = options.refused_shadow.value_or(Debug::Get().try_refused_shadow);
@@ -648,6 +649,10 @@ Context::Impl::~Impl() {
     upscaler_fsr.reset();
     mirror_merge_stats = {}; // allocator-owned, like the pool buffers above
     bc_scratch.reset();
+    {
+        std::scoped_lock lock{free_staging_mutex};
+        free_staging.clear();
+    }
     allocator.reset();
     command_buffer_allocations.clear();
     command_pool.reset();
@@ -1242,6 +1247,15 @@ void Context::Impl::CompleteMain() {
             std::scoped_lock lock{free_commands_mutex};
             free_command_buffers.insert(free_command_buffers.end(), flight->command_buffers.begin(),
                                         flight->command_buffers.end());
+        }
+        if (!flight->staging.empty()) {
+            std::scoped_lock lock{free_staging_mutex};
+            for (vk::Buffer& chunk : flight->staging) {
+                if (chunk.Mapped().size() == STAGING_CHUNK_SIZE &&
+                    free_staging.size() < MAX_FREE_STAGING) {
+                    free_staging.push_back(std::move(chunk));
+                }
+            }
         }
         flight->staging.clear();
         if (!flight->arena.empty()) {
@@ -1942,14 +1956,14 @@ std::string Context::DescribeState() const {
     const auto& s = impl->stats;
     text += fmt::format(
         " mem(storages new/reuse/evict={}/{}/{} split_import(pools/runs)={}/{} uploads={} MB={} "
-        "cpu check/change={}/{} "
+        "cpu check/trusted/change={}/{}/{} "
         "hash_ms={} hash_MB={} (compressed {} dynamic {}) decode_ms={} decode_MB={} alias_xfer={} "
         "alias_seen={} virt={} astc gpu/fallback/bc={}/{}/{} untile gpu/direct/fallback={}/{}/{} "
         "untile_gpu_MB={} storage_cache(MB/superseded/aged/pressure_evicted)={}/{}/{}/{})",
         s.storages_created.load(), s.storages_reused.load(), s.storages_evicted.load(),
         s.pools_split_imported.load(), s.split_runs.load(),
-        s.uploads.load(), s.upload_bytes.load() >> 20, s.cpu_checks.load(), s.cpu_changes.load(),
-        s.hash_ns.load() / 1'000'000, s.hash_bytes.load() >> 20,
+        s.uploads.load(), s.upload_bytes.load() >> 20, s.cpu_checks.load(),
+        s.cpu_checks_trusted.load(), s.cpu_changes.load(), s.hash_ns.load() / 1'000'000, s.hash_bytes.load() >> 20,
         s.hash_bytes_compressed.load() >> 20, s.hash_bytes_dynamic.load() >> 20,
         s.decode_ns.load() / 1'000'000, s.decode_bytes.load() >> 20, s.alias_transfers.load(),
         s.alias_overlaps_seen.load(), s.virtual_maps.load(), s.astc_gpu_uploads.load(),

@@ -48,7 +48,7 @@ namespace {
 constexpr VkPipelineStageFlags ALL_STAGES = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
 constexpr VkAccessFlags ALL_WRITES = VK_ACCESS_MEMORY_WRITE_BIT;
 constexpr VkAccessFlags ALL_ACCESS = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-constexpr u64 STAGING_CHUNK = u64{8} << 20;
+constexpr u64 STAGING_CHUNK = Context::Impl::STAGING_CHUNK_SIZE;
 /// Tiled uploads below this many linear bytes untile on the CPU: a few dozen microseconds there,
 /// less than a buffer allocation, a dispatch and a barrier more (switch2-recomp's GPU untile uses
 /// the same 64 KiB floor).
@@ -1147,10 +1147,20 @@ StagingRange Recorder::AllocStaging(u64 size, u64 alignment) {
     chunk_used = (chunk_used + alignment - 1) / alignment * alignment;
     if (flight.staging.empty() || chunk_used + size > chunk_size) {
         chunk_size = (std::max)(size, STAGING_CHUNK);
-        // Storage use: the GPU untile reads tiled bytes from staging (UploadUntileOnGpu).
-        vk::Buffer chunk = impl.CreateHostBuffer(
-            chunk_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            MemoryUsage::Upload, AllocationKind::Staging);
+        vk::Buffer chunk;
+        if (chunk_size == STAGING_CHUNK) {
+            std::scoped_lock lock{impl.free_staging_mutex};
+            if (!impl.free_staging.empty()) {
+                chunk = std::move(impl.free_staging.back());
+                impl.free_staging.pop_back();
+            }
+        }
+        if (!chunk) {
+            // Storage use: the GPU untile reads tiled bytes from staging (UploadUntileOnGpu).
+            chunk = impl.CreateHostBuffer(
+                chunk_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                MemoryUsage::Upload, AllocationKind::Staging);
+        }
         chunk_pointer = chunk.Mapped().data();
         flight.staging.push_back(std::move(chunk));
         chunk_used = 0;
@@ -1179,63 +1189,7 @@ u64 Recorder::GuestPageHash(const Pool& pool, u64 page) const {
 }
 
 bool Recorder::MirrorTakeCpuWrites(Pool& pool) {
-    if (!impl.mirror_hash_tracked) {
-        return false;
-    }
-    VC::GuestMemory* const memory = impl.guest.load(std::memory_order_acquire);
-    if (memory == nullptr) {
-        return false;
-    }
-    if (!pool.split_runs.empty()) {
-        // Raw stores reach a split pool's guest bytes past the tracker: once one completed, every
-        // page is hashed again before it is trusted.
-        const u64 raw_epoch = impl.split_raw_epoch.load(std::memory_order_acquire);
-        if (raw_epoch != pool.split_raw_epoch_seen) {
-            pool.split_raw_epoch_seen = raw_epoch;
-            for (Pool::MirrorPage& page : pool.mirror_pages) {
-                page.trusted = false;
-            }
-        }
-    }
-    if (pool.mirror_track == 0) {
-        if (pool.mirror_track_tried) {
-            return false;
-        }
-        pool.mirror_track_tried = true;
-        pool.mirror_track = memory->Track(pool.address, pool.size);
-        if (pool.mirror_track == 0) {
-            return false;
-        }
-        // Watched from now on: a page hashed after this shows any later CPU write. No page is
-        // trusted yet.
-        memory->Arm(pool.mirror_track, pool.address, pool.size);
-        pool.mirror_write_epoch = memory->WriteEpoch(pool.mirror_track);
-        if (pool.mirror_write_epoch) {
-            pool.mirror_epoch_clean = pool.mirror_write_epoch->load(std::memory_order_acquire);
-        }
-        return true;
-    }
-    u64 epoch = 0;
-    if (pool.mirror_write_epoch) {
-        epoch = pool.mirror_write_epoch->load(std::memory_order_acquire);
-        if (epoch == pool.mirror_epoch_clean) {
-            return true;
-        }
-    }
-    // The whole pool: a taken write lives on as an untrusted page until that page is hashed, so a
-    // range checked later does not lose it.
-    thread_local std::vector<std::pair<u64, u64>> written;
-    written.clear();
-    memory->TakeWritten(pool.mirror_track, pool.address, pool.size, written);
-    for (const auto& [begin, end] : written) {
-        const u64 from = (std::max)(begin, pool.address) - pool.address;
-        const u64 to = (std::min)(end - pool.address, pool.size);
-        for (u64 page = from / Pool::MIRROR_PAGE; page * Pool::MIRROR_PAGE < to; ++page) {
-            pool.mirror_pages[static_cast<size_t>(page)].trusted = false;
-        }
-    }
-    pool.mirror_epoch_clean = epoch; // read before the take: a write in between shows as a change
-    return true;
+    return impl.TakePoolCpuWrites(pool);
 }
 
 bool Recorder::MirrorPageSettled(Pool& pool, u64 page,

@@ -50,6 +50,97 @@ u64 Context::Impl::PollTick() {
     return poll_tick;
 }
 
+bool Context::Impl::TakePoolCpuWrites(Pool& pool) {
+    if (!mirror_hash_tracked) {
+        return false;
+    }
+    VC::GuestMemory* const memory = guest.load(std::memory_order_acquire);
+    if (memory == nullptr) {
+        return false;
+    }
+    if (!pool.split_runs.empty()) {
+        // Raw stores reach a split pool's guest bytes past the tracker: once one completed, every
+        // page is hashed again before it is trusted.
+        const u64 raw_epoch = split_raw_epoch.load(std::memory_order_acquire);
+        if (raw_epoch != pool.split_raw_epoch_seen) {
+            pool.split_raw_epoch_seen = raw_epoch;
+            for (Pool::MirrorPage& page : pool.mirror_pages) {
+                page.trusted = false;
+            }
+            // Textures of the pool too: every page counts as written.
+            ++pool.cpu_write_gen;
+            std::fill(pool.page_write_gen.begin(), pool.page_write_gen.end(), pool.cpu_write_gen);
+        }
+    }
+    if (pool.mirror_track == 0) {
+        if (pool.mirror_track_tried) {
+            return false;
+        }
+        pool.mirror_track_tried = true;
+        pool.mirror_track = memory->Track(pool.address, pool.size);
+        if (pool.mirror_track == 0) {
+            return false;
+        }
+        // Watched from now on: a page hashed after this shows any later CPU write. No page is
+        // trusted yet.
+        memory->Arm(pool.mirror_track, pool.address, pool.size);
+        pool.mirror_write_epoch = memory->WriteEpoch(pool.mirror_track);
+        if (pool.mirror_write_epoch) {
+            pool.mirror_epoch_clean = pool.mirror_write_epoch->load(std::memory_order_acquire);
+        }
+        pool.page_write_gen.assign(
+            static_cast<size_t>((pool.size + Pool::MIRROR_PAGE - 1) / Pool::MIRROR_PAGE), 0);
+        return true;
+    }
+    u64 epoch = 0;
+    if (pool.mirror_write_epoch) {
+        epoch = pool.mirror_write_epoch->load(std::memory_order_acquire);
+        if (epoch == pool.mirror_epoch_clean) {
+            return true;
+        }
+    }
+    // The whole pool: a taken write lives on as an untrusted page until that page is hashed, so a
+    // range checked later does not lose it.
+    thread_local std::vector<std::pair<u64, u64>> written;
+    written.clear();
+    memory->TakeWritten(pool.mirror_track, pool.address, pool.size, written);
+    if (!written.empty()) {
+        ++pool.cpu_write_gen;
+    }
+    for (const auto& [begin, end] : written) {
+        const u64 from = (std::max)(begin, pool.address) - pool.address;
+        const u64 to = (std::min)(end - pool.address, pool.size);
+        for (u64 page = from / Pool::MIRROR_PAGE; page * Pool::MIRROR_PAGE < to; ++page) {
+            const size_t index = static_cast<size_t>(page);
+            if (index < pool.mirror_pages.size()) {
+                pool.mirror_pages[index].trusted = false;
+            }
+            if (index < pool.page_write_gen.size()) {
+                pool.page_write_gen[index] = pool.cpu_write_gen;
+            }
+        }
+    }
+    pool.mirror_epoch_clean = epoch; // read before the take: a write in between shows as a change
+    return true;
+}
+
+bool Context::Impl::PoolWrittenSince(const Pool& pool, u64 offset, u64 size, u32 gen) {
+    if (size == 0) {
+        return false;
+    }
+    const u64 first = offset / Pool::MIRROR_PAGE;
+    const u64 last = (offset + size - 1) / Pool::MIRROR_PAGE;
+    if (last >= pool.page_write_gen.size()) {
+        return true;
+    }
+    for (u64 page = first; page <= last; ++page) {
+        if (pool.page_write_gen[static_cast<size_t>(page)] > gen) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
     // A storage the GPU wrote is watched too (a decoder writing a video plane the game cleared
     // first): its baseline is the guest signature at the first check after the GPU write, so a
@@ -69,7 +160,7 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
     if (pool_it == pools.end() || s.pool_offset >= pool_it->second->size) {
         return;
     }
-    const Pool& pool = *pool_it->second;
+    Pool& pool = *pool_it->second;
     const bool watching = s.origin == StorageOrigin::Gpu;
     if (watching && ((pool.flags & PoolFlag::CpuNoAccess) != 0 || pool.IsVirtual())) {
         return;
@@ -78,11 +169,30 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
     if (size == 0) {
         return;
     }
+    constexpr u64 SMALL_STORAGE = u64{4} << 20;
+    const auto schedule_unchanged = [&] {
+        ++s.unchanged_checks;
+        u64 backoff = CheckBackoff(s.unchanged_checks);
+        if (size <= SMALL_STORAGE) {
+            backoff = (std::min)(backoff, u64{3}); // a new glyph shows within a few frames
+        }
+        s.next_check_tick = tick + 1 + (s.dynamic ? (std::min)(backoff, u64{1}) : backoff);
+    };
+    // The page tracker saw none of the storage's pages written since a full hash matched: the
+    // bytes are the same, no hash needed. Forced checks (a flush, a host write) still hash.
+    const bool tracked = tex_hash_tracked && !watching && !pool.IsVirtual() &&
+                         (pool.flags & PoolFlag::CpuNoAccess) == 0 && TakePoolCpuWrites(pool);
+    const u32 tracked_gen = pool.cpu_write_gen;
+    if (tracked && !forced && s.cpu_trusted_gen != 0 &&
+        !PoolWrittenSince(pool, s.pool_offset, size, s.cpu_trusted_gen)) {
+        stats.cpu_checks_trusted.fetch_add(1, std::memory_order_relaxed);
+        schedule_unchanged();
+        return;
+    }
     // A texture the CPU keeps writing parts of (a glyph atlas) shows new content only in a few
     // lines the signature may not sample: small uncompressed ones and ones that changed before
     // are compared in full at every check. Block-compressed data is rewritten whole (a streamed
     // tile), so its signature plus the scheduled full compare are enough.
-    constexpr u64 SMALL_STORAGE = u64{4} << 20;
     const bool compressed = s.desc.format != 0 && FormatBlockInfo(s.desc.format).width > 1;
     const bool every_check = forced || s.dynamic || (size <= SMALL_STORAGE && !compressed);
     bool full = every_check || tick >= s.next_full_tick;
@@ -135,6 +245,11 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
             changed = HashGuestBytes(data, size) != s.guest_hash;
             hashed += size;
             s.next_full_tick = tick + FULL_VERIFY_PRESENTS;
+            // Taken before the bytes were read: a write since shows with a later generation.
+            s.cpu_trusted_gen = (!changed && tracked) ? tracked_gen : 0;
+        }
+        if (changed) {
+            s.cpu_trusted_gen = 0;
         }
     }
     const u64 check_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -159,12 +274,7 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
                  changed, check_ns / 1e6, guest_ns / 1e6);
     }
     if (!changed) {
-        ++s.unchanged_checks;
-        u64 backoff = CheckBackoff(s.unchanged_checks);
-        if (size <= SMALL_STORAGE) {
-            backoff = (std::min)(backoff, u64{3}); // a new glyph shows within a few frames
-        }
-        s.next_check_tick = tick + 1 + (s.dynamic ? (std::min)(backoff, u64{1}) : backoff);
+        schedule_unchanged();
         return;
     }
     stats.cpu_changes.fetch_add(1, std::memory_order_relaxed);

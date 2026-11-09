@@ -140,6 +140,7 @@ Config Read() {
     config.try_flush_tracked = EnvFlag("EDEN_NX2_TRY_FLUSH_TRACKED", true);
     config.mirror_hash_always = EnvFlag("EDEN_NX2_NVN_MIRROR_HASH_ALWAYS");
     config.raw_split_import = EnvFlag("EDEN_NX2_NVN_RAW_SPLIT_IMPORT", true);
+    config.tex_hash_always = EnvFlag("EDEN_NX2_NVN_TEX_HASH_ALWAYS");
     if (const u64 wait = EnvNumber("EDEN_NX2_TRY_INVALIDATE_WRITEBACK", 0); wait != 0) {
         config.try_invalidate_writeback =
             static_cast<u32>(wait == 1 ? 250 : (std::min<u64>)(wait, 5000));
