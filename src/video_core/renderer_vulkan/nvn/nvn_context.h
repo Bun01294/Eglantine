@@ -157,7 +157,7 @@ struct ContextOptions {
     /// TrimStorageCache). Unset: EDEN_NX2_NVN_STORAGE_BUDGET_MIB, else 6 GiB.
     std::optional<u64> storage_cache_budget_bytes{};
     /// Presents after which an idle render target that can be rebuilt leaves the cache even under
-    /// the budget (0: never). Unset: EDEN_NX2_NVN_TRIM_AGE_PRESENTS, else 300.
+    /// the budget (0: never). Unset: EDEN_NX2_NVN_TRIM_AGE_PRESENTS, else 0 (off: the age rule dropped GPU-written lighting targets in OoT).
     std::optional<u64> storage_trim_age_presents{};
     /// The trim of before the age and device budget rules. Unset: EDEN_NX2_NVN_TRIM_LEGACY.
     std::optional<bool> storage_trim_legacy{};

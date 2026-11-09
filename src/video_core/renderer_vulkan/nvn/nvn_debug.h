@@ -175,8 +175,8 @@ struct Config {
     /// EDEN_NX2_NVN_STORAGE_BUDGET_MIB: the storage cache budget (0: the default, 6144 MiB).
     u64 storage_budget_bytes{0};
     /// EDEN_NX2_NVN_TRIM_AGE_PRESENTS: presents after which an idle render target that can be
-    /// rebuilt leaves the storage cache (default 300, 0 never).
-    u64 trim_age_presents{300};
+    /// rebuilt leaves the storage cache (default 0 = off: it dropped GPU-written lighting targets in OoT; 300 = the old rule).
+    u64 trim_age_presents{0};
     /// EDEN_NX2_NVN_TRIM_LEGACY=1: the storage cache trim without the age and device budget rules.
     bool trim_legacy{false};
     /// EDEN_NX2_TRY_VMA_DEVICE_STRICT=1 (candidate): the replay's device-local images and buffers

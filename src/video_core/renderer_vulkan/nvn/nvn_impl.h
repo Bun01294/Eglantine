@@ -218,7 +218,7 @@ inline u64 CheckBackoff(u32 unchanged_checks) {
 inline constexpr u64 DEFAULT_STORAGE_CACHE_BUDGET = u64{6} << 30;
 /// Presents an idle render target that guest bytes or newer storages can rebuild stays cached
 /// under the budget (ContextOptions::storage_trim_age_presents overrides it; 0 never ages out).
-inline constexpr u64 DEFAULT_STORAGE_TRIM_AGE_PRESENTS = 300;
+inline constexpr u64 DEFAULT_STORAGE_TRIM_AGE_PRESENTS = 0;
 
 /// True when the half-open ranges, sorted by start, leave no byte of [begin, end) uncovered.
 [[nodiscard]] inline bool RangesCover(std::span<const std::pair<u64, u64>> ranges, u64 begin,
