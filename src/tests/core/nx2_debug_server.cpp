@@ -521,3 +521,67 @@ TEST_CASE("NVN draw probe skips by stage hash and takes a census per full frame"
     Probe::DumpDone(*path, {});
     REQUIRE(Probe::GetDump().path == *path);
 }
+
+TEST_CASE("NVN draw probe skips dispatches by compute hash and takes their census",
+          "[core][nx2_debug_server]") {
+    namespace Probe = VideoCommon::NvnDrawProbe;
+    Probe::Reset();
+    SCOPE_EXIT {
+        Probe::Reset();
+    };
+    const Probe::DispatchInfo direct{.hash = 0xc0, .groups = {4, 2, 1}, .indirect = false};
+    const Probe::DispatchInfo indirect{.hash = 0xc0, .groups = {}, .indirect = true};
+    const Probe::DispatchInfo other{.hash = 0xc1, .groups = {8, 1, 1}, .indirect = false};
+    Probe::DrawInfo draw{};
+    draw.hashes[0] = 0xa0;
+
+    Probe::SetSkip({0xc0}, Probe::SkipMode::Skip);
+    REQUIRE(Probe::Active());
+    REQUIRE(Probe::OnDispatch(direct));
+    REQUIRE(Probe::OnDispatch(indirect));
+    REQUIRE_FALSE(Probe::OnDispatch(other));
+    REQUIRE_FALSE(Probe::OnDraw(draw));
+    // Only mode selects draws; listed compute hashes still skip their dispatches.
+    Probe::SetSkip({0xa0, 0xc0}, Probe::SkipMode::Only);
+    REQUIRE_FALSE(Probe::OnDraw(draw));
+    REQUIRE(Probe::OnDispatch(direct));
+    REQUIRE_FALSE(Probe::OnDispatch(other));
+    Probe::SetSkip({}, Probe::SkipMode::Only);
+    REQUIRE(Probe::OnDraw(draw));
+    REQUIRE_FALSE(Probe::OnDispatch(direct));
+
+    Probe::SetSkip({0xc0}, Probe::SkipMode::Skip);
+    REQUIRE_FALSE(Probe::ArmCensus(1));
+    (void)Probe::OnDispatch(other); // the partial frame before the first present is dropped
+    Probe::OnPresent();
+    REQUIRE(Probe::LastCensus().dispatch_rows.empty());
+    (void)Probe::OnDispatch(direct);
+    (void)Probe::OnDispatch(direct);
+    (void)Probe::OnDispatch(indirect);
+    (void)Probe::OnDispatch(other);
+    (void)Probe::OnDraw(draw);
+    Probe::OnPresent();
+    const Probe::Census census = Probe::LastCensus();
+    REQUIRE(census.present != 0);
+    REQUIRE(census.draws == 1);
+    REQUIRE(census.dispatches == 4);
+    REQUIRE(census.skipped_dispatches == 3);
+    REQUIRE(census.dispatch_rows.size() == 2);
+    const Probe::DispatchRow& first = census.dispatch_rows[0];
+    REQUIRE(first.hash == 0xc0);
+    REQUIRE(first.count == 3);
+    REQUIRE(first.groups == 16);
+    REQUIRE(first.indirect == 1);
+    REQUIRE(first.skipped == 3);
+    const Probe::DispatchRow& second = census.dispatch_rows[1];
+    REQUIRE(second.hash == 0xc1);
+    REQUIRE(second.count == 1);
+    REQUIRE(second.groups == 8);
+    REQUIRE(second.indirect == 0);
+    REQUIRE(second.skipped == 0);
+
+    // The census is over; the skip set alone keeps the probe active.
+    REQUIRE(Probe::Active());
+    Probe::SetSkip({}, Probe::SkipMode::Skip);
+    REQUIRE_FALSE(Probe::Active());
+}

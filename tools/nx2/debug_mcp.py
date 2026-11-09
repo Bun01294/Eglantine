@@ -257,9 +257,13 @@ TOOLS = [
                        "EDEN_NX2_NVN_ONLY_VS), draw count, summed vertex/index count, primitive "
                        "mode, indexed/indirect/mesh, and for the first draw its vertex streams "
                        "(guest address, pool and offset, staged copy) and index range. Most draws "
-                       "first, 'limit' rows (default 40); 'hash' keeps rows having that hash. The "
-                       "first call arms the census for 'arm_presents' presents (default 600) and "
-                       "waits up to 3 s for a full frame.",
+                       "first, 'limit' rows (default 40); 'hash' keeps rows having that hash. Also "
+                       "'dispatches': one row per compute program hash (the hash the gpuprof "
+                       "report prints) with count, groups (summed x*y*z of the direct ones), "
+                       "indirect (indirect dispatches) and skipped (dropped by nvn_draw_skip), "
+                       "most dispatches first, same 'limit' and 'hash'. The first call arms the "
+                       "census for 'arm_presents' presents (default 600) and waits up to 3 s for a "
+                       "full frame.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -276,8 +280,12 @@ TOOLS = [
                        "set, add, remove, clear (also resets mode to skip). 'hashes': stage hashes "
                        "as nvn_draws lists them. 'mode': skip (default: skip listed) or only (skip "
                        "every draw except those having a listed hash; an empty list in only mode "
-                       "skips every draw). Returns the mode and set. Clear it when done; it is "
-                       "also cleared when the game stops.",
+                       "skips every draw). Compute dispatches whose compute hash (nvn_draws "
+                       "'dispatches', gpuprof) is listed are skipped in both modes; only mode "
+                       "never skips an unlisted dispatch. A skipped direct dispatch is recorded "
+                       "with zero workgroups (its barriers stay), a skipped indirect one is not "
+                       "recorded. Returns the mode and set. Clear it when done; it is also cleared "
+                       "when the game stops.",
         "inputSchema": {
             "type": "object",
             "properties": {

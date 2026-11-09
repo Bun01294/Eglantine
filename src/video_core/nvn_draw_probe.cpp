@@ -28,6 +28,9 @@ struct State {
     std::map<Key, Row> current;
     u64 current_draws{};
     u64 current_skipped{};
+    std::map<u64, DispatchRow> current_dispatch_rows;
+    u64 current_dispatches{};
+    u64 current_skipped_dispatches{};
     Census last;
     u64 presents{};
     // Skip set.
@@ -58,6 +61,15 @@ bool Matches(const std::vector<u64>& set, const DrawInfo& info) {
     return false;
 }
 
+void ClearCurrentLocked(State& s) {
+    s.current.clear();
+    s.current_draws = 0;
+    s.current_skipped = 0;
+    s.current_dispatch_rows.clear();
+    s.current_dispatches = 0;
+    s.current_skipped_dispatches = 0;
+}
+
 } // namespace
 
 bool OnDraw(const DrawInfo& info) {
@@ -85,6 +97,28 @@ bool OnDraw(const DrawInfo& info) {
     return skip;
 }
 
+bool OnDispatch(const DispatchInfo& info) {
+    State& s = S();
+    std::scoped_lock lock{s.mutex};
+    // Only mode selects draws; a dispatch is skipped in either mode when its hash is listed.
+    const bool skip =
+        info.hash != 0 && std::find(s.skip.begin(), s.skip.end(), info.hash) != s.skip.end();
+    if (s.census_presents_left != 0) {
+        DispatchRow& row = s.current_dispatch_rows[info.hash];
+        row.hash = info.hash;
+        ++row.count;
+        if (info.indirect) {
+            ++row.indirect;
+        } else {
+            row.groups += u64{info.groups[0]} * info.groups[1] * info.groups[2];
+        }
+        row.skipped += skip ? 1 : 0;
+        ++s.current_dispatches;
+        s.current_skipped_dispatches += skip ? 1 : 0;
+    }
+    return skip;
+}
+
 void OnPresent() {
     State& s = S();
     std::scoped_lock lock{s.mutex};
@@ -94,9 +128,7 @@ void OnPresent() {
     }
     if (s.census_partial) {
         s.census_partial = false;
-        s.current.clear();
-        s.current_draws = 0;
-        s.current_skipped = 0;
+        ClearCurrentLocked(s);
         return;
     }
     Census census;
@@ -109,10 +141,16 @@ void OnPresent() {
     }
     std::sort(census.rows.begin(), census.rows.end(),
               [](const Row& a, const Row& b) { return a.draws > b.draws; });
+    census.dispatches = s.current_dispatches;
+    census.skipped_dispatches = s.current_skipped_dispatches;
+    census.dispatch_rows.reserve(s.current_dispatch_rows.size());
+    for (const auto& [hash, row] : s.current_dispatch_rows) {
+        census.dispatch_rows.push_back(row);
+    }
+    std::stable_sort(census.dispatch_rows.begin(), census.dispatch_rows.end(),
+                     [](const DispatchRow& a, const DispatchRow& b) { return a.count > b.count; });
     s.last = std::move(census);
-    s.current.clear();
-    s.current_draws = 0;
-    s.current_skipped = 0;
+    ClearCurrentLocked(s);
     --s.census_presents_left;
     UpdateActiveLocked(s);
 }
@@ -145,9 +183,7 @@ bool ArmCensus(u32 presents) {
     std::scoped_lock lock{s.mutex};
     const bool running = s.census_presents_left != 0;
     if (!running) {
-        s.current.clear();
-        s.current_draws = 0;
-        s.current_skipped = 0;
+        ClearCurrentLocked(s);
         s.census_partial = true;
     }
     s.census_presents_left = std::max(s.census_presents_left, presents);
@@ -166,9 +202,7 @@ void Reset() {
     std::scoped_lock lock{s.mutex};
     s.census_presents_left = 0;
     s.census_partial = false;
-    s.current.clear();
-    s.current_draws = 0;
-    s.current_skipped = 0;
+    ClearCurrentLocked(s);
     s.last = {};
     s.skip.clear();
     s.skip_mode = SkipMode::Skip;

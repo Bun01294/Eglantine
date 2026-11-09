@@ -407,8 +407,8 @@ json RejectShaders(ToolState&, const json& params) {
                 {"applied", false},
                 {"vtx_hle", true},
                 {"note", "VTX-HLE is active: reject_shaders only affects the emulated GPU path, "
-                         "VTX-HLE draws are not changed. Use nvn_draw_skip with the stage hashes "
-                         "nvn_draws lists to drop VTX-HLE draws."}};
+                         "VTX-HLE draws are not changed. Use nvn_draw_skip with the stage or "
+                         "compute hashes nvn_draws lists to drop VTX-HLE draws or dispatches."}};
     }
     const int timeout = Param<int>(params, "timeout_s", 5, 0, 60);
     const bool applied = hashes.empty() || VideoCore::Nx2Debug::WaitRejectApplied(
@@ -741,11 +741,31 @@ json NvnDraws(ToolState& state, const json& params) {
         rows.push_back(std::move(entry));
     }
     out["pipelines"] = std::move(rows);
+    out["dispatch_count"] = census.dispatches;
+    out["skipped_dispatches"] = census.skipped_dispatches;
+    out["dispatch_programs_total"] = census.dispatch_rows.size();
+    json dispatches = json::array();
+    for (const Probe::DispatchRow& row : census.dispatch_rows) {
+        if (dispatches.size() >= limit) {
+            break;
+        }
+        if (filter && row.hash != *filter) {
+            continue;
+        }
+        dispatches.push_back({{"hash", Hex(row.hash)},
+                              {"count", row.count},
+                              {"groups", row.groups},
+                              {"indirect", row.indirect},
+                              {"skipped", row.skipped}});
+    }
+    out["dispatches"] = std::move(dispatches);
     out["format"] = "One row per distinct (stage hashes, primitive mode, indexed, indirect, mesh) "
                     "of the last recorded present, most draws first. elements = sum of direct "
                     "vertex/index counts (0 for indirect and mesh draws). mode = NVNdrawPrimitive. "
                     "first_draw_* describe the first draw of the row; staged = it binds the pass's "
-                    "device-local staged copy.";
+                    "device-local staged copy. dispatches: one row per compute program hash (the "
+                    "gpuprof one), most dispatches first; groups = sum of x*y*z of the direct ones, "
+                    "indirect = indirect dispatches, skipped = dropped by nvn_draw_skip.";
     return out;
 }
 
@@ -756,8 +776,10 @@ json SkipState() {
     const bool only = mode == Probe::SkipMode::Only;
     return {{"mode", only ? "only" : "skip"},
             {"hashes", HexList(hashes)},
-            {"note", only ? "Every draw is skipped unless one of its stage hashes is listed."
-                          : "Draws with any listed stage hash are skipped."}};
+            {"note", only ? "Every draw is skipped unless one of its stage hashes is listed; "
+                            "dispatches with a listed compute hash are skipped."
+                          : "Draws with any listed stage hash and dispatches with a listed "
+                            "compute hash are skipped."}};
 }
 
 json NvnDrawSkip(ToolState&, const json& params) {

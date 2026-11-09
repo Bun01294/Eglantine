@@ -11,11 +11,11 @@
 
 #include "common/common_types.h"
 
-/// Live draw census, draw skipping by stage hash and a one-shot draw dump for the NVN replay
-/// (VTX-HLE), driven by the debug server methods `nvn_draws`, `nvn_draw_skip` and `nvn_draw_dump`
-/// (core/debugger/nx2_debug_tools.cpp). No Vulkan types: the replay fills it
-/// (DrawContext::ProbeDraw), the debug server thread reads it. Unused cost: one relaxed atomic load
-/// per draw.
+/// Live draw and dispatch census, draw and dispatch skipping by program hash and a one-shot draw
+/// dump for the NVN replay (VTX-HLE), driven by the debug server methods `nvn_draws`,
+/// `nvn_draw_skip` and `nvn_draw_dump` (core/debugger/nx2_debug_tools.cpp). No Vulkan types: the
+/// replay fills it (DrawContext::ProbeDraw, DrawContext::Dispatch), the debug server thread reads
+/// it. Unused cost: one relaxed atomic load per draw and dispatch.
 namespace VideoCommon::NvnDrawProbe {
 
 /// NVNshaderStage numbering: 0 vertex, 1 fragment, 2 geometry, 3 tess control, 4 tess eval,
@@ -56,20 +56,41 @@ struct Row {
     u64 skipped{};
 };
 
+/// One compute dispatch as the replay is about to record it.
+struct DispatchInfo {
+    u64 hash{};                  ///< compute program hash, as the GPU profiler prints it
+    std::array<u32, 3> groups{}; ///< workgroups of a direct dispatch (0 for indirect)
+    bool indirect{};
+};
+
+/// The dispatches of one compute program in a present.
+struct DispatchRow {
+    u64 hash{};
+    u64 count{};
+    u64 groups{};   ///< sum of x*y*z of the direct ones
+    u64 indirect{};
+    u64 skipped{};
+};
+
 struct Census {
     u64 present{};       ///< replay present number the census ends at (0: none yet)
     u64 draws{};
     u64 skipped{};
     std::vector<Row> rows;
+    u64 dispatches{};
+    u64 skipped_dispatches{};
+    std::vector<DispatchRow> dispatch_rows; ///< most dispatches first
 };
 
+/// Draws: Skip drops the draws having a listed stage hash, Only drops every other draw.
+/// Dispatches: in both modes the ones whose compute hash is listed are dropped.
 enum class SkipMode { Skip, Only };
 
 namespace Detail {
 extern std::atomic<bool> g_active;
 }
 
-/// Anything armed (census, skip set, dump)? Checked per draw.
+/// Anything armed (census, skip set, dump)? Checked per draw and dispatch.
 [[nodiscard]] inline bool Active() {
     return Detail::g_active.load(std::memory_order_relaxed);
 }
@@ -77,6 +98,9 @@ extern std::atomic<bool> g_active;
 // ---- replay thread ----
 /// Records the draw; returns true when it must be skipped.
 [[nodiscard]] bool OnDraw(const DrawInfo& info);
+/// Records the dispatch; returns true when its work must be dropped (the replay records a direct
+/// one with zero workgroups and does not record an indirect one).
+[[nodiscard]] bool OnDispatch(const DispatchInfo& info);
 /// A present was recorded: the census of the frame so far becomes the last one.
 void OnPresent();
 /// A dump is armed for a draw with one of these hashes: returns the file path to write.

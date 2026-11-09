@@ -32,6 +32,7 @@
 #include "video_core/nvn/shader/nvn_compute_bank.h"
 #include "video_core/nvn/shader/nvn_driver_layout.h"
 #include "video_core/nvn/timestamp_mode.h"
+#include "video_core/nvn_draw_probe.h"
 #include "video_core/renderer_vulkan/nvn/nvn_draw.h"
 #include "video_core/renderer_vulkan/nvn/nvn_backing_log.h"
 
@@ -335,6 +336,19 @@ void DrawContext::Dispatch(const VC::DispatchPayload& p) {
         skipped();
         return;
     }
+    // nvn_draws / nvn_draw_skip (video_core/nvn_draw_probe.h): a skipped direct dispatch is
+    // recorded with zero groups below, a skipped indirect one is not recorded.
+    bool probe_skip = false;
+    if (VideoCommon::NvnDrawProbe::Active()) [[unlikely]] {
+        probe_skip = VideoCommon::NvnDrawProbe::OnDispatch(
+            {.hash = program_hash,
+             .groups = indirect ? std::array<u32, 3>{} : std::array<u32, 3>{p.x, p.y, p.z},
+             .indirect = indirect});
+        if (probe_skip && indirect) {
+            skipped();
+            return;
+        }
+    }
 
     // Indirect group counts are read by the GPU: resolve them first, so a dispatch that is
     // skipped here never marks the storage ranges it would have written.
@@ -560,7 +574,11 @@ void DrawContext::Dispatch(const VC::DispatchPayload& p) {
              : GpuProf::Tag{},
         0, cs_mode != CostSplit::Mode::Count ? 1u : 0u};
     cmd.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *compute->pipeline);
-    if (cs_mode == CostSplit::Mode::NoGroups || cs_mode == CostSplit::Mode::OneGroup) [[unlikely]] {
+    if (probe_skip) [[unlikely]] {
+        // As the cost split's nogroups: the barriers and bookkeeping stay, the work vanishes.
+        cmd.Dispatch(0, 0, 0);
+    } else if (cs_mode == CostSplit::Mode::NoGroups || cs_mode == CostSplit::Mode::OneGroup)
+        [[unlikely]] {
         // Direct or indirect, the mode's groups.
         const std::array<u32, 3> groups = CostSplit::Groups(cs_mode, {p.x, p.y, p.z});
         cmd.Dispatch(groups[0], groups[1], groups[2]);
