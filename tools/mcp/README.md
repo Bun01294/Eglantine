@@ -64,7 +64,7 @@ agent holds it, see `acquire_control`).
 | `tas_write_script`, `tas_play`, `tas_stop`, `tas_record_start`, `tas_record_stop`, `tas_set_options` (W, L) | Frame-locked TAS scripts (write as steps or raw TAS-nx, play with screenshots at frames, record a human) |
 | `memory_map` | Mapped regions of the application process |
 | `read_memory`, `search_memory`, `write_memory` (W, L) | Guest memory (typed or hex; pattern search with `??`) |
-| `watch_add`, `watch_list`, `watch_remove` | Values sampled every frame; changes become `watch` timeline events |
+| `watch_add`, `watch_list`, `watch_remove` | Values sampled every frame (or `at: "invalidate"`, see below); changes become `watch` timeline events |
 | `summarize_since`, `timeline_export` (W, L), `compare_runs` | Clustered digest; JSONL export under `<log dir>/mcp`; diff two runs |
 | `set_determinism` (W, L), `env_switches` | Fixed RNG/RTC/language/region; active `EDEN_*` variables (`EDEN_*` only) |
 | `control_status`, `acquire_control`, `release_control` | Share one emulator between several agents |
@@ -84,6 +84,24 @@ frame is presented, before it pauses again (`image_source: "presented frame ..."
 it falls back to the capture layer (emulated GPU path) and then to the last presented screenshot
 any tool took, with its guest frame and age. `screenshot` uses the same fallback while paused;
 `capture_frames` refuses to run while paused.
+
+### GPU results the guest reads at an invalidate (VTX-HLE)
+
+A per-frame watch samples about 2 ms after each present, on its own thread. Values the GPU writes
+that the guest reads right after `nvnMemoryPoolInvalidateMappedRange` / `nvnBufferInvalidateMappedRange`
+and then clears (OoT's light sums) are usually gone by then, so the watch keeps reading 0. Two
+ways to see them:
+
+- `watch_add {"address": ..., "type": "f32", "at": "invalidate"}` samples the address inside
+  every invalidate call that covers it, on the guest thread, after the write-back wait. Changes
+  are posted as `watch` events marked `@invalidate`; `watch_list` shows `samples` (how many
+  times it was read). It is never sampled if the game does not invalidate that range.
+- Start the emulator with `EDEN_NX2_DIAG_INVALIDATE=1` (and `EDEN_NX2_DIAG_INVALIDATE_WORDS=<n>`,
+  default 16, up to 64, e.g. 36 to include +0x80..0x8c). Each flush/invalidate logs
+  `[nvn] mapped-range invalidate f<frame> addr=... size=... words: ...` at Info level in class
+  `Core`. Those lines reach the timeline through the log sink:
+  `timeline {"kinds": ["log"], "source_prefix": "Core", "contains": "mapped-range invalidate addr=0x..."}`
+  or `wait_for` with the same filter. (`contains` matches a plain substring of the message.)
 
 ### Not in this build
 

@@ -7,6 +7,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "common/settings.h"
+#include "core/debugger/mapped_range_hook.h"
 #include "mcp/control.h"
 #include "mcp/protocol.h"
 #include "mcp/timeline.h"
@@ -429,4 +430,31 @@ TEST_CASE("MCP frames fall back to the last presented screenshot", "[mcp]") {
     // Without a host a screenshot fails cleanly and leaves the remembered frame alone.
     REQUIRE_FALSE(CaptureScreenshot(ctx, 640, std::chrono::milliseconds{1}, error));
     REQUIRE(LastScreenshot()->frame == 1234);
+}
+
+TEST_CASE("MCP watches can sample at invalidate; mapped-range lines are queryable", "[mcp]") {
+    ToolRegistry registry;
+    RegisterAllTools(registry);
+    const Tool* watch_add = registry.Find("watch_add");
+    REQUIRE(watch_add);
+    REQUIRE_FALSE(ValidateArguments(watch_add->input_schema,
+                                    json{{"address", "0x1000"}, {"type", "f32"}, {"at", "invalidate"}}));
+    REQUIRE_FALSE(ValidateArguments(watch_add->input_schema, json{{"address", 4096}, {"at", "present"}}));
+    REQUIRE(ValidateArguments(watch_add->input_schema, json{{"address", 4096}, {"at", "later"}}));
+    // The invalidate hook is only installed while an at:"invalidate" watch exists.
+    REQUIRE(Core::Trace::g_invalidate_hook.load() == nullptr);
+
+    // EDEN_NX2_DIAG_INVALIDATE lines reach the timeline as Core log events through the log sink.
+    Timeline t{16};
+    t.Push(EventKind::Log, 2, "Core", "[nvn] mapped-range flush f10 addr=0x1000 size=0xc0 words: 0");
+    t.Push(EventKind::Log, 2, "Core",
+           "[nvn] mapped-range invalidate f10 addr=0x1000 size=0xc0 last_seq=5 completed=5 words: "
+           "3e1db22d");
+    t.Push(EventKind::Log, 2, "Render.Vulkan", "[nvn] mapped-range invalidate elsewhere");
+    const auto q = ParseQuery(json{{"kinds", {"log"}},
+                                   {"source_prefix", "Core"},
+                                   {"contains", "mapped-range invalidate"}});
+    const auto r = t.Read(q);
+    REQUIRE(r.events.size() == 1);
+    REQUIRE(r.events[0].message.find("3e1db22d") != std::string::npos);
 }

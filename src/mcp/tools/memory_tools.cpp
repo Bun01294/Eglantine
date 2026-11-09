@@ -20,6 +20,7 @@
 #include "core/core.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/debugger/mapped_range_hook.h"
 #include "core/memory.h"
 #include "mcp/context.h"
 #include "mcp/timeline.h"
@@ -513,7 +514,10 @@ ToolResult SearchMemory(ToolContext& ctx, const json& args) {
 // ---- watches ------------------------------------------------------------------------------
 
 /// Samples watched addresses once per presented frame on its own thread and records changes in
-/// the timeline. Runs only while watches exist and a game is running.
+/// the timeline. Runs only while watches exist and a game is running. Watches added with
+/// at_invalidate are sampled instead on the guest thread inside NVN InvalidateMappedRange calls
+/// that cover them (Core::Trace::g_invalidate_hook, installed only while such watches exist):
+/// GPU results the guest reads there and clears before the next present are invisible per frame.
 class WatchSampler {
 public:
     static constexpr size_t kMaxWatches = 256;
@@ -525,9 +529,11 @@ public:
         u64 address;
         ValueType type;
         std::string label;
+        bool at_invalidate = false;
         std::optional<u64> last;
         u64 changes = 0;
         u64 last_change_frame = 0;
+        u64 samples = 0; ///< Successful reads (unmapped addresses are skipped, not counted)
     };
 
     static WatchSampler& Get() {
@@ -540,7 +546,7 @@ public:
     /// Returns 0 and sets `error` when the server is shutting down or the watch limit is reached
     /// (checked under the lock, so concurrent callers can't overshoot).
     u32 Add(Core::System& system, Timeline* timeline, u64 address, ValueType type,
-            std::string label, std::string& error) {
+            std::string label, bool at_invalidate, std::string& error) {
         std::scoped_lock lock{mutex};
         // Checked under the lock Shutdown takes: a watch added after shutdown began would start
         // a sampler that nothing joins.
@@ -553,7 +559,10 @@ public:
             return 0;
         }
         const u32 id = next_id++;
-        watches.push_back({id, address, type, std::move(label)});
+        watches.push_back({id, address, type, std::move(label), at_invalidate});
+        hook_system = &system;
+        hook_timeline = timeline;
+        UpdateHook();
         if (!thread.joinable() || stopped) {
             if (thread.joinable()) {
                 thread.join();
@@ -570,12 +579,40 @@ public:
     /// no watches remain.
     bool Remove(u32 id) {
         std::scoped_lock lock{mutex};
-        return std::erase_if(watches, [id](const Watch& w) { return w.id == id; }) != 0;
+        const bool removed = std::erase_if(watches, [id](const Watch& w) { return w.id == id; }) != 0;
+        UpdateHook();
+        return removed;
     }
 
     void Clear() {
         std::scoped_lock lock{mutex};
         watches.clear();
+        UpdateHook();
+    }
+
+    /// Invalidate hook body: samples the at_invalidate watches inside [address, address + size).
+    void SampleAtInvalidate(u64 address, u64 size) {
+        std::scoped_lock lock{mutex};
+        if (hook_system == nullptr) {
+            return;
+        }
+        const auto covered = [&](const Watch& w) {
+            return w.at_invalidate && w.address >= address &&
+                   w.address + TypeSize(w.type) <= address + size;
+        };
+        if (std::none_of(watches.begin(), watches.end(), covered)) {
+            return;
+        }
+        const AppProcessRef process{*hook_system};
+        if (!process) {
+            return;
+        }
+        const u64 frame = PresentedFrames();
+        for (auto& w : watches) {
+            if (covered(w)) {
+                Sample(w, process.Memory(), frame, hook_timeline);
+            }
+        }
     }
 
     /// Copy of the current watches, taken under the lock.
@@ -590,6 +627,7 @@ public:
         {
             std::scoped_lock lock{mutex};
             watches.clear();
+            UpdateHook();
             finished = std::move(thread);
             stopped = false;
         }
@@ -622,6 +660,7 @@ private:
             std::scoped_lock lock{mutex};
             if (watches.empty() || !system.IsPoweredOn() || system.IsShuttingDown()) {
                 watches.clear();
+                UpdateHook();
                 stopped = true;
                 return;
             }
@@ -630,34 +669,57 @@ private:
             if (!process) {
                 continue;
             }
-            auto& memory = process.Memory();
             for (auto& w : watches) {
-                const size_t size = TypeSize(w.type);
-                u8 buf[8]{};
-                if (!memory.IsValidVirtualAddressRange(w.address, size) ||
-                    !memory.ReadBlockUnsafe(w.address, buf, size)) {
-                    continue;
+                if (!w.at_invalidate) {
+                    Sample(w, process.Memory(), frame, timeline);
                 }
-                const u64 bits = LoadBits(buf, w.type);
-                if (w.last && *w.last != bits) {
-                    ++w.changes;
-                    w.last_change_frame = frame;
-                    if (timeline) {
-                        timeline->Push(EventKind::Watch, 0,
-                                       w.label.empty() ? Hex(w.address) : w.label,
-                                       fmt::format("{} {}: {} -> {}", Hex(w.address),
-                                                   kTypes[static_cast<size_t>(w.type)].first,
-                                                   ValueJson(*w.last, w.type).dump(),
-                                                   ValueJson(bits, w.type).dump()));
-                    }
-                }
-                w.last = bits;
             }
         }
     }
 
+    /// Reads one watch and posts a timeline event when the value differs from the last sample
+    /// (the first sample only records the value). Call with the lock held.
+    static void Sample(Watch& w, Core::Memory::Memory& memory, u64 frame, Timeline* timeline) {
+        const size_t size = TypeSize(w.type);
+        u8 buf[8]{};
+        if (!memory.IsValidVirtualAddressRange(w.address, size) ||
+            !memory.ReadBlockUnsafe(w.address, buf, size)) {
+            return;
+        }
+        ++w.samples;
+        const u64 bits = LoadBits(buf, w.type);
+        if (w.last && *w.last != bits) {
+            ++w.changes;
+            w.last_change_frame = frame;
+            if (timeline) {
+                timeline->Push(EventKind::Watch, 0, w.label.empty() ? Hex(w.address) : w.label,
+                               fmt::format("{} {}{}: {} -> {}", Hex(w.address),
+                                           kTypes[static_cast<size_t>(w.type)].first,
+                                           w.at_invalidate ? " @invalidate" : "",
+                                           ValueJson(*w.last, w.type).dump(),
+                                           ValueJson(bits, w.type).dump()));
+            }
+        }
+        w.last = bits;
+    }
+
+    /// Installs the invalidate hook while an at_invalidate watch exists. Call with the lock held.
+    void UpdateHook() {
+        const bool wanted = std::any_of(watches.begin(), watches.end(),
+                                        [](const Watch& w) { return w.at_invalidate; });
+        Core::Trace::g_invalidate_hook.store(wanted ? &OnInvalidate : nullptr,
+                                             std::memory_order_release);
+    }
+
+    static void OnInvalidate(u64 address, u64 size) {
+        Get().SampleAtInvalidate(address, size);
+    }
+
     std::mutex mutex;
     std::vector<Watch> watches;
+    /// What the invalidate hook samples with (set by Add; the system outlives the server).
+    Core::System* hook_system = nullptr;
+    Timeline* hook_timeline = nullptr;
     u32 next_id = 1;
     bool stopped = true;
     std::jthread thread;
@@ -682,17 +744,27 @@ ToolResult WatchAdd(ToolContext& ctx, const json& args) {
             return ToolResult::Error("address not mapped");
         }
     }
+    const bool at_invalidate = args.value("at", "present") == "invalidate";
     std::string error;
     const u32 id = WatchSampler::Get().Add(*ctx.system, ctx.timeline, *address, type,
-                                           args.value("label", ""), error);
+                                           args.value("label", ""), at_invalidate, error);
     if (id == 0) {
         return ToolResult::Error(error);
     }
     return ToolResult::Structured(
         json{{"id", id},
-             {"note", "Sampled once per presented frame; changes appear as 'watch' events in the "
-                      "timeline (timeline kinds:[\"watch\"], or act/wait_for). Changes that revert "
-                      "within one frame are missed. Watches clear when the game stops."}});
+             {"at", at_invalidate ? "invalidate" : "present"},
+             {"note", at_invalidate
+                          ? "Sampled inside each NVN InvalidateMappedRange call that covers the "
+                            "address (VTX-HLE only), i.e. what the guest reads there; changes "
+                            "appear as 'watch' events marked @invalidate. Never sampled if the "
+                            "game does not invalidate that range. Watches clear when the game "
+                            "stops."
+                          : "Sampled once per presented frame; changes appear as 'watch' events "
+                            "in the timeline (timeline kinds:[\"watch\"], or act/wait_for). "
+                            "Changes that revert within one frame are missed (GPU results the "
+                            "guest clears after reading: try at:\"invalidate\"). Watches clear "
+                            "when the game stops."}});
 }
 
 /// watch_list: each watch with its last value (null before the first sample) and change count.
@@ -703,6 +775,8 @@ ToolResult WatchList(ToolContext&, const json&) {
                    {"address", Hex(w.address)},
                    {"type", kTypes[static_cast<size_t>(w.type)].first},
                    {"label", w.label},
+                   {"at", w.at_invalidate ? "invalidate" : "present"},
+                   {"samples", w.samples},
                    {"changes", w.changes},
                    {"last_change_frame", w.last_change_frame}};
         entry["value"] = w.last ? ValueJson(*w.last, w.type) : json{};
@@ -807,14 +881,23 @@ void RegisterMemoryTools(ToolRegistry& registry) {
     registry.Add(Tool{
         .name = "watch_add",
         .title = "Watch an address",
-        .description = "Watch a value; it is sampled every presented frame and each change becomes "
-                       "a 'watch' timeline event (old -> new, with the frame). Use with act or "
-                       "wait_for {kinds:[\"watch\"]} to see what an input changed.",
+        .description = "Watch a value; it is sampled every presented frame (or, with at "
+                       "\"invalidate\", inside each NVN InvalidateMappedRange covering it) and "
+                       "each change becomes a 'watch' timeline event (old -> new, with the "
+                       "frame). Use with act or wait_for {kinds:[\"watch\"]} to see what an input "
+                       "changed.",
         .input_schema = {{"type", "object"},
                          {"properties",
                           {{"address", AddressSchema("Virtual address")},
                            {"type", {{"type", "string"}, {"enum", TypeEnum()}}},
-                           {"label", {{"type", "string"}, {"maxLength", 100}}}}},
+                           {"label", {{"type", "string"}, {"maxLength", 100}}},
+                           {"at",
+                            {{"type", "string"},
+                             {"enum", {"present", "invalidate"}},
+                             {"description",
+                              "When to sample: once per presented frame (default), or when the "
+                              "guest invalidates a mapped range covering the address (GPU results "
+                              "it reads and clears within a frame; VTX-HLE only)."}}}}},
                          {"required", {"address"}},
                          {"additionalProperties", false}},
         .requires_game = true,
