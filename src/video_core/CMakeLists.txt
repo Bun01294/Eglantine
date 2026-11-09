@@ -166,6 +166,8 @@ add_library(video_core STATIC
     native_qmd.h
     native_tensor_programs.h
     native_query_trace.h
+    nvn_draw_probe.cpp
+    nvn_draw_probe.h
     nx2.h
     nx2_debug_control.cpp
     nx2_debug_control.h
@@ -248,6 +250,7 @@ add_library(video_core STATIC
     renderer_vulkan/nvn/nvn_draw.h
     renderer_vulkan/nvn/nvn_draw_clear.cpp
     renderer_vulkan/nvn/nvn_draw_debug.cpp
+    renderer_vulkan/nvn/nvn_draw_probe.cpp
     renderer_vulkan/nvn/nvn_draw_descriptors.cpp
     renderer_vulkan/nvn/nvn_draw_indirect.cpp
     renderer_vulkan/nvn/nvn_draw_log.cpp

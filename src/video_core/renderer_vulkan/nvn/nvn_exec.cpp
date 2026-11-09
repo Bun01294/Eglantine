@@ -25,6 +25,7 @@
 #include "common/settings.h"
 #include "core/perf_stats.h"
 #include "video_core/game_frame_size.h"
+#include "video_core/nvn_draw_probe.h"
 #include "video_core/nx2.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_log.h"
@@ -4880,6 +4881,7 @@ GpuProf::Tag Recorder::ProfTexture(GpuProf::Kind kind, u64 serial, u32 count) co
 
 void Recorder::RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>& generated,
                              const VideoCommon::Nvn::PresentCrop& window_crop) {
+    VideoCommon::NvnDrawProbe::OnPresent();
     Storage& guest = *texture.storage;
     const bool own_upscaled = impl.ndsr_upscaled_since_present;
     const auto own_stage = impl.upscaled_stage;

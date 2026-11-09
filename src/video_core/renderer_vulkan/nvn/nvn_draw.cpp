@@ -15,6 +15,7 @@
 #include "video_core/nvn/state_layouts.h"
 #include "shader_recompiler/stage.h"
 #include "video_core/nvn/timestamp_mode.h"
+#include "video_core/nvn_draw_probe.h"
 #include "video_core/renderer_vulkan/nvn/nvn_barrier.h"
 #include "video_core/renderer_vulkan/nvn/nvn_draw.h"
 #include "video_core/renderer_vulkan/nvn/nvn_draw_plan.h"
@@ -2212,6 +2213,12 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
                 index_ref.offset = it->second.offset;
                 ++counters.index_stage_binds;
             }
+        }
+    }
+    if (VideoCommon::NvnDrawProbe::Active()) [[unlikely]] {
+        if (ProbeDraw(mode, element_count, index, vertex, used_streams, active->mesh)) {
+            ++counters.draws_skipped;
+            return false;
         }
     }
     if (impl.gpu_profiler) {

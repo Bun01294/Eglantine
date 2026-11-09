@@ -46,6 +46,9 @@ class FakeEmulator:
             return {"result": {"address": request["params"]["address"], "hex": "0000803f"}}
         if method == "read_gpu_memory":
             return {"error": "GPU address 0x5000 is not mapped"}
+        if method == "nvn_draw_skip":
+            return {"result": {"mode": request["params"].get("mode", "skip"),
+                               "hashes": request["params"].get("hashes", [])}}
         if method in ("input", "input_sequence"):
             return {"result": {"controller": "player1", "frames": 3}}
         if method == "write_memory":
@@ -105,7 +108,8 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(names, ["status", "screenshot", "log_tail", "log_filter", "capture_frame",
                                  "capture_image", "reject_shaders", "sample", "read_memory",
                                  "search_memory", "write_memory", "read_gpu_memory", "input",
-                                 "input_sequence"])
+                                 "input_sequence", "nvn_draws", "nvn_draw_skip", "nvn_draw_dump",
+                                 "nvn_stats"])
         self.assertEqual(self.adapter.handle({"id": 3, "method": "bogus"})["error"]["code"], -32601)
 
     def test_status_is_forwarded(self):
@@ -136,9 +140,17 @@ class AdapterTest(unittest.TestCase):
         sequence = {"steps": [{"frames": 300}, {"frames": 300, "buttons": ["A"]}]}
         self.assertEqual(debug_mcp.default_timeout("input_sequence", sequence), 40)
         self.assertEqual(debug_mcp.default_timeout("status", {}), 5)
+        self.assertEqual(debug_mcp.default_timeout("nvn_draw_dump", {"wait_ms": 10000}), 15)
         result = self.call("input_sequence", sequence)
         self.assertFalse(result["isError"])
         self.assertEqual(self.fake.requests[-1]["params"], sequence)
+
+    def test_nvn_draw_skip_is_forwarded(self):
+        arguments = {"action": "set", "hashes": ["3ddfb1d7621c4755"], "mode": "only"}
+        result = self.call("nvn_draw_skip", arguments)
+        self.assertFalse(result["isError"])
+        self.assertEqual(json.loads(result["content"][0]["text"])["mode"], "only")
+        self.assertEqual(self.fake.requests[-1]["params"], arguments)
 
     def test_screenshot_becomes_image_content(self):
         result = self.call("screenshot")

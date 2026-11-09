@@ -20,6 +20,7 @@
 #include "core/hle/kernel/kernel.h"
 #include "core/memory.h"
 #include "tests/core/system_test_context.h"
+#include "video_core/nvn_draw_probe.h"
 #include "video_core/nx2_debug_control.h"
 
 namespace {
@@ -426,4 +427,97 @@ TEST_CASE("Injected input merges buttons and replaces sticks while installed",
     controller.SetInputInjector({});
     REQUIRE(controller.GetNpadButtons().raw == None);
     REQUIRE(controller.GetSticks().left.x == 0);
+}
+
+TEST_CASE("Debug server draw hashes take 1 to 16 hex digits", "[core][nx2_debug_server]") {
+    REQUIRE(Core::Nx2Debug::ParseDrawHash("621c4755") == 0x621c4755);
+    REQUIRE(Core::Nx2Debug::ParseDrawHash("0x3DDFB1D7621C4755") == 0x3ddfb1d7621c4755);
+    for (const char* bad : {"", "0x", "3ddfb1d7621c47551", "3ddfb1d7621c475g", " 621c4755"}) {
+        REQUIRE_THROWS_AS(Core::Nx2Debug::ParseDrawHash(bad), std::runtime_error);
+    }
+}
+
+TEST_CASE("Debug server nvn_stats keeps the latest heartbeat lines", "[core][nx2_debug_server]") {
+    const std::vector<std::string> lines{
+        "[1] Core <Info> [nvn] status: presents=10",
+        "[1] Core <Info> [nvn] memory: synthetic lists 1",
+        "[1] Render.Vulkan <Info> [nvn] gpuprof 10 s window (10.0 s): presents=300",
+        "[1] Render.Vulkan <Info> [nvn] gpuprof 10 s window: gpu ms per frame old",
+        "[1] Render.Vulkan <Info> [nvn] storage census: 5 images, estimated MiB (count): old",
+        "[2] Core <Info> [nvn] status: presents=20",
+        "[2] Core <Info> [nvn] replay stage=3 seq=9 completed=8",
+        "[2] Render.Vulkan <Info> [nvn] gpuprof 10 s window (10.0 s): presents=600",
+        "[2] Render.Vulkan <Info> [nvn] gpuprof 10 s window: gpu ms per frame new",
+        "[2] Render.Vulkan <Info> [nvn] gpuprof tags top  1: other",
+        "[2] Render.Vulkan <Info> [nvn] storage census: 7 images, estimated MiB (count): new",
+        "[2] Render.Vulkan <Info> [nvn] storage census: cache holders MiB (count): a",
+        "[2] Render.Vulkan <Info> [nvn] storage census: #1 64x64x1",
+    };
+    const json stats = Core::Nx2Debug::NvnStatsFromLog(lines, 2);
+    REQUIRE(stats["status"] == lines[5]);
+    REQUIRE(stats["memory"] == lines[1]);
+    REQUIRE(stats["replay_stage"] == lines[6]);
+    REQUIRE(stats["gpuprof_window"] == json{lines[7], lines[8]});
+    REQUIRE(stats["storage_census"] == json{lines[10], lines[11]});
+    REQUIRE(stats["storage_census_total"] == 3);
+    REQUIRE_FALSE(stats.contains("note"));
+    const json empty = Core::Nx2Debug::NvnStatsFromLog({}, 2);
+    REQUIRE(empty["memory"].is_null());
+    REQUIRE(empty["gpuprof_window"].empty());
+    REQUIRE(empty.contains("note"));
+}
+
+TEST_CASE("NVN draw probe skips by stage hash and takes a census per full frame",
+          "[core][nx2_debug_server]") {
+    namespace Probe = VideoCommon::NvnDrawProbe;
+    Probe::Reset();
+    SCOPE_EXIT {
+        Probe::Reset();
+    };
+    REQUIRE_FALSE(Probe::Active());
+    Probe::DrawInfo a{};
+    a.hashes[0] = 0xa0;
+    a.hashes[1] = 0xa1;
+    a.count = 3;
+    Probe::DrawInfo b{};
+    b.hashes[0] = 0xb0;
+    b.count = 6;
+
+    Probe::SetSkip({0xa1}, Probe::SkipMode::Skip);
+    REQUIRE(Probe::Active());
+    REQUIRE(Probe::OnDraw(a));
+    REQUIRE_FALSE(Probe::OnDraw(b));
+    Probe::SetSkip({0xa1}, Probe::SkipMode::Only);
+    REQUIRE_FALSE(Probe::OnDraw(a));
+    REQUIRE(Probe::OnDraw(b));
+    Probe::SetSkip({}, Probe::SkipMode::Skip);
+    REQUIRE_FALSE(Probe::Active());
+
+    REQUIRE_FALSE(Probe::ArmCensus(1));
+    REQUIRE(Probe::Active());
+    (void)Probe::OnDraw(b); // the partial frame before the first present is dropped
+    Probe::OnPresent();
+    REQUIRE(Probe::LastCensus().present == 0);
+    (void)Probe::OnDraw(a);
+    (void)Probe::OnDraw(b);
+    (void)Probe::OnDraw(b);
+    Probe::OnPresent();
+    const Probe::Census census = Probe::LastCensus();
+    REQUIRE(census.present != 0);
+    REQUIRE(census.draws == 3);
+    REQUIRE(census.rows.size() == 2);
+    REQUIRE(census.rows[0].first.hashes[0] == 0xb0);
+    REQUIRE(census.rows[0].draws == 2);
+    REQUIRE(census.rows[0].elements == 12);
+    REQUIRE_FALSE(Probe::Active());
+
+    Probe::ArmDump(0xb0, "dir");
+    REQUIRE_FALSE(Probe::DumpRequested(a).has_value());
+    const auto path = Probe::DumpRequested(b);
+    REQUIRE(path.has_value());
+    REQUIRE(path->starts_with("dir/nvn-draw-dump-00000000000000b0-p"));
+    REQUIRE_FALSE(Probe::DumpRequested(b).has_value());
+    REQUIRE_FALSE(Probe::Active());
+    Probe::DumpDone(*path, {});
+    REQUIRE(Probe::GetDump().path == *path);
 }

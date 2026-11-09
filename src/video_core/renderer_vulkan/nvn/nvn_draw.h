@@ -1033,6 +1033,11 @@ private:
                                const BufferRef* count);
     /// EDEN_NX2_NVN_ONLY_DRAWS: false for a draw of the selected frame that is not listed.
     [[nodiscard]] bool DebugDrawAllowed() const;
+    /// Census / skip / dump of the draw for the debug server draw methods
+    /// (video_core/nvn_draw_probe.h, nvn_draw_probe.cpp). True: the draw is skipped.
+    [[nodiscard]] bool ProbeDraw(u32 mode, u32 element_count, const IndexRange* index,
+                                 const std::array<BufferRef, MAX_VERTEX_STREAMS>& vertex,
+                                 u32 used_streams, bool mesh);
     /// `textures` diag request (nvn_draw_debug.cpp): the textures of the draw being prepared are
     /// noted (`DiagNoteTextures`, after BuildDescriptors) and read back when the pass has ended
     /// (`DiagFlushTextures`, from EndPass).
