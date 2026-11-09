@@ -1130,6 +1130,17 @@ TEST_CASE("NVN pool mirror: raw-global draws keep the mirror entries live (TRY_R
         !vulkan->device->IsDescriptorAliasingSupported()) {
         SKIP("raw-global memory is unsupported on this Vulkan device");
     }
+    // Written for TRY_STORAGE_RAW_WRITE_THROUGH off (now on by default): pin it for this test.
+    namespace D = Common::DiagRequest;
+    struct SwitchGuard {
+        bool initial = D::TrySwitchEnabled("TRY_STORAGE_RAW_WRITE_THROUGH");
+        SwitchGuard() {
+            REQUIRE(D::SetTrySwitch("TRY_STORAGE_RAW_WRITE_THROUGH", false));
+        }
+        ~SwitchGuard() {
+            static_cast<void>(D::SetTrySwitch("TRY_STORAGE_RAW_WRITE_THROUGH", initial));
+        }
+    } guard;
     constexpr u64 TARGET = POOL_VA + 0x4000;
     constexpr u64 RAW_A = POOL_VA + 0x8000;
     constexpr u64 RAW_B = POOL_VA + 0x9000;
@@ -1243,9 +1254,11 @@ TEST_CASE("NVN storage VRAM refuses pools above its configured size limit", "[nv
     if (!vulkan) {
         SKIP("no Vulkan device");
     }
+    // vtxcov 0: TRY_VTXCOV_BIGPOOL (on by default) gives an oversized pool a read-only mirror.
     ShadowRig rig(*vulkan, Vulkan::Nvn::ContextOptions{
                                 .try_storage_vram = true,
-                                .try_storage_vram_max_bytes = 32_KiB});
+                                .try_storage_vram_max_bytes = 32_KiB,
+                                .vtxcov = 0u});
     std::vector<u64> list;
     Dispatch(list, PROGRAM, STORAGE_VA, 4096, 1);
     rig.Run(1, std::move(list));
@@ -1273,6 +1286,7 @@ TEST_CASE("NVN storage VRAM: a written range of a refused pool goes through a co
         ShadowRig rig(*vulkan, Vulkan::Nvn::ContextOptions{
                                     .try_storage_vram = true,
                                     .try_storage_vram_max_bytes = 32_KiB,
+                                    .vtxcov = 0u,
                                     .refused_shadow = refused_shadow});
         constexpr u64 ARGS = POOL_VA + 0x2000;
         constexpr u64 TARGET = POOL_VA + 0x3000;
@@ -3311,6 +3325,17 @@ TEST_CASE("NVN vertex mirror: a raw global store makes the read-only mirror stal
         !vulkan->device->IsDescriptorAliasingSupported()) {
         SKIP("raw-global memory is unsupported on this Vulkan device");
     }
+    // Written for TRY_RO_MIRROR_EXACT off (now on by default): pin it for this test.
+    namespace D = Common::DiagRequest;
+    struct SwitchGuard {
+        bool initial = D::TrySwitchEnabled("TRY_RO_MIRROR_EXACT");
+        SwitchGuard() {
+            REQUIRE(D::SetTrySwitch("TRY_RO_MIRROR_EXACT", false));
+        }
+        ~SwitchGuard() {
+            static_cast<void>(D::SetTrySwitch("TRY_RO_MIRROR_EXACT", initial));
+        }
+    } guard;
     VertexMirrorRig rig(*vulkan, true, false);
     for (u32 i = 0; i < 3; ++i) {
         rig.SetVertex(i, F32_ONE_64TH);

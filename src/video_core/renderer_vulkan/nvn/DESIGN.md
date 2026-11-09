@@ -1280,8 +1280,12 @@ mirror budget still applies.
 A written range of a pool without a mirror stays in guest memory (`shadow_skipped_no_room`; with
 `EDEN_NX2_NVN_SHADOW_LOG=1` the first ones are logged as `written storage range stays in host
 memory`). OoT Kokiri has two such pools (305 and 88 MiB, imported) and ~62 of these bindings per present.
-`EDEN_NX2_TRY_REFUSED_SHADOW=1` (candidate) binds those of at most `EDEN_NX2_NVN_SHADOW_MAX_KIB` that
-are not in a raw-global plan through a copy shadow, as with mirrors off (at most 32 live copy shadows).
+`EDEN_NX2_TRY_REFUSED_SHADOW` (on by default, `=0` opts out) binds those of at most
+`EDEN_NX2_NVN_REFUSED_SHADOW_MAX_KIB` (default 4096) that are not in a raw-global plan through a copy shadow,
+as with mirrors off (at most 32 live copy shadows). Measured on OoT Kokiri village (RTX 5080): the CMAA edge pass
+`3816717874cb1f93` keeps its counter + edge list (1.76 MiB, over the mirrors-off 1 MiB `SHADOW_MAX_KIB`) in the
+305 MiB pool; its per-warp atomics over PCIe cost ~10 ms a frame. In a copy shadow it costs ~1 ms: GPU 36 -> 24 ms,
+23 -> 31-34 fps, picture unchanged.
 
 **Validity** (`MirrorPages`: one bit per 4 KiB page). A page is valid when the mirror holds the guest
 bytes: it was copied in and no other writer has changed the guest page since. Invalid at creation, and
@@ -1484,8 +1488,9 @@ reads is a `PoolMirror` with `storage == false`:
 - `EDEN_NX2_NVN_DIAG_RO_RAW_KEEP=1` (measurement only; the picture may be wrong): a raw-writing draw leaves the
   read-only mirrors valid. Its gap to the real switch is the price of the invalidation (the recopies it causes);
   identical pictures mean no raw store of the run reached a read-only mirror.
-- `EDEN_NX2_TRY_RO_MIRROR_EXACT=1` and `EDEN_NX2_TRY_STORAGE_RAW_WRITE_THROUGH=1` enable raw
-  store write-through to read-only and storage mirrors respectively. `Impl::RawWriteThroughTable`
+- `EDEN_NX2_TRY_RO_MIRROR_EXACT` and `EDEN_NX2_TRY_STORAGE_RAW_WRITE_THROUGH` (both on by default, `=0`
+  opts out) enable raw store write-through to read-only and storage mirrors respectively. OoT Castle Town
+  market at night: whole-pool snapshots 262 -> 92 per present, 345 -> 62 MiB copied each way, +2.5 fps. `Impl::RawWriteThroughTable`
   is a second table in the raw table's format, with one entry per eligible pool: its guest base,
   alias target device address and size. Read-only mirrors are included only with
   `TRY_RO_MIRROR_EXACT`; imported storage mirrors are included only with
@@ -1546,8 +1551,10 @@ logs `[nvn] vtxcov: presents=N per present, vertex/index: served=v/i{reason=v/i,
 served_KiB=v/i not_served_KiB=v/i{..} copy_in_KiB=.. stage_copy_KiB=.. switches=..` (per present, reasons with no
 bind left out; `copy_in` the pool mirror copy-ins, `stage_copy` the staging gathers). Totals: `ContextStats::vtxcov_binds`.
 
-**Switches** (candidates, off by default; they act with `TRY_VTX_MIRROR` and pool mirrors; `EDEN_NX2_TRY_VTXCOV=1`
-sets all four, the startup line `[nvn] vtxcov: switches ...` names them):
+**Switches** (on by default together with `TRY_VTX_MIRROR` and `TRY_RO_MIRROR_EXACT`; they act with pool mirrors;
+`EDEN_NX2_TRY_VTXCOV=0` turns all four off, `EDEN_NX2_TRY_VTXCOV_<NAME>=0` one; the startup line
+`[nvn] vtxcov: switches ...` names them; the coverage counters need `EDEN_NX2_NVN_VTXCOV_DIAG=1`). OoT Kokiri
+village: every vertex/index range served from VRAM, GPU 39-40 -> 36-37 ms, stable across area transitions:
 
 - `EDEN_NX2_TRY_VTXCOV_INPASS=1`: a vertex/index range of an imported pool that no staged copy serves (not scanned,
   indirect index, past the copy bound, a pass whose copy was dropped) is served at its bind from the pool's mirror

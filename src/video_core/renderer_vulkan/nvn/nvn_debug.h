@@ -237,17 +237,17 @@ struct Config {
     /// binding, at most TRY_STORAGE_VRAM_MAX_MIB each), kept current by a copy-in of the pages the
     /// guest wrote at every pass begin, instead of read over PCIe (CostSplit `vramu`).
     bool try_ubo_mirror{false};
-    /// EDEN_NX2_TRY_VTX_MIRROR=1 (candidate, off by default): the vertex and index ranges a render
+    /// EDEN_NX2_TRY_VTX_MIRROR=0 opts out (on by default): the vertex and index ranges a render
     /// pass stages are served from device-local pool mirrors (read-only: no raw table entry, made
     /// stale by raw-writing draws) that copy in only the stale pages of the ranges used, at most
     /// VTX_MIRROR_COPY_BYTES per pass, instead of copying every range of every pass with 32+ draws
     /// (VertexStage) or reading it over PCIe (passes of fewer draws).
-    bool try_vtx_mirror{false};
-    /// EDEN_NX2_TRY_VTXCOV_INPASS / _SHADERWRITES / _BOUND / _BIGPOOL=1 (candidates, off by
-    /// default; EDEN_NX2_TRY_VTXCOV=1 sets them all): VtxCovSwitch bits (nvn_vtxcov.h). They act
-    /// with TRY_VTX_MIRROR.
+    bool try_vtx_mirror{true};
+    /// EDEN_NX2_TRY_VTXCOV_INPASS / _SHADERWRITES / _BOUND / _BIGPOOL: VtxCovSwitch bits
+    /// (nvn_vtxcov.h), all on by default (Load sets VTXCOV_ALL); =0 turns one off and
+    /// EDEN_NX2_TRY_VTXCOV=0 turns all four off. They act with TRY_VTX_MIRROR.
     u32 try_vtxcov{0};
-    /// EDEN_NX2_NVN_VTXCOV_DIAG=1 (on by itself with TRY_VTX_MIRROR or a TRY_VTXCOV switch): every
+    /// EDEN_NX2_NVN_VTXCOV_DIAG=1 (opt-in): every
     /// vertex/index bind is counted by where it was read from or why it stayed in host memory,
     /// logged as `[nvn] vtxcov:` every 10 s of presents.
     bool vtxcov_diag{false};
@@ -263,11 +263,15 @@ struct Config {
     /// ones) end at a conflicting use or the end of the command buffer. Plain copy shadows (pools
     /// without a table mirror) still end.
     bool try_raw_keep_entries{true};
-    /// EDEN_NX2_TRY_REFUSED_SHADOW=1 (candidate): with pool mirrors on, a written storage range of
-    /// at most EDEN_NX2_NVN_SHADOW_MAX_KIB in an imported pool that gets no mirror (over
-    /// TRY_STORAGE_VRAM_MAX_MIB, the budget, unaligned) is bound through a copy shadow, as with
-    /// mirrors off, instead of staying in host memory where its stores and atomics cross PCIe.
-    bool try_refused_shadow{false};
+    /// EDEN_NX2_TRY_REFUSED_SHADOW=0 opts out (on by default): with pool mirrors on, a written
+    /// storage range of at most EDEN_NX2_NVN_REFUSED_SHADOW_MAX_KIB in an imported pool that gets
+    /// no mirror (over TRY_STORAGE_VRAM_MAX_MIB, the budget, unaligned) is bound through a copy
+    /// shadow, as with mirrors off, instead of staying in host memory where its stores and atomics
+    /// cross PCIe.
+    bool try_refused_shadow{true};
+    /// EDEN_NX2_NVN_REFUSED_SHADOW_MAX_KIB: longest such range (default 4096; OoT's CMAA edge
+    /// list is 1.76 MiB, over the 1 MiB SHADOW_MAX_KIB of the mirrors-off path).
+    u64 refused_shadow_max_bytes{u64{4} << 20};
     /// EDEN_NX2_NVN_CONDITION_PREFETCH=0: every GPU render condition computes its own predicate at
     /// its point (no batch of the conditions ahead, Recorder::PrefetchConditions); on by default.
     bool condition_prefetch{true};

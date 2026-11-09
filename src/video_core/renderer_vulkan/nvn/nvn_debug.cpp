@@ -146,18 +146,27 @@ Config Read() {
     config.try_barrier_merge = static_cast<u32>(EnvNumber("EDEN_NX2_TRY_BARRIER_MERGE", 0));
     config.try_stage_span = EnvFlag("EDEN_NX2_TRY_STAGE_SPAN");
     config.try_ubo_mirror = EnvFlag("EDEN_NX2_TRY_UBO_MIRROR");
-    config.try_vtx_mirror = EnvFlag("EDEN_NX2_TRY_VTX_MIRROR");
-    if (EnvFlag("EDEN_NX2_TRY_VTXCOV")) {
-        config.try_vtxcov = VTXCOV_ALL;
-    }
-    config.try_vtxcov |= EnvFlag("EDEN_NX2_TRY_VTXCOV_INPASS") ? VTXCOV_INPASS : 0u;
-    config.try_vtxcov |= EnvFlag("EDEN_NX2_TRY_VTXCOV_SHADERWRITES") ? VTXCOV_SHADER_WRITES : 0u;
-    config.try_vtxcov |= EnvFlag("EDEN_NX2_TRY_VTXCOV_BOUND") ? VTXCOV_BOUND : 0u;
-    config.try_vtxcov |= EnvFlag("EDEN_NX2_TRY_VTXCOV_BIGPOOL") ? VTXCOV_BIGPOOL : 0u;
-    config.vtxcov_diag = EnvFlag("EDEN_NX2_NVN_VTXCOV_DIAG", config.try_vtx_mirror ||
-                                                                 config.try_vtxcov != 0);
+    // Vertex/index ranges from VRAM: on by default (OoT Kokiri village 39-40 -> 36-37 ms GPU, every
+    // range served). =0 turns a switch off; EDEN_NX2_TRY_VTXCOV=0 turns all four coverage switches off.
+    config.try_vtx_mirror = EnvFlag("EDEN_NX2_TRY_VTX_MIRROR", true);
+    config.try_vtxcov = EnvFlag("EDEN_NX2_TRY_VTXCOV", true) ? VTXCOV_ALL : 0u;
+    const auto vtxcov_switch = [&](const char* name, u32 bit) {
+        if (const char* value = std::getenv(name); value != nullptr && *value != '\0') {
+            config.try_vtxcov = std::strcmp(value, "0") != 0 ? (config.try_vtxcov | bit)
+                                                            : (config.try_vtxcov & ~bit);
+        }
+    };
+    vtxcov_switch("EDEN_NX2_TRY_VTXCOV_INPASS", VTXCOV_INPASS);
+    vtxcov_switch("EDEN_NX2_TRY_VTXCOV_SHADERWRITES", VTXCOV_SHADER_WRITES);
+    vtxcov_switch("EDEN_NX2_TRY_VTXCOV_BOUND", VTXCOV_BOUND);
+    vtxcov_switch("EDEN_NX2_TRY_VTXCOV_BIGPOOL", VTXCOV_BIGPOOL);
+    // The per-bind coverage counters cost replay CPU, so they are opt-in now that the switches are on.
+    config.vtxcov_diag = EnvFlag("EDEN_NX2_NVN_VTXCOV_DIAG");
     config.try_raw_keep_entries = EnvFlag("EDEN_NX2_TRY_RAW_KEEP_ENTRIES", true);
-    config.try_refused_shadow = EnvFlag("EDEN_NX2_TRY_REFUSED_SHADOW");
+    // On by default: OoT's CMAA edge pass (3816717874cb1f93) keeps a 1.76 MiB counter + edge list in a
+    // refused 305 MiB pool; in VRAM it drops from ~10 ms to ~1 ms (Kokiri village 36 -> 24 ms GPU).
+    config.try_refused_shadow = EnvFlag("EDEN_NX2_TRY_REFUSED_SHADOW", true);
+    config.refused_shadow_max_bytes = EnvNumber("EDEN_NX2_NVN_REFUSED_SHADOW_MAX_KIB", 4096) << 10;
     config.diag_ro_raw_keep = EnvFlag("EDEN_NX2_NVN_DIAG_RO_RAW_KEEP");
     if (const char* mode = std::getenv("EDEN_NX2_NVN_DEPTH_MODE"); mode != nullptr && *mode != '\0') {
         config.depth_mode = std::atoi(mode) != 0 ? 1 : 0;

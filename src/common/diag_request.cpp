@@ -59,7 +59,11 @@ bool TrySwitchDefaultEnabled(std::string_view name) {
     if (value != nullptr) {
         return value[0] == '1';
     }
-    return name == "TRY_NATIVE_F32_ATOMICS" || name == "TRY_ATOMIC_RESERVE";
+    // TRY_RO_MIRROR_EXACT / TRY_STORAGE_RAW_WRITE_THROUGH: raw stores write through to the read-only
+    // and storage VTX-HLE pool mirrors, so raw-writing draws skip the whole-pool snapshot (OoT
+    // market: 345 -> 62 MiB copied each way per present, +2.5 fps). On by default; =0 opts out.
+    return name == "TRY_NATIVE_F32_ATOMICS" || name == "TRY_ATOMIC_RESERVE" ||
+           name == "TRY_RO_MIRROR_EXACT" || name == "TRY_STORAGE_RAW_WRITE_THROUGH";
 }
 
 bool TrySwitchEnabledLocked(const Registry& registry, std::string_view name) {

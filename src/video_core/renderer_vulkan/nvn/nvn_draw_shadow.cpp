@@ -281,7 +281,7 @@ void DrawContext::ApplyMirrors(DrawPlan& plan, bool allow_create) {
             const Debug::Config& debug = Debug::Get();
             const bool copy_shadow =
                 impl.refused_shadow && !plan.raw_global && debug.shadow_storage &&
-                use.size <= debug.shadow_max_bytes && shadows.size() < MAX_LIVE_SHADOWS &&
+                use.size <= debug.refused_shadow_max_bytes && shadows.size() < MAX_LIVE_SHADOWS &&
                 std::ranges::count_if(shadows, [](const Shadow& entry) { return !entry.mirror; }) <
                     static_cast<std::ptrdiff_t>(MAX_LIVE_COPY_SHADOWS);
             bool created = false;
