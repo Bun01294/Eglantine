@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 
 #include "video_core/host_shaders/bc_encoder_comp_spv.h"
 #include "video_core/renderer_vulkan/nvn/nvn_bc_encode.h"
