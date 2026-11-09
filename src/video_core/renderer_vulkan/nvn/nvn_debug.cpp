@@ -133,6 +133,7 @@ Config Read() {
     config.try_wb_lines = static_cast<u32>(EnvNumber("EDEN_NX2_TRY_WB_LINES", 8));
     config.try_dispatch_order = EnvFlag("EDEN_NX2_TRY_DISPATCH_ORDER");
     config.try_flush_tracked = EnvFlag("EDEN_NX2_TRY_FLUSH_TRACKED", true);
+    config.mirror_hash_always = EnvFlag("EDEN_NX2_NVN_MIRROR_HASH_ALWAYS");
     if (const u64 wait = EnvNumber("EDEN_NX2_TRY_INVALIDATE_WRITEBACK", 0); wait != 0) {
         config.try_invalidate_writeback =
             static_cast<u32>(wait == 1 ? 250 : (std::min<u64>)(wait, 5000));

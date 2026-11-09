@@ -2794,6 +2794,7 @@ TEST_CASE("NVN mirror pool: only the guest pages that changed are copied again",
         SKIP("no Vulkan device");
     }
     MirrorRig rig(*vulkan, ReadProgram());
+    rig.memory.tracking = false; // no page tracker: every page is hashed at every use
     u8* data = rig.memory.Add(POOL_VA, 64_KiB);
     std::memset(data, 0xCD, 64_KiB);
     rig.Start(64_KiB);
@@ -2830,7 +2831,92 @@ TEST_CASE("NVN mirror pool: only the guest pages that changed are copied again",
     stats = rig.context.Stats();
     REQUIRE(stats.mirror_upload_bytes == 16384);
     REQUIRE(stats.mirror_upload_runs == 4);
+    REQUIRE(stats.mirror_pages_trusted == 0);
     REQUIRE(stats.ops_failed == 0);
+}
+
+TEST_CASE("NVN mirror pool: with the page tracker only the pages written are hashed again",
+          "[nvn][compute][mirror]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    MirrorRig rig(*vulkan, ReadProgram());
+    u8* data = rig.memory.Add(POOL_VA, 64_KiB);
+    std::memset(data, 0xCD, 64_KiB);
+    rig.Start(64_KiB);
+
+    // First use: hashed and copied in.
+    rig.Run(STORAGE_VA, 6, 8192);
+    Vulkan::Nvn::ContextStats stats = rig.context.Stats();
+    REQUIRE(stats.mirror_upload_bytes == 8192);
+    REQUIRE(stats.mirror_pages_trusted == 0);
+    u64 hashed = stats.mirror_pages_hashed;
+    u64 trusted = stats.mirror_pages_trusted;
+    // Hashes of the last run (the pass check and the upload may each hash a changed page).
+    const auto next = [&] {
+        stats = rig.context.Stats();
+        const u64 delta = stats.mirror_pages_hashed - hashed;
+        hashed = stats.mirror_pages_hashed;
+        return delta;
+    };
+
+    // Nothing was written: no page is hashed, nothing is copied.
+    rig.Run(STORAGE_VA, 6, 8192);
+    REQUIRE(next() == 0);
+    REQUIRE(stats.mirror_upload_bytes == 8192);
+    REQUIRE(stats.mirror_pages_trusted >= trusted + 2);
+
+    // A guest CPU store: that page alone is hashed and copied again, the other stays trusted.
+    const u8 stored = 0x5A;
+    rig.memory.CpuWrite(STORAGE_VA + 0x1100, &stored, 1);
+    trusted = rig.context.Stats().mirror_pages_trusted;
+    rig.Run(STORAGE_VA, 6, 8192);
+    const u64 store_hashes = next();
+    REQUIRE(store_hashes >= 1);
+    REQUIRE(store_hashes <= 2);
+    REQUIRE(stats.mirror_upload_bytes == 12288);
+    REQUIRE(stats.mirror_pages_trusted > trusted);
+
+    rig.Run(STORAGE_VA, 6, 8192);
+    REQUIRE(next() == 0);
+
+    // A host service's write through a host pointer, announced: that page is copied again.
+    data[0x1200] = 0x5B;
+    rig.context.NotifyHostWrite(STORAGE_VA + 0x200, 1);
+    rig.Run(STORAGE_VA, 6, 8192);
+    REQUIRE(next() >= 1);
+    REQUIRE(stats.mirror_upload_bytes == 16384);
+
+    // A guest flush of the whole pool without a store keeps the pages trusted.
+    rig.context.NotifyCpuWrite(POOL_VA, 64_KiB);
+    rig.Run(STORAGE_VA, 6, 8192);
+    REQUIRE(next() == 0);
+    REQUIRE(stats.mirror_upload_bytes == 16384);
+    REQUIRE(stats.ops_failed == 0);
+}
+
+TEST_CASE("NVN mirror pool: a page the GPU wrote is hashed again after its write-back",
+          "[nvn][compute][mirror]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    MirrorRig rig(*vulkan, AddProgram());
+    u8* data = rig.memory.Add(POOL_VA, 64_KiB);
+    std::memset(data, 0, 64_KiB);
+    rig.Start(64_KiB);
+
+    rig.Run(STORAGE_VA, 6);
+    REQUIRE(WordAt(data, 0x1000) == 100);
+    // The write-back is not a tracked write, but the page is not trusted: the guest putting the
+    // old word back (also untracked here) is still seen, and the GPU adds to it.
+    const u32 zero = 0;
+    std::memcpy(data + 0x1000, &zero, sizeof(zero));
+    rig.Run(STORAGE_VA, 6);
+    REQUIRE(WordAt(data, 0x1000) == 100);
+    REQUIRE(WordAt(data, 0x1004) == 200);
+    REQUIRE(rig.context.Stats().ops_failed == 0);
 }
 
 TEST_CASE("NVN mirror pool: a guest write between two uses reaches the GPU",

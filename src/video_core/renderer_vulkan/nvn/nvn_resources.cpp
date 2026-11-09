@@ -999,6 +999,12 @@ void Context::Impl::DestroyNow(u64 serial) {
             }
             pool->takeover_track = 0;
         }
+        if (pool->mirror_track != 0) {
+            if (VC::GuestMemory* const memory = guest.load(std::memory_order_acquire)) {
+                memory->Untrack(pool->mirror_track);
+            }
+            pool->mirror_track = 0;
+        }
         ++pool_generation;
         const auto by_address = pools_by_address.find(pool->address);
         if (by_address != pools_by_address.end() && by_address->second == pool) {

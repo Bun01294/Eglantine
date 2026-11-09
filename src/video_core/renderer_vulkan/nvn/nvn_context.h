@@ -138,6 +138,10 @@ struct ContextOptions {
     /// pages the page tracker saw the guest write or the mirror does not hold. Unset:
     /// EDEN_NX2_TRY_FLUSH_TRACKED decides (on unless 0).
     std::optional<bool> flush_tracked{};
+    /// Mirror pools (Pool::Backing::Mirror) hash only the guest pages the page tracker saw written
+    /// (or that something it does not see wrote) instead of every page of every range at each
+    /// submission; needs GuestMemory::Track. Unset: on unless EDEN_NX2_NVN_MIRROR_HASH_ALWAYS.
+    std::optional<bool> mirror_hash_tracked{};
     /// Milliseconds a guest nvnMemoryPoolInvalidateMappedRange waits for the GPU's unfinished
     /// writes to its range (0 = off). Unset: EDEN_NX2_TRY_INVALIDATE_WRITEBACK decides.
     std::optional<u32> invalidate_wait_ms{};
@@ -174,6 +178,7 @@ struct ContextStats {
     u64 mirror_upload_bytes{};          ///< ... of this many bytes
     u64 mirror_ranges_clean{};          ///< range uses that needed no copy
     u64 mirror_pages_hashed{};          ///< guest pages compared with what the mirror holds
+    u64 mirror_pages_trusted{};         ///< ... not compared: the page tracker saw no write
     // Pool mirrors (EDEN_NX2_NVN_POOL_MIRROR; Context::Impl::AtomicStats vram_* for the meaning).
     u64 vram_mirrors{};
     u64 vram_mirror_refused{};

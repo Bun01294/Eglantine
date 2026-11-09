@@ -218,6 +218,7 @@ Context::Impl::Impl(const Device& device_, std::mutex& submit_mutex_,
     dispatch_order_by_barriers =
         options.dispatch_order_by_barriers.value_or(Debug::Get().try_dispatch_order);
     flush_tracked = options.flush_tracked.value_or(Debug::Get().try_flush_tracked);
+    mirror_hash_tracked = options.mirror_hash_tracked.value_or(!Debug::Get().mirror_hash_always);
     invalidate_wait_ms = options.invalidate_wait_ms.value_or(Debug::Get().try_invalidate_writeback);
     raw_keep_entries = options.raw_keep_entries.value_or(Debug::Get().try_raw_keep_entries);
     storage_cache_budget =
@@ -1272,6 +1273,7 @@ ContextStats Context::Stats() const {
         .mirror_upload_bytes = s.mirror_upload_bytes.load(relaxed),
         .mirror_ranges_clean = s.mirror_ranges_clean.load(relaxed),
         .mirror_pages_hashed = s.mirror_pages_hashed.load(relaxed),
+        .mirror_pages_trusted = s.mirror_pages_trusted.load(relaxed),
         .vram_mirrors = s.vram_mirrors.load(relaxed),
         .vram_mirror_refused = s.vram_mirror_refused.load(relaxed),
         .vram_copy_in_runs = s.vram_copy_in_runs.load(relaxed),
@@ -1529,9 +1531,10 @@ std::string Context::DescribeState() const {
         text += fmt::format(" pools(imported/mirrored: runs,no_import)={}/{}: {},{}",
                             c.pools_imported, c.pools_mirrored, c.pools_mirrored_discontiguous,
                             c.pools_mirrored_no_import);
-        text += fmt::format(" mirror(uploads/copies/MiB/clean/pages_hashed)={}/{}/{}/{}/{}",
-                            c.mirror_uploads, c.mirror_upload_runs, c.mirror_upload_bytes >> 20,
-                            c.mirror_ranges_clean, c.mirror_pages_hashed);
+        text += fmt::format(
+            " mirror(uploads/copies/MiB/clean/pages_hashed/pages_trusted)={}/{}/{}/{}/{}/{}",
+            c.mirror_uploads, c.mirror_upload_runs, c.mirror_upload_bytes >> 20,
+            c.mirror_ranges_clean, c.mirror_pages_hashed, c.mirror_pages_trusted);
         if (impl->draw_resources) {
             const DrawCounters& draw = impl->draw_resources->counters;
             const auto breaks = [&](BreakCause cause) {
@@ -1660,6 +1663,7 @@ void Context::CollectStats(std::vector<VideoCommon::Nvn::SinkStat>& out) const {
     out.push_back({"mirror uploads: KiB copied", s.mirror_upload_bytes >> 10});
     out.push_back({"mirror range uses that needed no copy", s.mirror_ranges_clean});
     out.push_back({"mirror guest pages compared", s.mirror_pages_hashed});
+    out.push_back({"mirror guest pages trusted (no write tracked)", s.mirror_pages_trusted});
     out.push_back({"pool mirrors (VRAM copies of imported pools)", s.vram_mirrors});
     out.push_back({"pool mirrors: refused (budget, allocation, no CPU write tracking)",
                    s.vram_mirror_refused});

@@ -150,9 +150,20 @@ struct Pool {
         u64 hash{};     ///< CityHash64 of the guest page the mirror was last made equal to
         u32 checked{};  ///< submission (seq + 1) that last found the guest page unchanged
         bool valid{};   ///< the mirror holds a guest page at all (else the first use uploads it)
+        /// Hashed while `mirror_track` watched the page, with no GPU write of it pending, and
+        /// nothing wrote it since that the tracker does not see: unchanged unless the tracker
+        /// reports a write, so it is not hashed again (Recorder::MirrorTakeCpuWrites).
+        bool trusted{};
     };
     static constexpr u64 MIRROR_PAGE = 4096;
     std::vector<MirrorPage> mirror_pages;
+    /// Mirror pools: GuestMemory::Track registration over the whole pool, every page armed, so
+    /// that unchanged pages need no hash (Impl::mirror_hash_tracked). 0: not registered (yet, or
+    /// tracking unavailable: `mirror_track_tried`). Replay thread.
+    u64 mirror_track{};
+    bool mirror_track_tried{false};
+    std::shared_ptr<const std::atomic<u64>> mirror_write_epoch;
+    u64 mirror_epoch_clean{}; ///< `mirror_write_epoch` before the last TakeWritten
     /// Imported pools: the persistent device-local copy that storage bindings and indirect
     /// arguments use (EDEN_NX2_NVN_POOL_MIRROR, nvn_pool_mirror.h; not Backing::Mirror). Null until
     /// the first use that wants one. Replay thread only.
@@ -639,6 +650,7 @@ struct Context::Impl {
         std::atomic<u64> mirror_upload_runs{};           ///< ... in this many copies
         std::atomic<u64> mirror_uploads{};               ///< UploadRange calls that copied anything
         std::atomic<u64> mirror_pages_hashed{};          ///< guest pages compared with the mirror
+        std::atomic<u64> mirror_pages_trusted{};         ///< ... not compared: the tracker saw no write
         std::atomic<u64> mirror_ranges_clean{};          ///< range uses that needed no copy
         /// VRAM mirrors of imported pools (EDEN_NX2_NVN_POOL_MIRROR).
         std::atomic<u64> vram_mirrors{};            ///< mirrors created
@@ -1115,6 +1127,9 @@ struct Context::Impl {
     u32 barrier_merge{0};
     /// ContextOptions::flush_tracked, else EDEN_NX2_TRY_FLUSH_TRACKED (set at construction).
     bool flush_tracked{false};
+    /// ContextOptions::mirror_hash_tracked, else on unless EDEN_NX2_NVN_MIRROR_HASH_ALWAYS (set at
+    /// construction): mirror pools hash only the guest pages the page tracker saw written.
+    bool mirror_hash_tracked{false};
     /// EDEN_NX2_TRY_INVALIDATE_WRITEBACK (ContextOptions / nvn_debug.h): milliseconds a guest
     /// invalidate waits for the GPU's unfinished writes to its range; 0 = off (nothing is noted).
     u32 invalidate_wait_ms{0};

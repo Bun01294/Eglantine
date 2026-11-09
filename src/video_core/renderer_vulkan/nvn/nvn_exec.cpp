@@ -8,6 +8,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <optional>
 #include <unordered_set>
 #include <utility>
 
@@ -581,6 +582,14 @@ private:
     void UploadRange(Pool& pool, u64 offset, u64 size);
     bool MirrorNeedsUpload(Pool& pool, u64 offset, u64 size);
     u64 GuestPageHash(const Pool& pool, u64 page) const;
+    /// Mirror pools: registers the pool with the page tracker at the first call, then turns the
+    /// pages the guest CPU wrote since the last call into untrusted ones. False: no tracking (every
+    /// page is hashed, nothing is trusted).
+    bool MirrorTakeCpuWrites(Pool& pool);
+    /// Whether no unfinished submission writes `page` of a mirror pool (its write-back, which the
+    /// tracker does not see, is done). `pending` caches the pool's GPU-written ranges.
+    bool MirrorPageSettled(Pool& pool, u64 page,
+                           std::optional<std::vector<std::pair<u64, u64>>>& pending);
     /// The replay wrote a pool range on the GPU (through the pool's own buffer unless
     /// `invalidate_mirror` is false: a pool mirror's write-back, after which the mirror and the
     /// guest bytes agree).
@@ -1096,23 +1105,99 @@ u64 Recorder::GuestPageHash(const Pool& pool, u64 page) const {
     return Common::CityHash64(reinterpret_cast<const char*>(bytes), static_cast<size_t>(length));
 }
 
+bool Recorder::MirrorTakeCpuWrites(Pool& pool) {
+    if (!impl.mirror_hash_tracked) {
+        return false;
+    }
+    VC::GuestMemory* const memory = impl.guest.load(std::memory_order_acquire);
+    if (memory == nullptr) {
+        return false;
+    }
+    if (pool.mirror_track == 0) {
+        if (pool.mirror_track_tried) {
+            return false;
+        }
+        pool.mirror_track_tried = true;
+        pool.mirror_track = memory->Track(pool.address, pool.size);
+        if (pool.mirror_track == 0) {
+            return false;
+        }
+        // Watched from now on: a page hashed after this shows any later CPU write. No page is
+        // trusted yet.
+        memory->Arm(pool.mirror_track, pool.address, pool.size);
+        pool.mirror_write_epoch = memory->WriteEpoch(pool.mirror_track);
+        if (pool.mirror_write_epoch) {
+            pool.mirror_epoch_clean = pool.mirror_write_epoch->load(std::memory_order_acquire);
+        }
+        return true;
+    }
+    u64 epoch = 0;
+    if (pool.mirror_write_epoch) {
+        epoch = pool.mirror_write_epoch->load(std::memory_order_acquire);
+        if (epoch == pool.mirror_epoch_clean) {
+            return true;
+        }
+    }
+    // The whole pool: a taken write lives on as an untrusted page until that page is hashed, so a
+    // range checked later does not lose it.
+    thread_local std::vector<std::pair<u64, u64>> written;
+    written.clear();
+    memory->TakeWritten(pool.mirror_track, pool.address, pool.size, written);
+    for (const auto& [begin, end] : written) {
+        const u64 from = (std::max)(begin, pool.address) - pool.address;
+        const u64 to = (std::min)(end - pool.address, pool.size);
+        for (u64 page = from / Pool::MIRROR_PAGE; page * Pool::MIRROR_PAGE < to; ++page) {
+            pool.mirror_pages[static_cast<size_t>(page)].trusted = false;
+        }
+    }
+    pool.mirror_epoch_clean = epoch; // read before the take: a write in between shows as a change
+    return true;
+}
+
+bool Recorder::MirrorPageSettled(Pool& pool, u64 page,
+                                 std::optional<std::vector<std::pair<u64, u64>>>& pending) {
+    if (!pending) {
+        // Taken before the page is hashed: the completion writes a range back before it drops it
+        // from gpu_dirty, so a range missing here is in the guest bytes the hash reads.
+        pending.emplace();
+        std::scoped_lock lock{pool.dirty_mutex};
+        for (const Pool::Dirty& dirty : pool.gpu_dirty) {
+            pending->emplace_back(dirty.begin, dirty.end);
+        }
+    }
+    const u64 begin = page * Pool::MIRROR_PAGE;
+    const u64 end = begin + Pool::MIRROR_PAGE;
+    return std::none_of(pending->begin(), pending->end(), [&](const auto& range) {
+        return range.first < end && range.second > begin;
+    });
+}
+
 bool Recorder::MirrorNeedsUpload(Pool& pool, u64 offset, u64 size) {
     if (pool.backing != Pool::Backing::Mirror || size == 0 || offset >= pool.size) {
         return false;
     }
+    const bool tracked = MirrorTakeCpuWrites(pool);
+    std::optional<std::vector<std::pair<u64, u64>>> pending;
     const u32 stamp = static_cast<u32>(flight.seq) + 1;
     const u64 first = offset / Pool::MIRROR_PAGE;
     const u64 last = (std::min)(offset + size, pool.size) - 1;
     u64 hashed = 0;
+    u64 trusted = 0;
     bool dirty = false;
     for (u64 index = first; index <= last / Pool::MIRROR_PAGE; ++index) {
         Pool::MirrorPage& page = pool.mirror_pages[static_cast<size_t>(index)];
         if (page.valid && page.checked == stamp) {
             continue;
         }
+        if (page.valid && page.trusted) {
+            ++trusted;
+            continue;
+        }
+        const bool settled = tracked && MirrorPageSettled(pool, index, pending);
         ++hashed;
         if (page.valid && page.hash == GuestPageHash(pool, index)) {
             page.checked = stamp;
+            page.trusted = settled;
             continue;
         }
         dirty = true;
@@ -1120,6 +1205,9 @@ bool Recorder::MirrorNeedsUpload(Pool& pool, u64 offset, u64 size) {
     }
     if (hashed != 0) {
         impl.stats.mirror_pages_hashed.fetch_add(hashed, std::memory_order_relaxed);
+    }
+    if (trusted != 0) {
+        impl.stats.mirror_pages_trusted.fetch_add(trusted, std::memory_order_relaxed);
     }
     return dirty;
 }
@@ -1131,22 +1219,31 @@ void Recorder::UploadRange(Pool& pool, u64 offset, u64 size) {
     // The guest pages of the range that differ from what the mirror holds (all of them the first
     // time), as runs of consecutive pages. The mirror is made equal to these pages from here on,
     // so the bookkeeping is updated now.
+    const bool tracked = MirrorTakeCpuWrites(pool);
+    std::optional<std::vector<std::pair<u64, u64>>> pending;
     const u32 stamp = static_cast<u32>(flight.seq) + 1;
     const u64 first = offset / Pool::MIRROR_PAGE;
     const u64 last = (std::min)(offset + size, pool.size) - 1;
     u64 hashed = 0;
+    u64 trusted = 0;
     std::vector<std::pair<u64, u64>> parts;
     for (u64 index = first; index <= last / Pool::MIRROR_PAGE; ++index) {
         Pool::MirrorPage& page = pool.mirror_pages[static_cast<size_t>(index)];
         if (page.valid && page.checked == stamp) {
             continue;
         }
+        if (page.valid && page.trusted) {
+            ++trusted;
+            continue;
+        }
+        const bool settled = tracked && MirrorPageSettled(pool, index, pending);
         ++hashed;
         const u64 hash = GuestPageHash(pool, index);
         const bool changed = !page.valid || page.hash != hash;
         page.hash = hash;
         page.valid = true;
         page.checked = stamp;
+        page.trusted = settled;
         if (!changed) {
             continue;
         }
@@ -1160,6 +1257,9 @@ void Recorder::UploadRange(Pool& pool, u64 offset, u64 size) {
     }
     if (hashed != 0) {
         impl.stats.mirror_pages_hashed.fetch_add(hashed, std::memory_order_relaxed);
+    }
+    if (trusted != 0) {
+        impl.stats.mirror_pages_trusted.fetch_add(trusted, std::memory_order_relaxed);
     }
     if (parts.empty()) {
         impl.stats.mirror_ranges_clean.fetch_add(1, std::memory_order_relaxed);
@@ -1241,6 +1341,14 @@ void Recorder::NotePoolWrite(Pool& pool, u64 offset, u64 size, bool invalidate_m
         {
             std::scoped_lock lock{pool.dirty_mutex};
             pool.gpu_dirty.push_back({offset, offset + size, flight.seq});
+        }
+        // The write-back (and a report's timestamp) reaches the guest bytes untracked: the pages
+        // are hashed again once it is done (MirrorPageSettled).
+        if (size != 0 && offset < pool.size) {
+            const u64 end = (std::min)(offset + size, pool.size);
+            for (u64 page = offset / Pool::MIRROR_PAGE; page * Pool::MIRROR_PAGE < end; ++page) {
+                pool.mirror_pages[static_cast<size_t>(page)].trusted = false;
+            }
         }
         dirty_pool_set.insert(&pool);
         for (const InFlight::Readback& existing : readbacks) {

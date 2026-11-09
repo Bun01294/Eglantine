@@ -369,6 +369,18 @@ The guest memory stays the CPU truth.
   (`Pool::gpu_dirty`) are skipped: the mirror is newer than the guest there. The bytes a GPU write
   puts back into the guest differ from the page's recorded hash, so that page is copied once more
   at its next use (same bytes).
+- **Page tracker gate** (default; `EDEN_NX2_NVN_MIRROR_HASH_ALWAYS=1` or no `GuestMemory::Track`:
+  every page is hashed as above). At its first check a mirror pool is registered with the page
+  tracker (`Pool::mirror_track`, every page armed). A page hashed after that, with no GPU write of
+  it pending (no `gpu_dirty` range on it: its write-back is in the guest bytes), becomes `trusted`
+  and is not hashed again (`pages_trusted` in the heartbeat) until something takes the trust away:
+  a guest CPU write the tracker reports (`Recorder::MirrorTakeCpuWrites`: one `TakeWritten` of the
+  whole pool when its `WriteEpoch` moved, into the per-page flags), a GPU write of the page
+  (`NotePoolWrite`; the write-back and a report's timestamp land untracked), a host service's
+  write or an untracked flush (`NotifyCpuWriteNow`), and a texel flush (`FlushTextureNow`). A
+  guest flush with `flush_tracked` keeps the trust (the CPU's stores are in the tracker), as for
+  the pool mirrors' audit below ("Guest flushes of mirrored pools"). OoT's Castle Town hashed
+  ~30,500 unchanged pages (~125 MB, ~10 ms of the replay thread) per present without it.
 - **After** an op that writes a range (copy destination, clear), the range is recorded as
   GPU-dirty and, at the end of the submission, copied into a download buffer.
 - **At completion** the completion thread copies the download buffer into the guest bytes (host

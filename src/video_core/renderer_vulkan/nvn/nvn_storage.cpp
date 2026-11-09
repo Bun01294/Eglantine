@@ -662,10 +662,17 @@ void Context::Impl::NotifyCpuWriteNow(u64 address, u64 size, bool host_write) {
     const u64 end = begin + size;
     if (!pool.pending.load(std::memory_order_acquire) && !pool.mirror_pages.empty()) {
         // A mirror's pages in the range are compared with the guest's again at their next use,
-        // even in a submission that already found them unchanged.
+        // even in a submission that already found them unchanged. Trusted pages stay trusted for a
+        // guest flush with `flush_tracked` (the guest CPU's stores are in the page tracker), not
+        // for a host service's write through a host pointer.
+        const bool untrust = host_write || !flush_tracked;
         const u64 last = (std::min)(end, pool.size);
         for (u64 page = begin / Pool::MIRROR_PAGE; page * Pool::MIRROR_PAGE < last; ++page) {
-            pool.mirror_pages[static_cast<size_t>(page)].checked = 0;
+            Pool::MirrorPage& mirror_page = pool.mirror_pages[static_cast<size_t>(page)];
+            mirror_page.checked = 0;
+            if (untrust) {
+                mirror_page.trusted = false;
+            }
         }
     }
     // A pool mirror copies the range in again at its next use (the guest CPU's writes are seen by
@@ -1263,6 +1270,13 @@ void Context::Impl::FlushTextureNow(CmdFlushTexture& command) {
     }
     if (!scratch.empty() && memory) {
         memory->Write(pool.address + s.pool_offset, scratch.data(), scratch.size());
+    }
+    // An untracked write: a mirror pool hashes these pages again at their next use.
+    if (!pool.mirror_pages.empty()) {
+        const u64 end = s.pool_offset + storage_size;
+        for (u64 page = s.pool_offset / Pool::MIRROR_PAGE; page * Pool::MIRROR_PAGE < end; ++page) {
+            pool.mirror_pages[static_cast<size_t>(page)].trusted = false;
+        }
     }
     // The guest bytes are the texture's contents now: from here on it is a CPU-sourced storage.
     s.origin = StorageOrigin::Cpu;
