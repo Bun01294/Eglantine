@@ -451,6 +451,18 @@ PipelineCache::Impl::Impl(const Device& device_, PipelineCacheOptions options_)
                             ? VertexInputMode::Dynamic
                             : VertexInputMode::Static;
     must_emulate_scaled_formats = device.MustEmulateScaledFormats();
+    // The titles whose own tensor programs are lowered, as the emulated GPU picks them
+    // (KeplerCompute::EmulatesNativeTensorPrograms); the compact form needs compute pipelines
+    // created 32 threads wide.
+    tensor_lowering = VideoCommon::NativeTensorLoweringFor(
+        Settings::GetCurrentProgramID(),
+        device.IsExtSubgroupSizeControlSupported() &&
+            device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT));
+    if (tensor_lowering != VideoCommon::NativeTensorLowering::None) {
+        LOG_INFO(Render_Vulkan, "[nvn] tensor programs: lowered ({} form)",
+                 tensor_lowering == VideoCommon::NativeTensorLowering::Compact ? "compact"
+                                                                               : "full");
+    }
     const u32 mode_word = static_cast<u32>(vertex_input_mode);
     disk_header.profile_hash = Common::CityHash64WithSeed(
         reinterpret_cast<const char*>(&mode_word), sizeof(mode_word),
@@ -458,9 +470,11 @@ PipelineCache::Impl::Impl(const Device& device_, PipelineCacheOptions options_)
     const std::string_view epoch = options.translation_epoch.empty()
                                        ? Disk::TranslationEpoch()
                                        : std::string_view{options.translation_epoch};
+    TranslationSwitches switches = CurrentTranslationSwitches();
+    switches.tensor_lowering = static_cast<u8>(tensor_lowering);
     disk_header.translation_key = Disk::MakeTranslationKey({
         .epoch = epoch,
-        .switches_hash = HashTranslationSwitches(CurrentTranslationSwitches()),
+        .switches_hash = HashTranslationSwitches(switches),
         .vendor_id = disk_header.vendor_id,
         .device_id = disk_header.device_id,
         .driver_version = disk_header.driver_version,
@@ -652,9 +666,10 @@ LoweredEntry PipelineCache::Impl::GetLowered(const StageProgram& program, u32 nv
                 static_cast<VC::ShaderStage>(nvn_stage),
                 std::span<const u8>{program.control->data(), program.control->size()},
                 std::span<const u8>{program.code->data(), program.code->size()}},
-            // No cooperative matrix lowering in Eglantine: matrix programs (a game's own DLSS
-            // network) are rejected and the replay replaces the network (nvn_upscale.cpp).
-            false);
+            // No cooperative matrix lowering in Eglantine: a game's own DLSS network is lowered
+            // for the titles NativeTensorLoweringFor names, otherwise rejected and replaced by the
+            // replay (nvn_upscale.cpp).
+            tensor_lowering);
     } catch (const std::exception& e) {
         auto failed = std::make_shared<VC::LoweredNvnProgram>();
         failed->error = std::string{"exception: "} + e.what();
@@ -1007,6 +1022,9 @@ bool PipelineCache::Impl::Translate(const TranslateInput& in, TranslateOutput& o
         record.layout.uses_raw_global_memory = programs[stage].info.uses_raw_global_memory;
         record.layout.stores_raw_global_memory = programs[stage].info.stores_raw_global_memory;
         record.layout.raw_stores_written_through = VC::RawStoresWrittenThrough(programs[stage].info);
+        record.layout.requires_guest_warp =
+            is_compute && tensor_lowering == VideoCommon::NativeTensorLowering::Compact &&
+            programs[stage].info.UsesWarpOps();
         for (const VC::DescriptorBinding& binding : layout.bindings) {
             if (static_cast<u32>(binding.stage) != stage) {
                 continue;

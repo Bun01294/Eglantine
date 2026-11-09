@@ -499,7 +499,9 @@ Row ProcessShader(u64 index, const StoredShader& shader, const WorkerConfig& con
     }
 
     const NvnProgramBinary binary{*stage, shader.control, shader.code};
-    const auto lowered = LowerNvnProgram(binary, CooperativeMatrixRequested());
+    const auto lowered = LowerNvnProgram(binary, CooperativeMatrixRequested()
+                                                     ? VideoCommon::NativeTensorLowering::Full
+                                                     : VideoCommon::NativeTensorLowering::None);
     if (!lowered->capture_complete && lowered->error.empty()) {
         row.flags += "capture-incomplete ";
     }

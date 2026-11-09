@@ -160,8 +160,8 @@ std::optional<ShaderStage> StageFromSph(std::span<const u8> code) {
     return StageFromSphType((ReadU32(code, 0) >> 10) & 0xF);
 }
 
-std::shared_ptr<const LoweredNvnProgram> LowerNvnProgram(
-    const NvnProgramBinary& binary, bool support_cooperative_matrix) {
+std::shared_ptr<const LoweredNvnProgram> LowerNvnProgram(const NvnProgramBinary& binary,
+                                                        NativeTensorLowering tensor) {
     using Shader::Ampere::Instruction;
     using Capture = Shader::Ampere::ProgramCaptureState;
 
@@ -271,9 +271,11 @@ std::shared_ptr<const LoweredNvnProgram> LowerNvnProgram(
     result->capture_complete = complete;
     result->native_key = Shader::Ampere::NativeProgramKey(native);
 
+    const bool compute = binary.stage == ShaderStage::Compute;
     auto lowered = Shader::Ampere::LowerToMaxwell(
         native, {.geometry = binary.stage == ShaderStage::Geometry,
-                 .tensor = support_cooperative_matrix && binary.stage == ShaderStage::Compute});
+                 .tensor = compute && tensor != NativeTensorLowering::None,
+                 .compact_tensor = compute && tensor == NativeTensorLowering::Compact});
     if (!lowered) {
         const size_t failed = lowered.error_offset / sizeof(Instruction);
         result->error_offset = lowered.error_offset;

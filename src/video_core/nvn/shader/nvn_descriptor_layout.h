@@ -126,6 +126,9 @@ struct DescriptorLayout {
     /// Every stage that stores raw global memory writes each store through to the mirror alias
     /// table (RawStoresWrittenThrough). False when no stage stores.
     bool raw_stores_written_through{};
+    /// A compute program that must run 32 threads per subgroup (the compact tensor helper
+    /// shuffles across the warp): its pipeline asks for a required subgroup size of 32.
+    bool requires_guest_warp{};
     u32 unsupported_count{};
 
     /// True when the pipeline needs push constants (rescaling or render area).

@@ -35,6 +35,7 @@
 #include "tests/temp_path.h"
 #include "video_core/nvn/state_layouts.h"
 #include "video_core/load_progress.h"
+#include "video_core/native_tensor_programs.h"
 #include "video_core/shader_notify.h"
 #include "video_core/renderer_vulkan/nvn/nvn_pipeline_cache.h"
 #include "video_core/renderer_vulkan/nvn/nvn_pipeline_disk.h"
@@ -1700,11 +1701,30 @@ TEST_CASE("Translation switches: the hash covers what the recompiler reads and n
         s.tensor_mode_set = true;
         s.tensor_mode = "stub";
     }));
+    REQUIRE(changes([](TranslationSwitches& s) { s.tensor_lowering = 1; }));
+    REQUIRE(changes([](TranslationSwitches& s) { s.tensor_lowering = 2; }));
     REQUIRE(changes([](TranslationSwitches& s) { s.raw_coverage = true; }));
     REQUIRE(changes([](TranslationSwitches& s) { s.raw_global_fast = true; }));
     REQUIRE(changes([](TranslationSwitches& s) { s.lean_global_memory = false; }));
     REQUIRE(changes([](TranslationSwitches& s) { s.ro_mirror_exact = true; }));
     REQUIRE_FALSE(changes([](TranslationSwitches&) {}));
+}
+
+TEST_CASE("Tensor programs are lowered for the titles the emulated GPU lowers them for",
+          "[nvn]") {
+    using VideoCommon::NativeTensorLowering;
+    using VideoCommon::NativeTensorLoweringFor;
+    // Ocarina of Time: compact where compute shaders can be 32 threads wide, else the expansion.
+    CHECK(NativeTensorLoweringFor(VideoCommon::OcarinaOfTimeProgramId, true) ==
+          NativeTensorLowering::Compact);
+    CHECK(NativeTensorLoweringFor(VideoCommon::OcarinaOfTimeProgramId, false) ==
+          NativeTensorLowering::Full);
+    // Donkey Kong Bananza: the expansion.
+    CHECK(NativeTensorLoweringFor(VideoCommon::DonkeyKongBananzaProgramId, true) ==
+          NativeTensorLowering::Full);
+    // Everyone else: rejected, as before.
+    CHECK(NativeTensorLoweringFor(0x0100000000010000ULL, true) == NativeTensorLowering::None);
+    CHECK(NativeTensorLoweringFor(0, false) == NativeTensorLowering::None);
 }
 
 TEST_CASE("Translation switches follow the settings the recompiler reads", "[nvn]") {

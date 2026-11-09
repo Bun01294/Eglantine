@@ -43,6 +43,7 @@
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/object_pool.h"
 #include "shader_recompiler/profile.h"
+#include "video_core/native_tensor_programs.h"
 #include "video_core/nvn/shader/nvn_driver_layout.h"
 
 namespace VideoCommon::Nvn {
@@ -206,10 +207,10 @@ struct LoweredNvnProgram {
     }
 };
 
-/// Captures, lowers and packs a program. Cooperative matrix lowering is enabled only for compute
-/// stages when `support_cooperative_matrix` is true.
+/// Captures, lowers and packs a program. Compute programs lower their matrix multiplies (HMMA) as
+/// `tensor` says; EDEN_NX2_TENSOR overrides it.
 [[nodiscard]] std::shared_ptr<const LoweredNvnProgram> LowerNvnProgram(
-    const NvnProgramBinary& binary, bool support_cooperative_matrix = false);
+    const NvnProgramBinary& binary, NativeTensorLowering tensor = NativeTensorLowering::None);
 
 /// A constant-buffer word whose value the environment hands out as a synthetic handle.
 struct NvnHandleRecord {

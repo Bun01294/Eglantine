@@ -33,6 +33,7 @@
 #include "common/thread.h"
 #include "common/thread_worker.h"
 #include "shader_recompiler/backend/bindings.h"
+#include "video_core/native_tensor_programs.h"
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_vulkan/nvn/nvn_pipeline_cache.h"
 #include "video_core/renderer_vulkan/nvn/nvn_pipeline_disk.h"
@@ -586,6 +587,9 @@ struct PipelineCache::Impl {
     /// the disk header's profile hash.
     VertexInputMode vertex_input_mode{VertexInputMode::Static};
     bool must_emulate_scaled_formats{};
+    /// How the title's compute programs lower their matrix multiplies (decided once, part of the
+    /// translation key).
+    VideoCommon::NativeTensorLowering tensor_lowering{VideoCommon::NativeTensorLowering::None};
     Shader::HostTranslateInfo host_info;
     Disk::Header disk_header;
     std::filesystem::path disk_path;

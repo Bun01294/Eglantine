@@ -164,6 +164,7 @@ add_library(video_core STATIC
     nvn/shader/nvn_program_map.cpp
     nvn/shader/nvn_program_map.h
     native_qmd.h
+    native_tensor_programs.h
     native_query_trace.h
     nx2.h
     nx2_debug_control.cpp

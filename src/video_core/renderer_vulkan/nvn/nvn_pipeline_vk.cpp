@@ -242,6 +242,7 @@ VC::DescriptorLayout PipelineCache::Impl::MergeLayouts(
         merged.uses_render_area |= slice.uses_render_area;
         merged.uses_raw_global_memory |= slice.uses_raw_global_memory;
         merged.stores_raw_global_memory |= slice.stores_raw_global_memory;
+        merged.requires_guest_warp |= slice.requires_guest_warp;
         raw_stores_not_through |=
             slice.stores_raw_global_memory && !slice.raw_stores_written_through;
         merged.unsupported_count += slice.unsupported_count;
@@ -456,6 +457,16 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::AssembleCompute(
             .codeSize = record.spirv.size() * sizeof(u32),
             .pCode = record.spirv.data(),
         });
+        // As vk_compute_pipeline.cpp: only programs that need whole warps ask for 32 threads per
+        // subgroup (forcing it elsewhere makes Intel compile SIMD32).
+        const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+            .pNext = nullptr,
+            .requiredSubgroupSize = GuestWarpSize,
+        };
+        const bool guest_warp = record.layout.requires_guest_warp &&
+                                device.IsExtSubgroupSizeControlSupported() &&
+                                device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT);
         pipeline->pipeline = device.GetLogical().CreateComputePipeline(
             {
                 .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
@@ -464,7 +475,7 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::AssembleCompute(
                 .stage =
                     {
                         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                        .pNext = nullptr,
+                        .pNext = guest_warp ? &subgroup_size_ci : nullptr,
                         .flags = 0,
                         .stage = VK_SHADER_STAGE_COMPUTE_BIT,
                         .module = *shader_module,

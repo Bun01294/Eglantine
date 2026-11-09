@@ -1260,6 +1260,10 @@ u64 HashTranslationSwitches(const TranslationSwitches& switches) {
                            switches.resolution_down_shift, switches.resolution_up_factor_bits,
                            switches.resolution_down_factor_bits);
     }
+    // Only in the text for the titles whose tensor programs are lowered: other keys stay valid.
+    if (switches.tensor_lowering != 0) {
+        key += fmt::format(" tensor_lowering={}", static_cast<int>(switches.tensor_lowering));
+    }
     if (Common::DiagRequest::TrySwitchDiffersFromDefault("TRY_DIRECT_UNUSED_ATOMICS")) {
         key += fmt::format(" direct_unused={}", switches.direct_unused_atomics);
     }
