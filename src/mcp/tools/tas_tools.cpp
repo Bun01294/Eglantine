@@ -23,6 +23,7 @@
 #include "input_common/main.h"
 #include "mcp/context.h"
 #include "mcp/host.h"
+#include "mcp/server.h"
 #include "mcp/timeline.h"
 #include "mcp/tool_registry.h"
 #include "mcp/tools/tool_helpers.h"
@@ -43,8 +44,8 @@ constexpr size_t kMaxScriptFrames = 216000;
 /// Button names shared with the input tools; HOME and CAPTURE are left out (the TAS engine
 /// ignores them so scripts can't trigger hotkeys).
 constexpr std::array<std::string_view, 18> kTasButtons{
-    "A",     "B",    "X",   "Y",     "LSTICK", "RSTICK", "L",  "R",  "ZL",
-    "ZR",    "PLUS", "MINUS", "DLEFT", "DUP",  "DRIGHT", "DDOWN", "SL", "SR"};
+    "A",  "B",    "X",     "Y",     "LSTICK", "RSTICK", "L",     "R",  "ZL",
+    "ZR", "PLUS", "MINUS", "DLEFT", "DUP",    "DRIGHT", "DDOWN", "SL", "SR"};
 
 json TasButtonEnum() {
     json names = json::array();
@@ -93,12 +94,13 @@ json StatusJson(Tas& tas) {
     for (const size_t length : lengths) {
         script_lengths.push_back(length);
     }
-    return json{{"state", StateName(state)},
-                {"frame", frame},
-                {"script_lengths", std::move(script_lengths)},
-                {"tas_enabled", Settings::values.tas_enable.GetValue()},
-                {"loop", Settings::values.tas_loop.GetValue()},
-                {"scripts_dir", DataRelativePath(Common::FS::GetEdenPath(Common::FS::EdenPath::TASDir))}};
+    return json{
+        {"state", StateName(state)},
+        {"frame", frame},
+        {"script_lengths", std::move(script_lengths)},
+        {"tas_enabled", Settings::values.tas_enable.GetValue()},
+        {"loop", Settings::values.tas_loop.GetValue()},
+        {"scripts_dir", DataRelativePath(Common::FS::GetEdenPath(Common::FS::EdenPath::TASDir))}};
 }
 
 /// Formats an optional [x, y] stick in -1..1 as a TAS-nx "x;y" axis pair in +-32767 ("0;0" if
@@ -202,8 +204,8 @@ std::string ValidateScript(std::string_view script, std::string& normalized, siz
         long long frame = 0;
         if (!ParseFrameNumber(fields[0], frame) || frame < 0 ||
             frame >= static_cast<long long>(kMaxScriptFrames)) {
-            return error(fmt::format("frame number must be an integer in 0..{}",
-                                     kMaxScriptFrames - 1));
+            return error(
+                fmt::format("frame number must be an integer in 0..{}", kMaxScriptFrames - 1));
         }
         if (frame <= previous) {
             return error("frame numbers must increase");
@@ -212,9 +214,8 @@ std::string ValidateScript(std::string_view script, std::string& normalized, siz
         for (const auto button : Split(fields[1], ';')) {
             const bool known =
                 button == "NONE" ||
-                (button.starts_with("KEY_") &&
-                 std::find(kTasButtons.begin(), kTasButtons.end(), button.substr(4)) !=
-                     kTasButtons.end());
+                (button.starts_with("KEY_") && std::find(kTasButtons.begin(), kTasButtons.end(),
+                                                         button.substr(4)) != kTasButtons.end());
             if (!known) {
                 return error("unknown button (KEY_A..KEY_SR or NONE)");
             }
@@ -301,8 +302,7 @@ ToolResult TasReadScript(ToolContext&, const json& args) {
         }
         path = ScriptPath(which[0] - '0');
     }
-    std::string text =
-        Common::FS::ReadStringFromFile(path, Common::FS::FileType::TextFile);
+    std::string text = Common::FS::ReadStringFromFile(path, Common::FS::FileType::TextFile);
     const size_t limit = args.value("max_bytes", size_t{65536});
     json out{{"path", DataRelativePath(path)}, {"bytes", text.size()}};
     if (text.size() > limit) {
@@ -382,13 +382,14 @@ ToolResult TasPlay(ToolContext& ctx, const json& args) {
         while (next_checkpoint < checkpoints.size() && seen_running &&
                frame >= checkpoints[next_checkpoint]) {
             std::string shot_error;
-            if (const auto png = CaptureScreenshot(ctx, max_width, milliseconds{3000}, shot_error)) {
+            if (const auto png =
+                    CaptureScreenshot(ctx, max_width, milliseconds{3000}, shot_error)) {
                 images.AddImage(*png, "image/png");
                 shots.push_back({{"requested_frame", checkpoints[next_checkpoint]},
                                  {"script_frame", std::get<1>(tas->GetStatus())}});
             } else {
-                shots.push_back({{"requested_frame", checkpoints[next_checkpoint]},
-                                 {"error", shot_error}});
+                shots.push_back(
+                    {{"requested_frame", checkpoints[next_checkpoint]}, {"error", shot_error}});
             }
             ++next_checkpoint;
         }
@@ -486,7 +487,8 @@ ToolResult TasRecordStop(ToolContext& ctx, const json& args) {
         return ToolResult::Error("not recording (call tas_record_start first)");
     }
     if (ctx.timeline) {
-        ctx.timeline->Push(EventKind::Input, 0, "mcp", fmt::format("tas record stop ({} frames)", frames));
+        ctx.timeline->Push(EventKind::Input, 0, "mcp",
+                           fmt::format("tas record stop ({} frames)", frames));
     }
     json out{{"frames", frames}, {"record_path", DataRelativePath(RecordPath())}};
     if (overwrite) {
@@ -512,7 +514,9 @@ ToolResult TasSetOptions(ToolContext&, const json& args) {
 }
 
 json PlayerProp() {
-    return json{{"type", "integer"}, {"minimum", 1}, {"maximum", 8},
+    return json{{"type", "integer"},
+                {"minimum", 1},
+                {"maximum", 8},
                 {"description", "Player 1-8 (default 1). Player 1's script also drives handheld."}};
 }
 
@@ -558,8 +562,10 @@ void RegisterTasTools(ToolRegistry& registry) {
                   {{"type", "object"},
                    {"properties",
                     {{"frames", {{"type", "integer"}, {"minimum", 1}, {"maximum", 216000}}},
-                     {"buttons", {{"type", "array"}, {"maxItems", 18},
-                                  {"items", {{"type", "string"}, {"enum", TasButtonEnum()}}}}},
+                     {"buttons",
+                      {{"type", "array"},
+                       {"maxItems", 18},
+                       {"items", {{"type", "string"}, {"enum", TasButtonEnum()}}}}},
                      {"left", StickProp()},
                      {"right", StickProp()}}},
                    {"required", {"frames"}},
@@ -577,9 +583,12 @@ void RegisterTasTools(ToolRegistry& registry) {
         .description = "Read player N's script, or \"record\" for the last recording.",
         .input_schema = {{"type", "object"},
                          {"properties",
-                          {{"which", {{"type", "string"}, {"maxLength", 6},
-                                      {"description", "\"1\"-\"8\" (default \"1\") or \"record\"."}}},
-                           {"max_bytes", {{"type", "integer"}, {"minimum", 1}, {"maximum", 1048576}}}}},
+                          {{"which",
+                            {{"type", "string"},
+                             {"maxLength", 6},
+                             {"description", "\"1\"-\"8\" (default \"1\") or \"record\"."}}},
+                           {"max_bytes",
+                            {{"type", "integer"}, {"minimum", 1}, {"maximum", 1048576}}}}},
                          {"additionalProperties", false}},
         .annotations = {.read_only = true, .idempotent = true},
         .handler = TasReadScript,

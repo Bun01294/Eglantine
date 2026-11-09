@@ -3,23 +3,24 @@
 
 // The running application's memory map (a JSON version of the GDB stub's monitor command).
 
+#include <limits>
 #include <mutex>
 #include <optional>
-#include <limits>
 
 #include <fmt/format.h>
 
 #include "core/arm/debug.h"
 #include "core/core.h"
+#include "core/hle/kernel/k_light_lock.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
-#include "core/hle/kernel/k_light_lock.h"
 #include "core/hle/kernel/k_thread.h"
-#include "mcp/control.h"
 #include "mcp/context.h"
-#include "mcp/tools/app_process.h"
+#include "mcp/control.h"
 #include "mcp/host.h"
+#include "mcp/server.h"
 #include "mcp/tool_registry.h"
+#include "mcp/tools/app_process.h"
 #include "mcp/tools/tool_helpers.h"
 
 namespace Mcp {
@@ -34,29 +35,52 @@ std::string Hex(u64 value) {
 const char* MemoryStateName(Kernel::Svc::MemoryState state) {
     using S = Kernel::Svc::MemoryState;
     switch (state) {
-    case S::Free: return "Free";
-    case S::Io: return "Io";
-    case S::Static: return "Static";
-    case S::Code: return "Code";
-    case S::CodeData: return "CodeData";
-    case S::Normal: return "Normal";
-    case S::Shared: return "Shared";
-    case S::AliasCode: return "AliasCode";
-    case S::AliasCodeData: return "AliasCodeData";
-    case S::Ipc: return "Ipc";
-    case S::Stack: return "Stack";
-    case S::ThreadLocal: return "ThreadLocal";
-    case S::Transferred: return "Transferred";
-    case S::SharedTransferred: return "SharedTransferred";
-    case S::SharedCode: return "SharedCode";
-    case S::Inaccessible: return "Inaccessible";
-    case S::NonSecureIpc: return "NonSecureIpc";
-    case S::NonDeviceIpc: return "NonDeviceIpc";
-    case S::Kernel: return "Kernel";
-    case S::GeneratedCode: return "GeneratedCode";
-    case S::CodeOut: return "CodeOut";
-    case S::Coverage: return "Coverage";
-    default: return "Unknown";
+    case S::Free:
+        return "Free";
+    case S::Io:
+        return "Io";
+    case S::Static:
+        return "Static";
+    case S::Code:
+        return "Code";
+    case S::CodeData:
+        return "CodeData";
+    case S::Normal:
+        return "Normal";
+    case S::Shared:
+        return "Shared";
+    case S::AliasCode:
+        return "AliasCode";
+    case S::AliasCodeData:
+        return "AliasCodeData";
+    case S::Ipc:
+        return "Ipc";
+    case S::Stack:
+        return "Stack";
+    case S::ThreadLocal:
+        return "ThreadLocal";
+    case S::Transferred:
+        return "Transferred";
+    case S::SharedTransferred:
+        return "SharedTransferred";
+    case S::SharedCode:
+        return "SharedCode";
+    case S::Inaccessible:
+        return "Inaccessible";
+    case S::NonSecureIpc:
+        return "NonSecureIpc";
+    case S::NonDeviceIpc:
+        return "NonDeviceIpc";
+    case S::Kernel:
+        return "Kernel";
+    case S::GeneratedCode:
+        return "GeneratedCode";
+    case S::CodeOut:
+        return "CodeOut";
+    case S::Coverage:
+        return "Coverage";
+    default:
+        return "Unknown";
     }
 }
 
@@ -67,10 +91,14 @@ const char* PermissionString(const Kernel::Svc::MemoryInfo& info) {
         return "---";
     }
     switch (info.permission) {
-    case Kernel::Svc::MemoryPermission::ReadExecute: return "r-x";
-    case Kernel::Svc::MemoryPermission::Read: return "r--";
-    case Kernel::Svc::MemoryPermission::ReadWrite: return "rw-";
-    default: return "---";
+    case Kernel::Svc::MemoryPermission::ReadExecute:
+        return "r-x";
+    case Kernel::Svc::MemoryPermission::Read:
+        return "r--";
+    case Kernel::Svc::MemoryPermission::ReadWrite:
+        return "rw-";
+    default:
+        return "---";
     }
 }
 
@@ -143,8 +171,10 @@ void RegisterProcessTools(ToolRegistry& registry) {
         .input_schema = {{"type", "object"},
                          {"properties",
                           {{"include_free", {{"type", "boolean"}}},
-                           {"state", {{"type", "string"}, {"maxLength", 32},
-                                      {"description", "e.g. Normal, Code, Stack"}}}}},
+                           {"state",
+                            {{"type", "string"},
+                             {"maxLength", 32},
+                             {"description", "e.g. Normal, Code, Stack"}}}}},
                          {"additionalProperties", false}},
         .annotations = {.read_only = true, .idempotent = true},
         .requires_game = true,

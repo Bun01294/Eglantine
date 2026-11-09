@@ -17,6 +17,7 @@
 #include "common/settings.h"
 #include "mcp/context.h"
 #include "mcp/host.h"
+#include "mcp/server.h"
 #include "mcp/timeline.h"
 #include "mcp/tool_registry.h"
 #include "mcp/tools/tool_helpers.h"
@@ -57,8 +58,8 @@ std::string Lower(std::string s) {
 bool Allowed(const Settings::BasicSetting& s) {
     const std::string name = Lower(s.GetLabel());
     static constexpr std::array<std::string_view, 17> kDeniedFragments{
-        "dump",   "token", "password", "passwd", "secret", "serial", "key",   "mcp",    "gdb",
-        "udp",    "airplane", "username", "network", "log", "web",    "debug", "post_shader"};
+        "dump", "token",    "password", "passwd",  "secret", "serial", "key",   "mcp",        "gdb",
+        "udp",  "airplane", "username", "network", "log",    "web",    "debug", "post_shader"};
     static constexpr std::array<std::string_view, 8> kDeniedSuffixes{
         "_path", "_dir", "_file", "_url", "_host", "_server", "_port", "_device"};
     for (const auto fragment : kDeniedFragments) {
@@ -85,9 +86,9 @@ bool Allowed(const Settings::BasicSetting& s) {
         return true;
     case Settings::Category::System: {
         static constexpr std::array<std::string_view, 11> kSystem{
-            "custom_rtc",    "custom_rtc_enabled", "custom_rtc_offset", "fast_cpu_time",
-            "fast_gpu_time", "language_index",     "region_index",      "rng_seed",
-            "rng_seed_enabled", "time_zone_index", "use_docked_mode"};
+            "custom_rtc",       "custom_rtc_enabled", "custom_rtc_offset", "fast_cpu_time",
+            "fast_gpu_time",    "language_index",     "region_index",      "rng_seed",
+            "rng_seed_enabled", "time_zone_index",    "use_docked_mode"};
         return std::find(kSystem.begin(), kSystem.end(), name) != kSystem.end();
     }
     default:
@@ -145,13 +146,14 @@ ToolResult ApplyChanges(ToolContext& ctx, const json& changes, bool apply) {
         }
         if (!(value.is_string() || value.is_number() || value.is_boolean()) ||
             (value.is_string() && value.get_ref<const std::string&>().size() > 128)) {
-            results.push_back({{"name", name}, {"error", "value must be a number, boolean or "
-                                                         "short string"}});
+            results.push_back({{"name", name},
+                               {"error", "value must be a number, boolean or "
+                                         "short string"}});
             any_error = true;
             continue;
         }
         const std::string before = s->IsEnum() ? s->Canonicalize() : s->ToString();
-        const std::string text = value.is_string() ? value.get<std::string>()
+        const std::string text = value.is_string()    ? value.get<std::string>()
                                  : value.is_boolean() ? (value.get<bool>() ? "true" : "false")
                                                       : value.dump();
         if (std::string error = SetFromString(*s, text); !error.empty()) {
@@ -283,10 +285,17 @@ void RegisterSettingsTools(ToolRegistry& registry) {
                        "Most take effect on the next boot.",
         .input_schema = {{"type", "object"},
                          {"properties",
-                          {{"rng_seed", {{"type", "integer"}, {"minimum", 0}, {"maximum", 4294967295LL}}},
+                          {{"rng_seed",
+                            {{"type", "integer"}, {"minimum", 0}, {"maximum", 4294967295LL}}},
                            {"rtc", {{"type", "integer"}}},
-                           {"language", {{"type", "string"}, {"maxLength", 32}, {"description", "e.g. EnglishAmerican, Japanese, or an index"}}},
-                           {"region", {{"type", "string"}, {"maxLength", 32}, {"description", "e.g. Usa, Europe, Japan, or an index"}}},
+                           {"language",
+                            {{"type", "string"},
+                             {"maxLength", 32},
+                             {"description", "e.g. EnglishAmerican, Japanese, or an index"}}},
+                           {"region",
+                            {{"type", "string"},
+                             {"maxLength", 32},
+                             {"description", "e.g. Usa, Europe, Japan, or an index"}}},
                            {"clear", {{"type", "boolean"}}}}},
                          {"additionalProperties", false}},
         .requires_write = true,
@@ -302,8 +311,10 @@ void RegisterSettingsTools(ToolRegistry& registry) {
                        "skipped; values are cut at 256 characters.",
         .input_schema = {{"type", "object"},
                          {"properties",
-                          {{"prefix", {{"type", "string"}, {"maxLength", 64},
-                                       {"description", "Must start with EDEN_ (default EDEN_)."}}}}},
+                          {{"prefix",
+                            {{"type", "string"},
+                             {"maxLength", 64},
+                             {"description", "Must start with EDEN_ (default EDEN_)."}}}}},
                          {"additionalProperties", false}},
         .annotations = {.read_only = true, .idempotent = true},
         .handler = EnvSwitches,

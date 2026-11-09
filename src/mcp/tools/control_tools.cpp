@@ -10,6 +10,7 @@
 #include "mcp/context.h"
 #include "mcp/control.h"
 #include "mcp/host.h"
+#include "mcp/server.h"
 #include "mcp/timeline.h"
 #include "mcp/tool_registry.h"
 
@@ -25,10 +26,8 @@ json HolderJson(const ControlLease::Holder& h, const std::string& caller) {
         {"held_by_you", h.session_id == caller},
         {"label", h.label},
         {"session", h.session_id.substr(0, 8)},
-        {"held_for_s",
-         std::chrono::duration_cast<std::chrono::seconds>(now - h.acquired).count()},
-        {"expires_in_s",
-         std::chrono::duration_cast<std::chrono::seconds>(h.expires - now).count()},
+        {"held_for_s", std::chrono::duration_cast<std::chrono::seconds>(now - h.acquired).count()},
+        {"expires_in_s", std::chrono::duration_cast<std::chrono::seconds>(h.expires - now).count()},
     };
 }
 
@@ -39,9 +38,10 @@ ToolResult ControlStatus(ToolContext& ctx, const json&) {
     }
     const auto holder = ctx.control->Current();
     if (!holder) {
-        return ToolResult::Structured(json{
-            {"free", true},
-            {"note", "Nobody controls the emulator; the first state-changing tool call takes it."}});
+        return ToolResult::Structured(
+            json{{"free", true},
+                 {"note",
+                  "Nobody controls the emulator; the first state-changing tool call takes it."}});
     }
     json out = HolderJson(*holder, ctx.session_id);
     out["free"] = false;
@@ -92,7 +92,8 @@ ToolResult AcquireControl(ToolContext& ctx, const json& args) {
     }
     if (ctx.timeline) {
         ctx.timeline->Push(EventKind::State, 0, "mcp",
-                           fmt::format("control acquired by {}", label.empty() ? ctx.session_id.substr(0, 8) : label));
+                           fmt::format("control acquired by {}",
+                                       label.empty() ? ctx.session_id.substr(0, 8) : label));
     }
     json out = HolderJson(holder, ctx.session_id);
     out["acquired"] = true;
@@ -118,22 +119,26 @@ void RegisterControlTools(ToolRegistry& registry) {
     registry.Add(Tool{
         .name = "control_status",
         .title = "Who controls the emulator",
-        .description = "Whether another agent currently holds the control lease. State-changing "
-                       "tools (boot, pause, stop, input, quit...) need it; read-only tools never do.",
+        .description =
+            "Whether another agent currently holds the control lease. State-changing "
+            "tools (boot, pause, stop, input, quit...) need it; read-only tools never do.",
         .annotations = {.read_only = true, .idempotent = true},
         .handler = ControlStatus,
     });
     registry.Add(Tool{
         .name = "acquire_control",
         .title = "Take control of the emulator",
-        .description = "Take the control lease so no other agent changes emulator state while you "
-                       "work. Not needed for a single agent: the first state-changing call takes it "
-                       "automatically. Every controlled call renews it; it expires after ttl_s "
-                       "seconds of inactivity (default 120). Fails if another agent holds it.",
+        .description =
+            "Take the control lease so no other agent changes emulator state while you "
+            "work. Not needed for a single agent: the first state-changing call takes it "
+            "automatically. Every controlled call renews it; it expires after ttl_s "
+            "seconds of inactivity (default 120). Fails if another agent holds it.",
         .input_schema = {{"type", "object"},
                          {"properties",
-                          {{"label", {{"type", "string"}, {"maxLength", 80},
-                                      {"description", "Your name, shown to other agents."}}},
+                          {{"label",
+                            {{"type", "string"},
+                             {"maxLength", 80},
+                             {"description", "Your name, shown to other agents."}}},
                            {"ttl_s", {{"type", "integer"}, {"minimum", 10}, {"maximum", 600}}}}},
                          {"additionalProperties", false}},
         .annotations = {.idempotent = true},

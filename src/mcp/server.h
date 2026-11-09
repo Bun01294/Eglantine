@@ -9,10 +9,10 @@
 #include <thread>
 
 #include "common/common_types.h"
+#include "mcp/activity.h"
 #include "mcp/control.h"
 #include "mcp/protocol.h"
 #include "mcp/timeline.h"
-#include "mcp/activity.h"
 #include "mcp/tool_registry.h"
 
 namespace Core {
@@ -119,5 +119,16 @@ private:
 
 /// Registers every built-in tool.
 void RegisterAllTools(ToolRegistry& registry);
+
+void RegisterCoreTools(ToolRegistry& registry);
+void RegisterEmulationTools(ToolRegistry& registry);
+void RegisterInputTools(ToolRegistry& registry);
+void RegisterControlTools(ToolRegistry& registry);
+void RegisterActTools(ToolRegistry& registry);
+void RegisterTasTools(ToolRegistry& registry);
+void RegisterProcessTools(ToolRegistry& registry);
+void RegisterMemoryTools(ToolRegistry& registry);
+void RegisterSettingsTools(ToolRegistry& registry);
+void RegisterTimelineTools(ToolRegistry& registry);
 
 } // namespace Mcp

@@ -20,6 +20,7 @@
 #include "input_common/main.h"
 #include "mcp/context.h"
 #include "mcp/host.h"
+#include "mcp/server.h"
 #include "mcp/timeline.h"
 #include "mcp/tool_registry.h"
 #include "mcp/tools/tool_helpers.h"
@@ -33,26 +34,16 @@ using VirtualStick = InputCommon::VirtualGamepad::VirtualStick;
 
 /// Button names accepted by the tools, mapped to virtual gamepad buttons.
 constexpr std::array<std::pair<std::string_view, VirtualButton>, 20> kButtons{{
-    {"A", VirtualButton::ButtonA},
-    {"B", VirtualButton::ButtonB},
-    {"X", VirtualButton::ButtonX},
-    {"Y", VirtualButton::ButtonY},
-    {"LSTICK", VirtualButton::StickL},
-    {"RSTICK", VirtualButton::StickR},
-    {"L", VirtualButton::TriggerL},
-    {"R", VirtualButton::TriggerR},
-    {"ZL", VirtualButton::TriggerZL},
-    {"ZR", VirtualButton::TriggerZR},
-    {"PLUS", VirtualButton::ButtonPlus},
-    {"MINUS", VirtualButton::ButtonMinus},
-    {"DLEFT", VirtualButton::ButtonLeft},
-    {"DUP", VirtualButton::ButtonUp},
-    {"DRIGHT", VirtualButton::ButtonRight},
-    {"DDOWN", VirtualButton::ButtonDown},
-    {"SL", VirtualButton::ButtonSL},
-    {"SR", VirtualButton::ButtonSR},
-    {"HOME", VirtualButton::ButtonHome},
-    {"CAPTURE", VirtualButton::ButtonCapture},
+    {"A", VirtualButton::ButtonA},          {"B", VirtualButton::ButtonB},
+    {"X", VirtualButton::ButtonX},          {"Y", VirtualButton::ButtonY},
+    {"LSTICK", VirtualButton::StickL},      {"RSTICK", VirtualButton::StickR},
+    {"L", VirtualButton::TriggerL},         {"R", VirtualButton::TriggerR},
+    {"ZL", VirtualButton::TriggerZL},       {"ZR", VirtualButton::TriggerZR},
+    {"PLUS", VirtualButton::ButtonPlus},    {"MINUS", VirtualButton::ButtonMinus},
+    {"DLEFT", VirtualButton::ButtonLeft},   {"DUP", VirtualButton::ButtonUp},
+    {"DRIGHT", VirtualButton::ButtonRight}, {"DDOWN", VirtualButton::ButtonDown},
+    {"SL", VirtualButton::ButtonSL},        {"SR", VirtualButton::ButtonSR},
+    {"HOME", VirtualButton::ButtonHome},    {"CAPTURE", VirtualButton::ButtonCapture},
 }};
 
 /// JSON array of every button name in kButtons, for schema enums.
@@ -94,8 +85,8 @@ InputCommon::VirtualGamepad* Gamepad(ToolContext& ctx, std::string& error) {
 /// Sleeps `ms`; returns false as soon as Allow Writes is switched off or the server stops, so a
 /// long hold cannot outlive the user's revocation (the caller releases what it pressed).
 bool InputSleep(ToolContext& ctx, int ms) {
-    const auto until = std::chrono::steady_clock::now() +
-                       std::chrono::milliseconds{std::clamp(ms, 0, 60000)};
+    const auto until =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds{std::clamp(ms, 0, 60000)};
     for (;;) {
         if (ServerStopping() || !ctx.WritesAllowed()) {
             return false;
@@ -187,8 +178,8 @@ ToolResult SetStick(ToolContext& ctx, const json& args) {
         return ToolResult::Error(error);
     }
     const size_t npad = NpadIndex(args);
-    const auto stick = args.at("stick").get<std::string>() == "right" ? VirtualStick::Right
-                                                                      : VirtualStick::Left;
+    const auto stick =
+        args.at("stick").get<std::string>() == "right" ? VirtualStick::Right : VirtualStick::Left;
     const float x = args.at("x").get<float>();
     const float y = args.at("y").get<float>();
     const int hold_ms = args.value("hold_ms", 0);
@@ -200,8 +191,8 @@ ToolResult SetStick(ToolContext& ctx, const json& args) {
             return ToolResult::Error(StoppedReason());
         }
     }
-    LogInput(ctx, fmt::format("stick {} ({:.2f},{:.2f}) {}", args.at("stick").get<std::string>(),
-                              x, y, hold_ms > 0 ? fmt::format("for {}ms", hold_ms) : "latched"));
+    LogInput(ctx, fmt::format("stick {} ({:.2f},{:.2f}) {}", args.at("stick").get<std::string>(), x,
+                              y, hold_ms > 0 ? fmt::format("for {}ms", hold_ms) : "latched"));
     return ToolResult::Text(hold_ms > 0 ? "stick moved and released"
                                         : "stick latched (call again with 0,0 to center)");
 }
@@ -302,9 +293,10 @@ json InputStepsSchema() {
                 {"items",
                  {{"type", "object"},
                   {"properties",
-                   {{"buttons", {{"type", "array"},
-                                 {"maxItems", 20},
-                                 {"items", {{"type", "string"}, {"enum", ButtonEnum()}}}}},
+                   {{"buttons",
+                     {{"type", "array"},
+                      {"maxItems", 20},
+                      {"items", {{"type", "string"}, {"enum", ButtonEnum()}}}}},
                     {"left", StickArray()},
                     {"right", StickArray()},
                     {"hold_ms", {{"type", "integer"}, {"minimum", 0}, {"maximum", 30000}}},
@@ -384,8 +376,8 @@ json ControllerStateJson(ToolContext& ctx, size_t npad) {
     const u64 raw = static_cast<u64>(state.raw);
     const auto bit = [raw](u32 index) { return ((raw >> index) & 1) != 0; };
     static constexpr std::array<std::string_view, 16> names{
-        "A", "B", "X", "Y", "LSTICK", "RSTICK", "L", "R",
-        "ZL", "ZR", "PLUS", "MINUS", "DLEFT", "DUP", "DRIGHT", "DDOWN"};
+        "A",  "B",  "X",    "Y",     "LSTICK", "RSTICK", "L",      "R",
+        "ZL", "ZR", "PLUS", "MINUS", "DLEFT",  "DUP",    "DRIGHT", "DDOWN"};
     for (u32 i = 0; i < names.size(); ++i) {
         if (bit(i)) {
             pressed.push_back(names[i]);
@@ -434,8 +426,9 @@ void RegisterInputTools(ToolRegistry& registry) {
     registry.Add(Tool{
         .name = "set_stick",
         .title = "Move a stick",
-        .description = "Set the left or right stick to (x, y) in -1..1 (up is +y). With hold_ms "
-                       "it returns to center afterwards; without, it stays there until moved again.",
+        .description =
+            "Set the left or right stick to (x, y) in -1..1 (up is +y). With hold_ms "
+            "it returns to center afterwards; without, it stays there until moved again.",
         .input_schema = {{"type", "object"},
                          {"properties",
                           {{"stick", {{"type", "string"}, {"enum", {"left", "right"}}}},
@@ -458,7 +451,8 @@ void RegisterInputTools(ToolRegistry& registry) {
                        "hold_ms then waiting wait_ms (max 200 steps, 60 s total). For "
                        "frame-exact input, use the TAS tools (tas_write_script, tas_play).",
         .input_schema = {{"type", "object"},
-                         {"properties", {{"steps", InputStepsSchema()}, {"player", PlayerSchema()}}},
+                         {"properties",
+                          {{"steps", InputStepsSchema()}, {"player", PlayerSchema()}}},
                          {"required", {"steps"}},
                          {"additionalProperties", false}},
         .requires_game = true,
@@ -479,9 +473,11 @@ void RegisterInputTools(ToolRegistry& registry) {
     });
 
     const json coord = {{"type", "number"}, {"minimum", 0}, {"maximum", 1}};
-    const json point = {{"type", "array"}, {"items", coord}, {"minItems", 2}, {"maxItems", 2},
+    const json point = {{"type", "array"},
+                        {"items", coord},
+                        {"minItems", 2},
+                        {"maxItems", 2},
                         {"description", "[x, y] in 0..1 of the screen (0,0 = top left)."}};
-
 }
 
 } // namespace Mcp

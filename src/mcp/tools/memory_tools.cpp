@@ -18,11 +18,12 @@
 
 #include "core/arm/debug.h"
 #include "core/core.h"
+#include "core/debugger/mapped_range_hook.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
-#include "core/debugger/mapped_range_hook.h"
 #include "core/memory.h"
 #include "mcp/context.h"
+#include "mcp/server.h"
 #include "mcp/timeline.h"
 #include "mcp/tool_registry.h"
 #include "mcp/tools/app_process.h"
@@ -37,9 +38,15 @@ enum class ValueType { U8, U16, U32, U64, S8, S16, S32, S64, F32, F64 };
 
 /// Type names as used in tool arguments, in ValueType order (indexed by the enum value).
 constexpr std::array<std::pair<std::string_view, ValueType>, 10> kTypes{{
-    {"u8", ValueType::U8},   {"u16", ValueType::U16}, {"u32", ValueType::U32},
-    {"u64", ValueType::U64}, {"s8", ValueType::S8},   {"s16", ValueType::S16},
-    {"s32", ValueType::S32}, {"s64", ValueType::S64}, {"f32", ValueType::F32},
+    {"u8", ValueType::U8},
+    {"u16", ValueType::U16},
+    {"u32", ValueType::U32},
+    {"u64", ValueType::U64},
+    {"s8", ValueType::S8},
+    {"s16", ValueType::S16},
+    {"s32", ValueType::S32},
+    {"s64", ValueType::S64},
+    {"f32", ValueType::F32},
     {"f64", ValueType::F64},
 }};
 
@@ -90,16 +97,26 @@ u64 LoadBits(const u8* p, ValueType type) {
 /// Numeric value for comparisons and display.
 double AsDouble(u64 bits, ValueType type) {
     switch (type) {
-    case ValueType::U8: return static_cast<double>(static_cast<u8>(bits));
-    case ValueType::U16: return static_cast<double>(static_cast<u16>(bits));
-    case ValueType::U32: return static_cast<double>(static_cast<u32>(bits));
-    case ValueType::U64: return static_cast<double>(bits);
-    case ValueType::S8: return static_cast<double>(static_cast<s8>(bits));
-    case ValueType::S16: return static_cast<double>(static_cast<s16>(bits));
-    case ValueType::S32: return static_cast<double>(static_cast<s32>(bits));
-    case ValueType::S64: return static_cast<double>(static_cast<s64>(bits));
-    case ValueType::F32: return static_cast<double>(std::bit_cast<f32>(static_cast<u32>(bits)));
-    case ValueType::F64: return std::bit_cast<f64>(bits);
+    case ValueType::U8:
+        return static_cast<double>(static_cast<u8>(bits));
+    case ValueType::U16:
+        return static_cast<double>(static_cast<u16>(bits));
+    case ValueType::U32:
+        return static_cast<double>(static_cast<u32>(bits));
+    case ValueType::U64:
+        return static_cast<double>(bits);
+    case ValueType::S8:
+        return static_cast<double>(static_cast<s8>(bits));
+    case ValueType::S16:
+        return static_cast<double>(static_cast<s16>(bits));
+    case ValueType::S32:
+        return static_cast<double>(static_cast<s32>(bits));
+    case ValueType::S64:
+        return static_cast<double>(static_cast<s64>(bits));
+    case ValueType::F32:
+        return static_cast<double>(std::bit_cast<f32>(static_cast<u32>(bits)));
+    case ValueType::F64:
+        return std::bit_cast<f64>(bits);
     }
     return 0.0;
 }
@@ -108,24 +125,32 @@ double AsDouble(u64 bits, ValueType type) {
 /// (sign-extended for signed types).
 json ValueJson(u64 bits, ValueType type) {
     switch (type) {
-    case ValueType::U64: return bits;
-    case ValueType::S64: return static_cast<s64>(bits);
+    case ValueType::U64:
+        return bits;
+    case ValueType::S64:
+        return static_cast<s64>(bits);
     case ValueType::F32:
-    case ValueType::F64: return AsDouble(bits, type);
-    default: return static_cast<s64>(AsDouble(bits, type));
+    case ValueType::F64:
+        return AsDouble(bits, type);
+    default:
+        return static_cast<s64>(AsDouble(bits, type));
     }
 }
 
 /// Bits of `value` (a JSON number) stored as `type`.
 u64 ToBits(const json& value, ValueType type) {
     switch (type) {
-    case ValueType::F32: return std::bit_cast<u32>(value.get<f32>());
-    case ValueType::F64: return std::bit_cast<u64>(value.get<f64>());
-    case ValueType::U64: return value.get<u64>();
+    case ValueType::F32:
+        return std::bit_cast<u32>(value.get<f32>());
+    case ValueType::F64:
+        return std::bit_cast<u64>(value.get<f64>());
+    case ValueType::U64:
+        return value.get<u64>();
     default: {
         const s64 v = value.get<s64>();
         const size_t bytes = TypeSize(type);
-        return bytes == 8 ? static_cast<u64>(v) : static_cast<u64>(v) & ((u64{1} << (bytes * 8)) - 1);
+        return bytes == 8 ? static_cast<u64>(v)
+                          : static_cast<u64>(v) & ((u64{1} << (bytes * 8)) - 1);
     }
     }
 }
@@ -151,7 +176,8 @@ std::optional<u64> ParseAddress(const json& v) {
 }
 
 json AddressSchema(const char* what) {
-    return json{{"description", fmt::format("{} as a hex string (\"0x8004a000\") or integer.", what)}};
+    return json{
+        {"description", fmt::format("{} as a hex string (\"0x8004a000\") or integer.", what)}};
 }
 
 /// The value of one hex digit, or nullopt.
@@ -226,9 +252,9 @@ std::vector<Region> SearchRegions(Kernel::KProcess& process, const std::string& 
         const auto info = mem_info.GetSvcMemoryInfo();
         const bool mapped = info.state != S::Free && info.state != S::Inaccessible &&
                             info.state != S::Io && info.state != S::Kernel;
-        const bool readable = mapped && (info.permission == P::Read ||
-                                         info.permission == P::ReadWrite ||
-                                         info.permission == P::ReadExecute);
+        const bool readable =
+            mapped && (info.permission == P::Read || info.permission == P::ReadWrite ||
+                       info.permission == P::ReadExecute);
         bool take = false;
         if (which == "all") {
             take = readable;
@@ -293,8 +319,8 @@ ToolResult ReadMemory(ToolContext& ctx, const json& args) {
     }
     auto& memory = process.Memory();
     if (!memory.IsValidVirtualAddressRange(*address, length)) {
-        return ToolResult::Error(fmt::format("{} + {:#x} is not fully mapped (memory_map)",
-                                             Hex(*address), length));
+        return ToolResult::Error(
+            fmt::format("{} + {:#x} is not fully mapped (memory_map)", Hex(*address), length));
     }
     std::vector<u8> bytes(length);
     memory.ReadBlock(*address, bytes.data(), length);
@@ -357,9 +383,9 @@ ToolResult WriteMemory(ToolContext& ctx, const json& args) {
     memory.WriteBlock(*address, bytes.data(), bytes.size());
     Core::InvalidateInstructionCacheRange(process.Get(), *address, bytes.size());
     if (ctx.timeline) {
-        ctx.timeline->Push(EventKind::Watch, 0, "mcp",
-                           fmt::format("write {} {} -> {}", Hex(*address), ToHex(before),
-                                       ToHex(bytes)));
+        ctx.timeline->Push(
+            EventKind::Watch, 0, "mcp",
+            fmt::format("write {} {} -> {}", Hex(*address), ToHex(before), ToHex(bytes)));
     }
     return ToolResult::Structured(
         json{{"address", Hex(*address)}, {"before", ToHex(before)}, {"after", ToHex(bytes)}});
@@ -388,8 +414,8 @@ struct ScanBudget {
 /// so matches across chunk boundaries are found). Reads bypass GPU read traps (no side effects).
 /// Stops when `budget` is spent (checked between chunks).
 template <typename Fn>
-void ForEachChunk(Core::Memory::Memory& memory, const std::vector<Region>& regions,
-                  size_t overlap, ScanBudget& budget, Fn&& fn) {
+void ForEachChunk(Core::Memory::Memory& memory, const std::vector<Region>& regions, size_t overlap,
+                  ScanBudget& budget, Fn&& fn) {
     constexpr size_t kChunk = 1024 * 1024;
     std::vector<u8> buffer(kChunk + overlap);
     for (const auto& region : regions) {
@@ -568,9 +594,8 @@ public:
                 thread.join();
             }
             stopped = false;
-            thread = std::jthread([this, &system, timeline](std::stop_token stop) {
-                Run(stop, system, timeline);
-            });
+            thread = std::jthread(
+                [this, &system, timeline](std::stop_token stop) { Run(stop, system, timeline); });
         }
         return id;
     }
@@ -579,7 +604,8 @@ public:
     /// no watches remain.
     bool Remove(u32 id) {
         std::scoped_lock lock{mutex};
-        const bool removed = std::erase_if(watches, [id](const Watch& w) { return w.id == id; }) != 0;
+        const bool removed =
+            std::erase_if(watches, [id](const Watch& w) { return w.id == id; }) != 0;
         UpdateHook();
         return removed;
     }
@@ -800,9 +826,10 @@ ToolResult WatchRemove(ToolContext&, const json& args) {
 }
 
 json RegionSchema() {
-    return json{{"type", "string"},
-                {"enum", {"data", "heap", "code", "all"}},
-                {"description", "data = writable regions (default), heap, code (r-x), all readable."}};
+    return json{
+        {"type", "string"},
+        {"enum", {"data", "heap", "code", "all"}},
+        {"description", "data = writable regions (default), heap, code (r-x), all readable."}};
 }
 
 } // namespace
@@ -823,13 +850,15 @@ void RegisterMemoryTools(ToolRegistry& registry) {
                          {"properties",
                           {{"address", AddressSchema("Virtual address")},
                            {"length", {{"type", "integer"}, {"minimum", 1}, {"maximum", 65536}}},
-                           {"format", {{"type", "string"},
-                                       {"enum", [] {
-                                            json e = TypeEnum();
-                                            e.push_back("hex");
-                                            e.push_back("ascii");
-                                            return e;
-                                        }()}}},
+                           {"format",
+                            {{"type", "string"},
+                             {"enum",
+                              [] {
+                                  json e = TypeEnum();
+                                  e.push_back("hex");
+                                  e.push_back("ascii");
+                                  return e;
+                              }()}}},
                            {"count", {{"type", "integer"}, {"minimum", 1}, {"maximum", 8192}}}}},
                          {"required", {"address"}},
                          {"additionalProperties", false}},
@@ -872,7 +901,8 @@ void RegisterMemoryTools(ToolRegistry& registry) {
                            {"value", {{"type", "number"}}},
                            {"region", RegionSchema()},
                            {"align", {{"type", "integer"}, {"minimum", 1}, {"maximum", 4096}}},
-                           {"max_results", {{"type", "integer"}, {"minimum", 1}, {"maximum", 10000}}}}},
+                           {"max_results",
+                            {{"type", "integer"}, {"minimum", 1}, {"maximum", 10000}}}}},
                          {"additionalProperties", false}},
         .annotations = {.read_only = true},
         .requires_game = true,
@@ -917,7 +947,8 @@ void RegisterMemoryTools(ToolRegistry& registry) {
         .description = "Remove one watch by id, or all with all:true.",
         .input_schema = {{"type", "object"},
                          {"properties",
-                          {{"id", {{"type", "integer"}, {"minimum", 1}}}, {"all", {{"type", "boolean"}}}}},
+                          {{"id", {{"type", "integer"}, {"minimum", 1}}},
+                           {"all", {{"type", "boolean"}}}}},
                          {"additionalProperties", false}},
         .requires_control = true,
         .handler = WatchRemove,

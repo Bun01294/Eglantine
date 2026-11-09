@@ -23,14 +23,11 @@
 namespace Mcp {
 
 json EventJson(const Event& e) {
-    json out{{"seq", e.seq},
-             {"t_ms", static_cast<double>(e.time_us) / 1000.0},
-             {"frame", e.frame},
-             {"kind", EventKindName(e.kind)},
-             {"source", e.source},
-             {"msg", e.message}};
+    json out{{"seq", e.seq},       {"t_ms", static_cast<double>(e.time_us) / 1000.0},
+             {"frame", e.frame},   {"kind", EventKindName(e.kind)},
+             {"source", e.source}, {"msg", e.message}};
     if (e.kind == EventKind::Log) {
-        static constexpr const char* levels[] = {"trace", "debug", "info",
+        static constexpr const char* levels[] = {"trace",   "debug", "info",
                                                  "warning", "error", "critical"};
         out["level"] = e.level < std::size(levels) ? levels[e.level] : "?";
     }
@@ -48,8 +45,9 @@ json FilterProperties() {
          {{"type", "array"},
           {"items",
            {{"type", "string"},
-            {"enum", {"log", "state", "input", "mark", "ipc", "svc", "unimpl", "watch", "crash",
-                      "frame"}}}},
+            {"enum",
+             {"log", "state", "input", "mark", "ipc", "svc", "unimpl", "watch", "crash",
+              "frame"}}}},
           {"description", "Event kinds to include (default: all)."}}},
         {"min_level",
          {{"type", "string"},
@@ -73,7 +71,7 @@ Timeline::Query ParseQuery(const json& args) {
         }
     }
     if (args.contains("min_level")) {
-        static constexpr std::string_view levels[] = {"trace", "debug", "info",
+        static constexpr std::string_view levels[] = {"trace",   "debug", "info",
                                                       "warning", "error", "critical"};
         const auto name = args["min_level"].get<std::string>();
         for (int i = 0; i < static_cast<int>(std::size(levels)); ++i) {
@@ -226,7 +224,9 @@ void RegisterCoreTools(ToolRegistry& registry) {
     });
 
     json timeline_props = FilterProperties();
-    timeline_props["limit"] = {{"type", "integer"}, {"minimum", 1}, {"maximum", 2000},
+    timeline_props["limit"] = {{"type", "integer"},
+                               {"minimum", 1},
+                               {"maximum", 2000},
                                {"description", "Max events to return (default 200)."}};
     registry.Add(Tool{
         .name = "timeline",
@@ -244,7 +244,9 @@ void RegisterCoreTools(ToolRegistry& registry) {
     });
 
     json wait_props = FilterProperties();
-    wait_props["timeout_ms"] = {{"type", "integer"}, {"minimum", 0}, {"maximum", 120000},
+    wait_props["timeout_ms"] = {{"type", "integer"},
+                                {"minimum", 0},
+                                {"maximum", 120000},
                                 {"description", "How long to wait (default 10000)."}};
     registry.Add(Tool{
         .name = "wait_for",
@@ -252,7 +254,9 @@ void RegisterCoreTools(ToolRegistry& registry) {
         .description = "Block until a timeline event matching the filters occurs (by default only "
                        "events after this call starts), or until timeout_ms. Use this instead of "
                        "polling, e.g. wait for a log line, a crash or a state change.",
-        .input_schema = {{"type", "object"}, {"properties", wait_props}, {"additionalProperties", false}},
+        .input_schema = {{"type", "object"},
+                         {"properties", wait_props},
+                         {"additionalProperties", false}},
         .annotations = {.read_only = true},
         .handler = WaitFor,
     });
@@ -272,28 +276,17 @@ void RegisterCoreTools(ToolRegistry& registry) {
     });
 }
 
-void RegisterEmulationTools(ToolRegistry& registry);
-void RegisterInputTools(ToolRegistry& registry);
-void RegisterControlTools(ToolRegistry& registry);
-void RegisterActTools(ToolRegistry& registry);
-void RegisterTasTools(ToolRegistry& registry);
-void RegisterProcessTools(ToolRegistry& registry);
-void RegisterMemoryTools(ToolRegistry& registry);
-void RegisterSettingsTools(ToolRegistry& registry);
-void RegisterTimelineTools(ToolRegistry& registry);
-
-// This build carries a subset of FUKKO's tools (see tools/mcp/README.md).
 void RegisterAllTools(ToolRegistry& registry) {
-    RegisterTimelineTools(registry);
-    RegisterSettingsTools(registry);
-    RegisterTasTools(registry);
-    RegisterProcessTools(registry);
-    RegisterMemoryTools(registry);
     RegisterCoreTools(registry);
     RegisterEmulationTools(registry);
     RegisterInputTools(registry);
     RegisterControlTools(registry);
     RegisterActTools(registry);
+    RegisterTasTools(registry);
+    RegisterProcessTools(registry);
+    RegisterMemoryTools(registry);
+    RegisterSettingsTools(registry);
+    RegisterTimelineTools(registry);
 }
 
 } // namespace Mcp

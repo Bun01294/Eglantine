@@ -20,6 +20,7 @@
 #include "mcp/context.h"
 #include "mcp/control.h"
 #include "mcp/host.h"
+#include "mcp/server.h"
 #include "mcp/timeline.h"
 #include "mcp/tool_registry.h"
 #include "mcp/tools/tool_helpers.h"
@@ -120,8 +121,7 @@ ToolResult Act(ToolContext& ctx, const json& args) {
     }
     out["waited"] = std::move(waited);
 
-    const json capture =
-        args.value("capture", json::array({"screenshot", "timeline", "perf"}));
+    const json capture = args.value("capture", json::array({"screenshot", "timeline", "perf"}));
     ToolResult result;
 
     if (Wants(capture, "timeline") && ctx.timeline) {
@@ -260,12 +260,16 @@ void StopWriteWork([[maybe_unused]] Host& host, [[maybe_unused]] Core::System& s
 void RegisterActTools(ToolRegistry& registry) {
     json event_filter = FilterProperties();
     event_filter.erase("since_seq");
-    event_filter["timeout_ms"] = {{"type", "integer"}, {"minimum", 0}, {"maximum", 60000},
+    event_filter["timeout_ms"] = {{"type", "integer"},
+                                  {"minimum", 0},
+                                  {"maximum", 60000},
                                   {"description", "How long to wait for it (default 10000)."}};
 
     json timeline_filter = FilterProperties();
     timeline_filter.erase("since_seq");
-    timeline_filter["limit"] = {{"type", "integer"}, {"minimum", 1}, {"maximum", 500},
+    timeline_filter["limit"] = {{"type", "integer"},
+                                {"minimum", 1},
+                                {"maximum", 500},
                                 {"description", "Max events (default 60)."}};
 
     registry.Add(Tool{
@@ -291,12 +295,17 @@ void RegisterActTools(ToolRegistry& registry) {
                      {"properties", event_filter},
                      {"additionalProperties", false},
                      {"description", "Wait for the first timeline event matching these filters."}}},
-                   {"frames", {{"type", "integer"}, {"minimum", 0}, {"maximum", 3600},
-                               {"description", "Guest frames to wait (frame-locked, not wall time)."}}},
+                   {"frames",
+                    {{"type", "integer"},
+                     {"minimum", 0},
+                     {"maximum", 3600},
+                     {"description", "Guest frames to wait (frame-locked, not wall time)."}}},
                    {"frames_timeout_ms", {{"type", "integer"}, {"minimum", 0}, {"maximum", 60000}}},
-                   {"screen", {{"type", "array"}, {"maxItems", 32},
-                               {"items", {{"type", "string"}, {"maxLength", 64}}},
-                               {"description", "Screen labels: not available in this build."}}},
+                   {"screen",
+                    {{"type", "array"},
+                     {"maxItems", 32},
+                     {"items", {{"type", "string"}, {"maxLength", 64}}},
+                     {"description", "Screen labels: not available in this build."}}},
                    {"screen_timeout_ms", {{"type", "integer"}, {"minimum", 0}, {"maximum", 60000}}},
                    {"ms", {{"type", "integer"}, {"minimum", 0}, {"maximum", 60000}}}}},
                  {"additionalProperties", false}}},
@@ -305,8 +314,8 @@ void RegisterActTools(ToolRegistry& registry) {
                  {"maxItems", 8},
                  {"items",
                   {{"type", "string"},
-                   {"enum", {"screenshot", "timeline", "controller", "perf", "screen_state",
-                             "probes"}}}},
+                   {"enum",
+                    {"screenshot", "timeline", "controller", "perf", "screen_state", "probes"}}}},
                  {"description", "Default [screenshot, timeline, perf]. screen_state and probes "
                                  "are not available in this build."}}},
                {"timeline",
@@ -314,8 +323,11 @@ void RegisterActTools(ToolRegistry& registry) {
                  {"properties", timeline_filter},
                  {"additionalProperties", false},
                  {"description", "Filters for the captured timeline events."}}},
-               {"max_width", {{"type", "integer"}, {"minimum", 160}, {"maximum", 3840},
-                              {"description", "Screenshot width cap (default 960)."}}}}},
+               {"max_width",
+                {{"type", "integer"},
+                 {"minimum", 160},
+                 {"maximum", 3840},
+                 {"description", "Screenshot width cap (default 960)."}}}}},
              {"additionalProperties", false}},
         // Annotated read-only on purpose: observe-only calls must not hold the global
         // mutating-tools mutex while they wait. The input part gates itself (writes + lease).

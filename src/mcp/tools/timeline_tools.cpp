@@ -16,6 +16,7 @@
 #include "common/fs/path_util.h"
 #include "core/core.h"
 #include "mcp/context.h"
+#include "mcp/server.h"
 #include "mcp/timeline.h"
 #include "mcp/tool_registry.h"
 #include "mcp/tools/tool_helpers.h"
@@ -66,8 +67,15 @@ std::vector<Cluster> ClusterEvents(const std::vector<json>& events) {
         const std::string pattern = Normalize(msg);
         auto& c = clusters[kind + '\x1f' + source + '\x1f' + level + '\x1f' + pattern];
         if (c.count == 0) {
-            c = {kind, source, level, pattern, msg.substr(0, 300), 0,
-                 e.value("frame", u64{0}), 0, e.value("seq", u64{0})};
+            c = {kind,
+                 source,
+                 level,
+                 pattern,
+                 msg.substr(0, 300),
+                 0,
+                 e.value("frame", u64{0}),
+                 0,
+                 e.value("seq", u64{0})};
         }
         ++c.count;
         c.last_frame = e.value("frame", u64{0});
@@ -76,14 +84,18 @@ std::vector<Cluster> ClusterEvents(const std::vector<json>& events) {
     for (auto& [key, c] : clusters) {
         out.push_back(std::move(c));
     }
-    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.count > b.count; });
+    std::sort(out.begin(), out.end(),
+              [](const auto& a, const auto& b) { return a.count > b.count; });
     return out;
 }
 
 /// A cluster as JSON with its frame range; "level" only for log clusters.
 json ClusterJson(const Cluster& c) {
-    json j{{"kind", c.kind}, {"source", c.source}, {"count", c.count},
-           {"frames", fmt::format("{}..{}", c.first_frame, c.last_frame)}, {"example", c.example}};
+    json j{{"kind", c.kind},
+           {"source", c.source},
+           {"count", c.count},
+           {"frames", fmt::format("{}..{}", c.first_frame, c.last_frame)},
+           {"example", c.example}};
     if (!c.level.empty()) {
         j["level"] = c.level;
     }
@@ -154,9 +166,11 @@ ToolResult SummarizeSince(ToolContext& ctx, const json& args) {
 /// Exports live under <log dir>/mcp; names only (no paths), so no tool writes or reads elsewhere.
 std::optional<std::filesystem::path> ExportPath(const std::string& name) {
     if (name.empty() || name.size() > 64 ||
-        !std::all_of(name.begin(), name.end(), [](char c) {
-            return std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' || c == '.';
-        }) ||
+        !std::all_of(name.begin(), name.end(),
+                     [](char c) {
+                         return std::isalnum(static_cast<unsigned char>(c)) || c == '-' ||
+                                c == '_' || c == '.';
+                     }) ||
         name.find("..") != std::string::npos || IsReservedDeviceName(name)) {
         return std::nullopt;
     }
@@ -170,8 +184,7 @@ constexpr size_t kMaxExportBytes = 16 * 1024 * 1024;
 size_t ExportCount(const std::filesystem::path& dir) {
     size_t count = 0;
     std::error_code ec;
-    for (std::filesystem::directory_iterator it{dir, ec}, end; !ec && it != end;
-         it.increment(ec)) {
+    for (std::filesystem::directory_iterator it{dir, ec}, end; !ec && it != end; it.increment(ec)) {
         if (it->path().extension() == ".jsonl") {
             ++count;
         }

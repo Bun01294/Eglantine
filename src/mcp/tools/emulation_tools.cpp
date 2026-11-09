@@ -13,6 +13,7 @@
 #include "core/core.h"
 #include "mcp/context.h"
 #include "mcp/host.h"
+#include "mcp/server.h"
 #include "mcp/timeline.h"
 #include "mcp/tool_registry.h"
 #include "mcp/tools/tool_helpers.h"
@@ -69,8 +70,8 @@ ToolResult Screenshot(ToolContext& ctx, const json& args) {
     }
     ToolResult result;
     result.AddImage(*png, "image/png");
-    result.AddText(fmt::format("guest frame {}",
-                               Core::g_nx2_present_count.load(std::memory_order_relaxed)));
+    result.AddText(
+        fmt::format("guest frame {}", Core::g_nx2_present_count.load(std::memory_order_relaxed)));
     return result;
 }
 
@@ -126,10 +127,10 @@ ToolResult FrameAdvance(ToolContext& ctx, const json& args) {
         } else {
             std::string fallback_error;
             png = FallbackFrame(ctx, 640, source, fallback_error);
-            source = png ? fmt::format("{} (presented-frame screenshot failed: {})", source,
-                                       shot_error)
-                         : fmt::format("none (presented-frame screenshot failed: {}; {})",
-                                       shot_error, fallback_error);
+            source =
+                png ? fmt::format("{} (presented-frame screenshot failed: {})", source, shot_error)
+                    : fmt::format("none (presented-frame screenshot failed: {}; {})", shot_error,
+                                  fallback_error);
         }
         out["image_source"] = source;
     }
@@ -245,8 +246,8 @@ std::vector<u8> EncodePng(const Frame& frame, u32 max_width) {
     if (max_width < w) {
         const u32 nh = h * max_width / w;
         std::vector<u8> scaled(size_t{max_width} * nh * 4);
-        stbir_resize_uint8(rgba.data(), static_cast<int>(w), static_cast<int>(h), 0,
-                           scaled.data(), static_cast<int>(max_width), static_cast<int>(nh), 0, 4);
+        stbir_resize_uint8(rgba.data(), static_cast<int>(w), static_cast<int>(h), 0, scaled.data(),
+                           static_cast<int>(max_width), static_cast<int>(nh), 0, 4);
         rgba = std::move(scaled);
         w = max_width;
         h = nh;
@@ -261,7 +262,6 @@ std::vector<u8> EncodePng(const Frame& frame, u32 max_width) {
         &png, static_cast<int>(w), static_cast<int>(h), 4, rgba.data(), static_cast<int>(w * 4));
     return png;
 }
-
 
 } // namespace
 
@@ -337,7 +337,8 @@ void RegisterEmulationTools(ToolRegistry& registry) {
         .input_schema = {{"type", "object"},
                          {"properties",
                           {{"frames", {{"type", "integer"}, {"minimum", 1}, {"maximum", 600}}},
-                           {"timeout_ms", {{"type", "integer"}, {"minimum", 100}, {"maximum", 60000}}},
+                           {"timeout_ms",
+                            {{"type", "integer"}, {"minimum", 100}, {"maximum", 60000}}},
                            {"screenshot", {{"type", "boolean"}}}}},
                          {"additionalProperties", false}},
         .requires_game = true,
@@ -351,12 +352,13 @@ void RegisterEmulationTools(ToolRegistry& registry) {
         .description = "Take count screenshots (max 12), one every every_frames presented frames: "
                        "a cheap substitute for video when watching an animation or a glitch. "
                        "Refused while paused (use frame_advance).",
-        .input_schema = {{"type", "object"},
-                         {"properties",
-                          {{"every_frames", {{"type", "integer"}, {"minimum", 1}, {"maximum", 3600}}},
-                           {"count", {{"type", "integer"}, {"minimum", 1}, {"maximum", 12}}},
-                           {"max_width", {{"type", "integer"}, {"minimum", 160}, {"maximum", 1280}}}}},
-                         {"additionalProperties", false}},
+        .input_schema =
+            {{"type", "object"},
+             {"properties",
+              {{"every_frames", {{"type", "integer"}, {"minimum", 1}, {"maximum", 3600}}},
+               {"count", {{"type", "integer"}, {"minimum", 1}, {"maximum", 12}}},
+               {"max_width", {{"type", "integer"}, {"minimum", 160}, {"maximum", 1280}}}}},
+             {"additionalProperties", false}},
         .annotations = {.read_only = true},
         .requires_game = true,
         .handler = CaptureFrames,
@@ -369,7 +371,8 @@ void RegisterEmulationTools(ToolRegistry& registry) {
         .requires_game = true,
         .requires_write = true,
         .requires_control = true,
-        .handler = [](ToolContext& ctx, const json&) { return Lifecycle(ctx, &Host::Pause, "pause"); },
+        .handler = [](ToolContext& ctx,
+                      const json&) { return Lifecycle(ctx, &Host::Pause, "pause"); },
     });
     registry.Add(Tool{
         .name = "resume",
@@ -379,7 +382,8 @@ void RegisterEmulationTools(ToolRegistry& registry) {
         .requires_game = true,
         .requires_write = true,
         .requires_control = true,
-        .handler = [](ToolContext& ctx, const json&) { return Lifecycle(ctx, &Host::Resume, "resume"); },
+        .handler = [](ToolContext& ctx,
+                      const json&) { return Lifecycle(ctx, &Host::Resume, "resume"); },
     });
     registry.Add(Tool{
         .name = "screenshot",
@@ -388,11 +392,12 @@ void RegisterEmulationTools(ToolRegistry& registry) {
                        "scaled to max_width (16:9). Fails if no frame is presented within "
                        "timeout_ms (e.g. loading); while paused it returns the capture layer or "
                        "the last presented screenshot and says which.",
-        .input_schema = {{"type", "object"},
-                         {"properties",
-                          {{"max_width", {{"type", "integer"}, {"minimum", 160}, {"maximum", 3840}}},
-                           {"timeout_ms", {{"type", "integer"}, {"minimum", 100}, {"maximum", 60000}}}}},
-                         {"additionalProperties", false}},
+        .input_schema =
+            {{"type", "object"},
+             {"properties",
+              {{"max_width", {{"type", "integer"}, {"minimum", 160}, {"maximum", 3840}}},
+               {"timeout_ms", {{"type", "integer"}, {"minimum", 100}, {"maximum", 60000}}}}},
+             {"additionalProperties", false}},
         .annotations = {.read_only = true},
         .requires_game = true,
         .handler = Screenshot,
