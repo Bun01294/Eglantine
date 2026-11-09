@@ -154,8 +154,13 @@ struct ContextOptions {
     /// context passes the GPU's; tests leave it null.
     VideoCore::LoadProgressSink* load_progress{};
     /// Cached storages with an image above this many bytes are trimmed (Context::Impl::
-    /// TrimStorageCache). Unset: 6 GiB.
+    /// TrimStorageCache). Unset: EDEN_NX2_NVN_STORAGE_BUDGET_MIB, else 6 GiB.
     std::optional<u64> storage_cache_budget_bytes{};
+    /// Presents after which an idle render target that can be rebuilt leaves the cache even under
+    /// the budget (0: never). Unset: EDEN_NX2_NVN_TRIM_AGE_PRESENTS, else 300.
+    std::optional<u64> storage_trim_age_presents{};
+    /// The trim of before the age and device budget rules. Unset: EDEN_NX2_NVN_TRIM_LEGACY.
+    std::optional<bool> storage_trim_legacy{};
     /// Runs on the replay thread after every queue submission. The renderer's context sets it to
     /// feed TurboMode (Force maximum clocks): that thread keeps the GPU at full clocks only while
     /// submissions keep coming, and the replay's submissions do not go through the scheduler.
@@ -212,6 +217,8 @@ struct ContextStats {
     u64 storages_reused{};
     u64 storages_evicted{};
     u64 storages_superseded_evicted{}; ///< ... of which GPU-written ones a later GPU write replaced
+    u64 storages_aged_evicted{};       ///< ... of which idle render targets past the age limit
+    u64 storages_pressure_evicted{};   ///< ... of which ones under the budget, for the device budget
     u64 storage_cache_bytes{};         ///< image bytes the storage cache holds now (estimate)
     u64 alias_transfers{};
     u64 alias_byte_transfers{}; ///< alias transfers made through the pool's bytes (nvn_alias_gpu.h)

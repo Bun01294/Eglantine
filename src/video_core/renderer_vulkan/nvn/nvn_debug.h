@@ -172,6 +172,13 @@ struct Config {
     u32 pool_mirror{0};
     /// EDEN_NX2_NVN_POOL_MIRROR_MAX_MIB: VRAM all pool mirrors together may take (default 4096).
     u64 pool_mirror_max_bytes{u64{4096} << 20};
+    /// EDEN_NX2_NVN_STORAGE_BUDGET_MIB: the storage cache budget (0: the default, 6144 MiB).
+    u64 storage_budget_bytes{0};
+    /// EDEN_NX2_NVN_TRIM_AGE_PRESENTS: presents after which an idle render target that can be
+    /// rebuilt leaves the storage cache (default 300, 0 never).
+    u64 trim_age_presents{300};
+    /// EDEN_NX2_NVN_TRIM_LEGACY=1: the storage cache trim without the age and device budget rules.
+    bool trim_legacy{false};
     /// EDEN_NX2_TRY_STORAGE_VRAM=0 opts out of mirroring bounded imported storage pools and
     /// redirecting raw-table aliases into the same copy, with full-pool raw write tracking.
     bool try_storage_vram{true};

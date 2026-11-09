@@ -215,6 +215,9 @@ inline u64 CheckBackoff(u32 unchanged_checks) {
 /// (ContextOptions::storage_cache_budget_bytes overrides it). DK's pools hold about 2 GB of
 /// textures; 6 GB leaves room for decoded stand-ins.
 inline constexpr u64 DEFAULT_STORAGE_CACHE_BUDGET = u64{6} << 30;
+/// Presents an idle render target that guest bytes or newer storages can rebuild stays cached
+/// under the budget (ContextOptions::storage_trim_age_presents overrides it; 0 never ages out).
+inline constexpr u64 DEFAULT_STORAGE_TRIM_AGE_PRESENTS = 300;
 
 /// True when the half-open ranges, sorted by start, leave no byte of [begin, end) uncovered.
 [[nodiscard]] inline bool RangesCover(std::span<const std::pair<u64, u64>> ranges, u64 begin,
@@ -296,6 +299,8 @@ struct Storage : std::enable_shared_from_this<Storage> {
     /// The guest wrote the storage itself (WriteTexels): upload again whatever the origin.
     bool force_upload{false};
     u64 last_used_seq{0};
+    /// Context::Impl::stats.presents at the last use (the trim's age clock).
+    u64 last_used_present{0};
     /// PoolIndex::write_gen at which TrimStorageCache found this (GPU-written) storage not
     /// superseded: it is not tested again before another GPU write in its pool (the test scans
     /// every storage over its bytes).
@@ -690,6 +695,9 @@ struct Context::Impl {
         std::atomic<u64> storages_reused{};      ///< textures that found a cached storage
         std::atomic<u64> storages_evicted{};
         std::atomic<u64> storages_superseded_evicted{}; ///< ... GPU-written ones a later GPU write replaced
+        std::atomic<u64> storages_aged_evicted{};       ///< ... idle render targets past the age limit
+        std::atomic<u64> storages_pressure_evicted{};   ///< ... under the budget, for the device budget
+        std::atomic<u64> storage_trim_pressure_passes{}; ///< trim passes that found the device over budget
         std::atomic<u64> storage_cache_bytes{};         ///< storage_cache_bytes of the replay thread, as a gauge
         std::atomic<u64> alias_transfers{};      ///< overlapping textures' contents copied over
         std::atomic<u64> alias_byte_transfers{}; ///< ... through the pool's bytes (alias shader)
@@ -998,6 +1006,14 @@ struct Context::Impl {
     u64 storage_cache_budget{0};
     u64 trim_floor_bytes{0};
     u64 trim_next_present{0};
+    /// EDEN_NX2_NVN_TRIM_LEGACY: only the over-budget pass at image creation, without the age and
+    /// device budget rules or the passes at presents.
+    bool trim_legacy{false};
+    /// Idle render targets that can be rebuilt are dropped after this many presents without a use
+    /// (0: never).
+    u64 trim_age_presents{DEFAULT_STORAGE_TRIM_AGE_PRESENTS};
+    /// Device usage over the device budget at the last pass (0: within it, or not reported).
+    u64 trim_device_excess{0};
     /// Device memory pages of the sparse storages (created with the first one) and the virtual
     /// pools that hold one. Replay thread (the pool is shared with the threads releasing storages).
     std::shared_ptr<SparsePagePool> sparse_pages;
@@ -1359,8 +1375,10 @@ struct Context::Impl {
     void RecordScaleBlit(vk::CommandBuffer cmd, Storage& native, bool to_scaled) const;
     /// Replay thread: reads the texture's image back into guest memory (CmdFlushTexture).
     void FlushTextureNow(CmdFlushTexture& command);
-    /// Drops cached storages nobody uses once the cache is over budget (least recently used first).
-    void TrimStorageCache();
+    /// Drops cached storages nobody uses once the cache is over budget (least recently used first)
+    /// or the device over its memory budget, and idle render targets past the age limit.
+    /// `at_present`: the periodic pass of a present (the cache need not have grown).
+    void TrimStorageCache(bool at_present = false);
     /// True when the GPU wrote every byte of the storage's span again after the storage's own last
     /// write, through other storages of the pool that took its contents over first (overlap
     /// resolution at their use): its image holds nothing the pool's bytes do not, so a later

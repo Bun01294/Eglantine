@@ -444,10 +444,13 @@ struct Rig {
     static constexpr u64 BUFFER_POOL_VA = 0x2000'0000;
 
     explicit Rig(HeadlessVulkan& vulkan, bool allow_import, u32 texture_pool_flags = POOL_CPU_CACHED,
-                 std::optional<u64> storage_cache_budget = {})
+                 std::optional<u64> storage_cache_budget = {},
+                 std::optional<u64> trim_age_presents = {}, std::optional<bool> trim_legacy = {})
         : context(*vulkan.device, vulkan.submit_mutex, nullptr,
                   {.allow_host_import = allow_import,
-                   .storage_cache_budget_bytes = storage_cache_budget}) {
+                   .storage_cache_budget_bytes = storage_cache_budget,
+                   .storage_trim_age_presents = trim_age_presents,
+                   .storage_trim_legacy = trim_legacy}) {
         texture_bytes = memory.Add(TEXTURE_POOL_VA, 4_MiB);
         readback = memory.Add(BUFFER_POOL_VA, 1_MiB);
         context.SetGuestMemory(&memory);
@@ -484,6 +487,15 @@ struct Rig {
         Run(context, seq, std::move(list));
         context.Destroy(serial);
         Settle();
+    }
+
+    /// Presents nothing `count` times (no present target: only the replay's present work runs).
+    void PresentNothing(u32 count) {
+        for (u32 i = 0; i < count; ++i) {
+            context.Present({.seq = ++seq, .queue = 0, .texture_serial = 0, .window_slot = 0,
+                             .present_interval = 1});
+        }
+        Run(context, seq, {});
     }
 
     FakeMemory memory;
@@ -864,6 +876,76 @@ TEST_CASE("nvn memory: GPU-written storages nothing replaced stay over the budge
     stats = rig.context.Stats();
     REQUIRE(stats.storages_created == 4);
     REQUIRE(stats.storages_reused == 1);
+}
+
+TEST_CASE("nvn memory: an idle render target of guest bytes ages out and uploads them again",
+          "[nvn]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    constexpr u32 SIZE = 32;
+    const bool legacy = GENERATE(false, true);
+    Rig rig{*vulkan, true, POOL_CPU_CACHED, {}, 1, legacy};
+    Nvn::Storage reference = MakeStorage(NVN_FORMAT_RGBA8, SIZE, SIZE, 1,
+                                         PixelFormat::A8B8G8R8_UNORM,
+                                         VK_FORMAT_A8B8G8R8_UNORM_PACK32);
+    const std::vector<u8> texels = Gradient(SIZE, SIZE, 7);
+    const std::vector<u8> guest = SwizzleLevel0(reference, texels, 4, SIZE, SIZE);
+    std::memcpy(rig.texture_bytes, guest.data(), guest.size());
+    rig.context.CreateTexture(MakeTexture(10, Rig::TEXTURE_POOL, 0, NVN_FORMAT_RGBA8, SIZE, SIZE));
+    REQUIRE(rig.Read(10, SIZE, SIZE) == texels);
+    rig.context.Destroy(10);
+    rig.Settle();
+    REQUIRE(rig.context.Stats().storage_cache_bytes == SIZE * SIZE * 4);
+    rig.PresentNothing(2);
+    Nvn::ContextStats stats = rig.context.Stats();
+    if (legacy) {
+        // Under the budget the trim of before keeps it.
+        REQUIRE(stats.storages_evicted == 0);
+        REQUIRE(stats.storage_cache_bytes == SIZE * SIZE * 4);
+        return;
+    }
+    REQUIRE(stats.storages_evicted == 1);
+    REQUIRE(stats.storages_aged_evicted == 1);
+    REQUIRE(stats.storage_cache_bytes == 0);
+    // The texture over the same bytes gets a new image with the guest's texels.
+    rig.context.CreateTexture(MakeTexture(11, Rig::TEXTURE_POOL, 0, NVN_FORMAT_RGBA8, SIZE, SIZE));
+    REQUIRE(rig.Read(11, SIZE, SIZE) == texels);
+    stats = rig.context.Stats();
+    REQUIRE(stats.storages_created == 2);
+    REQUIRE(stats.ops_failed == 0);
+}
+
+TEST_CASE("nvn memory: an idle GPU-written render target ages out only when it was replaced",
+          "[nvn]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    constexpr u32 WIDTH = 64;
+    constexpr u32 SHORT = 128;
+    constexpr u32 TALL = 136;
+    Rig rig{*vulkan, true, POOL_CPU_CACHED, {}, 1};
+    rig.Paint(10, 0, WIDTH, SHORT, 1.0f, 0.0f, 0.0f);    // red, the shorter shape
+    rig.Paint(11, 0, WIDTH, TALL, 0.0f, 1.0f, 0.0f);     // green over all of it, later
+    rig.Paint(12, 1_MiB, WIDTH, 64, 0.0f, 0.0f, 1.0f);   // blue, nothing over it
+    REQUIRE(rig.context.Stats().storages_evicted == 0);
+    rig.PresentNothing(2);
+    Nvn::ContextStats stats = rig.context.Stats();
+    // Far under the budget: the red one goes (its bytes are the green one's now), the green and
+    // the blue ones hold texels nothing else does and stay.
+    REQUIRE(stats.storages_evicted == 1);
+    REQUIRE(stats.storages_aged_evicted == 1);
+    REQUIRE(stats.storages_superseded_evicted == 1);
+    REQUIRE(stats.storage_cache_bytes == (static_cast<u64>(TALL) + 64) * WIDTH * 4);
+    rig.context.CreateTexture(MakeTexture(13, Rig::TEXTURE_POOL, 0, NVN_FORMAT_RGBA8, WIDTH, SHORT));
+    REQUIRE(AllTexels(rig.Read(13, WIDTH, SHORT), 0, 255, 0, 255));
+    rig.context.CreateTexture(MakeTexture(14, Rig::TEXTURE_POOL, 1_MiB, NVN_FORMAT_RGBA8, WIDTH, 64));
+    REQUIRE(AllTexels(rig.Read(14, WIDTH, 64), 0, 0, 255, 255));
+    stats = rig.context.Stats();
+    REQUIRE(stats.alias_unsupported == 0);
+    REQUIRE(stats.ops_failed == 0);
 }
 
 TEST_CASE("nvn memory: a storage a texture uses is not dropped even when a later write replaced it",

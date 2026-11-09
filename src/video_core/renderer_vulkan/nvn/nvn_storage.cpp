@@ -7,7 +7,9 @@
 // notifications and the ReadTexels flush. See DESIGN.md "Memory and coherency".
 
 #include <algorithm>
+#include <array>
 #include <cstring>
+#include <optional>
 #include <unordered_set>
 #include <vector>
 
@@ -279,6 +281,7 @@ bool Context::Impl::EnsureImage(Storage& s) {
         return false;
     }
     s.current_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    s.last_used_present = stats.presents.load(std::memory_order_relaxed);
     stats.storages_created.fetch_add(1, std::memory_order_relaxed);
     if (s.cached) {
         storage_cache_bytes += s.vram_bytes;
@@ -873,18 +876,41 @@ bool Context::Impl::StorageSuperseded(const Storage& s) const {
     return RangesCover(covers, begin, end);
 }
 
-void Context::Impl::TrimStorageCache() {
-    if (storage_cache_bytes <= storage_cache_budget) {
-        return;
-    }
+void Context::Impl::TrimStorageCache(bool at_present) {
     // A pass walks the whole cache: it runs when the cache has grown since the last one or after
     // a few presents, not at every storage created.
     constexpr u64 PASS_INTERVAL_PRESENTS = 30;
     // Superseded-storage tests per pass (each scans the storages over the tested one's bytes).
     constexpr size_t MAX_SUPERSEDED_TESTS = 1024;
     const u64 presents = stats.presents.load(std::memory_order_relaxed);
-    if (storage_cache_bytes < trim_floor_bytes && presents < trim_next_present) {
+    const bool over_budget = storage_cache_bytes > storage_cache_budget;
+    if (trim_legacy) {
+        if (at_present || !over_budget ||
+            (storage_cache_bytes < trim_floor_bytes && presents < trim_next_present)) {
+            return;
+        }
+    } else if (at_present) {
+        // The periodic pass: textures died, storages aged, the device budget moved.
+        if (presents < trim_next_present) {
+            return;
+        }
+    } else if ((!over_budget && trim_device_excess == 0) ||
+               (storage_cache_bytes < trim_floor_bytes && presents < trim_next_present)) {
         return;
+    }
+    // The device over its memory budget (VK_EXT_memory_budget; the allocator's empty block space
+    // counts, the driver counts it too) pages: what the cache can rebuild goes until it is not.
+    u64 device_budget = 0;
+    trim_device_excess = 0;
+    if (!trim_legacy) {
+        device_budget = device.GetDeviceMemoryBudget();
+        if (device_budget != 0) {
+            const u64 used = device.GetDeviceMemoryUsage() + device.GetDeviceMemorySlack();
+            if (used > device_budget) {
+                trim_device_excess = used - device_budget;
+                stats.storage_trim_pressure_passes.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
     }
     struct Candidate {
         u64 last_used;
@@ -904,13 +930,23 @@ void Context::Impl::TrimStorageCache() {
         }
     }
     const auto by_age = [](const Candidate& a, const Candidate& b) { return a.last_used < b.last_used; };
-    const u64 target = storage_cache_budget / 10 * 9;
-    const auto evict = [&](const StorageKey& key, bool superseded) {
+    const u64 budget_target = storage_cache_budget / 10 * 9;
+    u64 target = over_budget ? budget_target : storage_cache_bytes;
+    if (trim_device_excess != 0) {
+        // The excess and a margin, so that the next pass does not find the device over at once.
+        const u64 shed = trim_device_excess + device_budget / 32;
+        target = (std::min)(target, storage_cache_bytes - (std::min)(storage_cache_bytes, shed));
+    }
+    enum class Reason { Budget, Superseded, Aged };
+    const auto evict = [&](const StorageKey& key, Reason reason) {
         const auto it = storage_cache.find(key);
         if (it == storage_cache.end()) {
             return;
         }
         Storage& storage = *it->second;
+        if (reason != Reason::Aged && storage_cache_bytes <= budget_target) {
+            stats.storages_pressure_evicted.fetch_add(1, std::memory_order_relaxed);
+        }
         storage_cache_bytes -= (std::min)(storage_cache_bytes, storage.vram_bytes);
         if (const auto index = storage_index.find(storage.pool_serial); index != storage_index.end()) {
             auto range = index->second.spans.equal_range(storage.pool_offset);
@@ -923,36 +959,49 @@ void Context::Impl::TrimStorageCache() {
         }
         storage.cached = false;
         stats.storages_evicted.fetch_add(1, std::memory_order_relaxed);
-        if (superseded) {
+        if (reason == Reason::Superseded) {
             stats.storages_superseded_evicted.fetch_add(1, std::memory_order_relaxed);
+        } else if (reason == Reason::Aged) {
+            stats.storages_aged_evicted.fetch_add(1, std::memory_order_relaxed);
         }
         storage_cache.erase(it);
+    };
+    size_t tests = 0;
+    // Whether a later GPU write replaced every byte of a GPU-written storage (null: the pass is
+    // out of tests, or nothing was written in its pool since it was found to be live).
+    const auto superseded = [&](Storage& storage) -> std::optional<bool> {
+        const auto index = storage_index.find(storage.pool_serial);
+        const u64 gen = index != storage_index.end() ? index->second.write_gen : 0;
+        if (storage.trim_checked_gen == gen || tests >= MAX_SUPERSEDED_TESTS) {
+            return std::nullopt;
+        }
+        ++tests;
+        if (StorageSuperseded(storage)) {
+            return true;
+        }
+        storage.trim_checked_gen = gen;
+        return false;
+    };
+    // Below the budget (the device budget's share) the storages of the last presents stay: the
+    // transient targets a game re-creates every frame would otherwise be made again every frame.
+    constexpr u64 PRESSURE_KEEP_PRESENTS = 4;
+    const auto kept_under_budget = [&](const Storage& storage) {
+        return storage_cache_bytes <= budget_target && presents >= storage.last_used_present &&
+               presents - storage.last_used_present < PRESSURE_KEEP_PRESENTS;
     };
     // First the render targets the GPU wrote again since (the game re-uses the bytes for other
     // shapes; each shape keeps an image of its own): their texels live in the newer storages, so
     // they cost nothing but the image. Storages the GPU wrote that nothing replaced hold data no
     // guest bytes can rebuild: they are kept.
     std::sort(gpu_written.begin(), gpu_written.end(), by_age);
-    size_t tests = 0;
     for (const Candidate& candidate : gpu_written) {
         if (storage_cache_bytes <= target || tests >= MAX_SUPERSEDED_TESTS) {
             break;
         }
         const auto it = storage_cache.find(candidate.key);
-        if (it == storage_cache.end()) {
-            continue;
-        }
-        Storage& storage = *it->second;
-        const auto index = storage_index.find(storage.pool_serial);
-        const u64 gen = index != storage_index.end() ? index->second.write_gen : 0;
-        if (storage.trim_checked_gen == gen) {
-            continue; // nothing was written in its pool since it was found to be live
-        }
-        ++tests;
-        if (StorageSuperseded(storage)) {
-            evict(candidate.key, true);
-        } else {
-            storage.trim_checked_gen = gen;
+        if (it != storage_cache.end() && !kept_under_budget(*it->second) &&
+            superseded(*it->second).value_or(false)) {
+            evict(candidate.key, Reason::Superseded);
         }
     }
     // Then the storages that hold guest bytes (the next use uploads them again).
@@ -961,7 +1010,39 @@ void Context::Impl::TrimStorageCache() {
         if (storage_cache_bytes <= target) {
             break;
         }
-        evict(candidate.key, false);
+        const auto it = storage_cache.find(candidate.key);
+        if (it != storage_cache.end() && !kept_under_budget(*it->second)) {
+            evict(candidate.key, Reason::Budget);
+        }
+    }
+    // Under the budget too: render targets nothing used for `trim_age_presents` that cost nothing
+    // to rebuild. Ones that hold guest bytes (or nothing) upload them again; GPU-written ones go
+    // only when superseded, never with texels no other storage holds.
+    if (!trim_legacy && trim_age_presents != 0) {
+        const auto aged = [&](const Storage& storage) {
+            return presents >= storage.last_used_present &&
+                   presents - storage.last_used_present >= trim_age_presents;
+        };
+        constexpr VkImageUsageFlags TARGET_USAGE =
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        for (const Candidate& candidate : from_guest) {
+            const auto it = storage_cache.find(candidate.key);
+            if (it != storage_cache.end() && (it->second->usage & TARGET_USAGE) != 0 &&
+                aged(*it->second)) {
+                evict(candidate.key, Reason::Aged);
+            }
+        }
+        for (const Candidate& candidate : gpu_written) {
+            if (tests >= MAX_SUPERSEDED_TESTS) {
+                break;
+            }
+            const auto it = storage_cache.find(candidate.key);
+            if (it != storage_cache.end() && aged(*it->second) &&
+                superseded(*it->second).value_or(false)) {
+                stats.storages_superseded_evicted.fetch_add(1, std::memory_order_relaxed);
+                evict(candidate.key, Reason::Aged);
+            }
+        }
     }
     trim_floor_bytes = storage_cache_bytes + (std::max)(storage_cache_budget / 32, u64{1});
     trim_next_present = presents + PASS_INTERVAL_PRESENTS;
@@ -1052,6 +1133,99 @@ void Context::Impl::LogStorageCensus() {
                  mib(storage_cache_budget), stats.storages_evicted.load(std::memory_order_relaxed),
                  stats.storages_superseded_evicted.load(std::memory_order_relaxed), most_spans,
                  mib(widest));
+    }
+    {
+        // Why the cache cannot reach its budget: who holds the cached images (only the cache
+        // holds the ones a trim may drop), where their bytes came from, how long ago the render
+        // targets were used, and the twins of the Resolution setting (not in the cache's count).
+        std::unordered_set<const Storage*> live;
+        for (const auto& [serial, texture] : textures) {
+            if (texture && texture->storage) {
+                live.insert(texture->storage.get());
+            }
+        }
+        for (const auto& [key, texture] : target_aliases) {
+            if (texture && texture->storage) {
+                live.insert(texture->storage.get());
+            }
+        }
+        Kind held_live, held_other, idle_gpu, idle_rebuild, twins;
+        std::array<Kind, 3> origin{};
+        // Presents since the last use: < 60, < 300, < 1800, older.
+        constexpr std::array<u64, 3> AGE_LIMITS{60, 300, 1800};
+        std::array<Kind, 4> target_age{};
+        std::array<Kind, 4> live_target_age{};
+        std::array<Kind, 4> idle_gpu_target_age{};
+        const u64 presents = stats.presents.load(std::memory_order_relaxed);
+        const auto age_bucket = [&](const Storage& s) {
+            const u64 age = presents > s.last_used_present ? presents - s.last_used_present : 0;
+            size_t bucket = 0;
+            while (bucket < AGE_LIMITS.size() && age >= AGE_LIMITS[bucket]) {
+                ++bucket;
+            }
+            return bucket;
+        };
+        const auto count = [](Kind& kind, const Storage& s) {
+            ++kind.count;
+            kind.bytes += s.vram_bytes;
+        };
+        for (const Storage* s : seen) {
+            if (s->scaled && s->scaled->image) {
+                count(twins, *s->scaled);
+            }
+        }
+        for (const auto& [key, storage] : storage_cache) {
+            const Storage& s = *storage;
+            if (!s.image || s.sparse) {
+                continue;
+            }
+            count(origin[static_cast<size_t>(s.origin)], s);
+            const bool idle = storage.use_count() == 1;
+            if (live.contains(&s)) {
+                count(held_live, s);
+            } else if (!idle) {
+                count(held_other, s);
+            } else if (s.origin == StorageOrigin::Gpu) {
+                count(idle_gpu, s);
+            } else {
+                count(idle_rebuild, s);
+            }
+            if ((s.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) == 0) {
+                continue;
+            }
+            const size_t bucket = age_bucket(s);
+            count(target_age[bucket], s);
+            if (live.contains(&s)) {
+                count(live_target_age[bucket], s);
+            } else if (idle && s.origin == StorageOrigin::Gpu) {
+                count(idle_gpu_target_age[bucket], s);
+            }
+        }
+        const auto ages = [&](const std::array<Kind, 4>& kinds) {
+            return fmt::format("<60 {} ({}), <300 {} ({}), <1800 {} ({}), older {} ({})",
+                               mib(kinds[0].bytes), kinds[0].count, mib(kinds[1].bytes),
+                               kinds[1].count, mib(kinds[2].bytes), kinds[2].count,
+                               mib(kinds[3].bytes), kinds[3].count);
+        };
+        LOG_INFO(Render_Vulkan,
+                 "[nvn] storage census: cache holders MiB (count): live textures {} ({}), other "
+                 "holders {} ({}), idle GPU-written {} ({}), idle rebuildable {} ({}); origin "
+                 "none/cpu/gpu {}/{}/{} MiB; scaled twins {} ({}); {} live textures",
+                 mib(held_live.bytes), held_live.count, mib(held_other.bytes), held_other.count,
+                 mib(idle_gpu.bytes), idle_gpu.count, mib(idle_rebuild.bytes), idle_rebuild.count,
+                 mib(origin[0].bytes), mib(origin[1].bytes), mib(origin[2].bytes),
+                 mib(twins.bytes), twins.count, textures.size());
+        LOG_INFO(Render_Vulkan,
+                 "[nvn] storage census: render targets by presents since use MiB (count): {}; of "
+                 "them held by live textures: {}; idle GPU-written: {}; trim {} age {} evicted "
+                 "aged {} pressure {}, device over budget at the last pass {} MiB ({} passes)",
+                 ages(target_age), ages(live_target_age), ages(idle_gpu_target_age),
+                 trim_legacy ? "legacy" : "current", trim_age_presents,
+                 stats.storages_aged_evicted.load(std::memory_order_relaxed),
+                 stats.storages_pressure_evicted.load(std::memory_order_relaxed),
+                 mib(trim_device_excess),
+                 stats.storage_trim_pressure_passes.load(std::memory_order_relaxed));
     }
     for (size_t i = 0; i < top; ++i) {
         const Storage& s = *largest[i];
