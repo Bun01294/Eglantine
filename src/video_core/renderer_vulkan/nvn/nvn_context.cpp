@@ -258,14 +258,31 @@ Context::Impl::Impl(const Device& device_, std::mutex& submit_mutex_,
             std::getenv("EDEN_NX2_NVN_ASTC_STANDIN"),
             Settings::values.astc_recompression.GetValue());
         const bool encodable = BcGpuEncoder::Supported(device);
-        astc_standin = encodable ? chosen : AstcStandin::Rgba8;
-        LOG_INFO(Render_Vulkan, "[nvn] ASTC stand-ins: {}{}", AstcStandinName(astc_standin),
-                 chosen != astc_standin ? " (the device cannot run the BC encoder)" : "");
+        astc_standin = !encodable ? AstcStandin::Rgba8
+                       : chosen == AstcStandin::Bc7 && !BcGpuEncoder::SupportsBc7(device)
+                           ? AstcStandin::Bc3
+                           : chosen;
+        bc7_quality = ParseBc7Quality(std::getenv("EDEN_NX2_NVN_BC7_QUALITY"));
+        LOG_INFO(Render_Vulkan, "[nvn] ASTC stand-ins: {}{}{}", AstcStandinName(astc_standin),
+                 astc_standin == AstcStandin::Bc7 ? fmt::format(" (quality {})", bc7_quality)
+                                                  : std::string{},
+                 chosen == astc_standin ? ""
+                 : encodable            ? " (the device cannot hold BC7)"
+                                        : " (the device cannot run the BC encoder)");
         if (astc_standin != AstcStandin::Rgba8) {
-            bc_encoder_future = std::async(std::launch::async, [this] {
+            const bool bc7 = astc_standin == AstcStandin::Bc7;
+            bc_encoder_future = std::async(std::launch::async, [this, bc7] {
                 Common::SetCurrentThreadName("NvnBcInit");
-                return std::make_unique<BcGpuEncoder>(device);
+                return std::make_unique<BcGpuEncoder>(device, bc7);
             });
+            const auto families = device.GetPhysical().GetQueueFamilyProperties();
+            const u32 valid_bits = device.GetGraphicsFamily() < families.size()
+                                       ? families[device.GetGraphicsFamily()].timestampValidBits
+                                       : 0;
+            bc_timing = valid_bits != 0;
+            bc_timestamp_mask = valid_bits >= 64 ? ~u64{0} : (u64{1} << valid_bits) - 1;
+            const float period = device.GetPhysical().GetProperties().limits.timestampPeriod;
+            bc_timestamp_period = period > 0.0f ? period : 1.0;
         }
     }
     untile_gpu_enabled = UntileGpu::Supported(device);
@@ -371,7 +388,8 @@ BcGpuEncoder* Context::Impl::BcEncoder() {
 }
 
 std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratch(u32 width, u32 height, u32 layers) {
-    if (bc_scratch && bc_scratch->Fits(width, height, layers)) {
+    const bool bc7 = astc_standin == AstcStandin::Bc7;
+    if (bc_scratch && bc_scratch->Fits(width, height, layers, bc7)) {
         return bc_scratch;
     }
     const auto texel_bytes = [](u32 w, u32 h, u32 l) { return u64{w} * h * l * 4; };
@@ -390,7 +408,7 @@ std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratch(u32 width, u32 height
         }
     }
     try {
-        auto scratch = MakeBcScratch(device, *allocator, w, h, l);
+        auto scratch = MakeBcScratch(device, *allocator, w, h, l, bc7);
         if (texel_bytes(w, h, l) <= BC_SCRATCH_BUDGET) {
             bc_scratch = scratch;
         }
@@ -403,6 +421,52 @@ std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratch(u32 width, u32 height
         }
         return nullptr;
     }
+}
+
+void Context::Impl::CompleteBcTimes(const BcUploadTimes& times) {
+    const u32 queries = static_cast<u32>(times.uploads.size() * 2);
+    std::vector<u64> ticks(queries);
+    if (queries == 0 ||
+        device.GetLogical().GetQueryResults(*times.pool, 0, queries, ticks.size() * sizeof(u64),
+                                            ticks.data(), sizeof(u64),
+                                            VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
+        return;
+    }
+    for (size_t i = 0; i < times.uploads.size(); ++i) {
+        const BcUploadTimes::Upload& upload = times.uploads[i];
+        const u64 elapsed = (ticks[2 * i + 1] - ticks[2 * i]) & bc_timestamp_mask;
+        const u64 ns = static_cast<u64>(static_cast<double>(elapsed) * bc_timestamp_period);
+        bc_window.uploads.fetch_add(1, std::memory_order_relaxed);
+        bc_window.bytes.fetch_add(upload.bytes, std::memory_order_relaxed);
+        bc_window.gpu_ns.fetch_add(ns, std::memory_order_relaxed);
+        u64 max = bc_window.max_ns.load(std::memory_order_relaxed);
+        while (ns > max && !bc_window.max_ns.compare_exchange_weak(max, ns)) {
+        }
+        if (upload.bytes >= BC_TIMED_LOG_BYTES) {
+            LOG_INFO(Render_Vulkan,
+                     "[nvn] {} stand-in upload {}x{}x{} lv {} fmt {:#x}: {} MiB, GPU {:.1f} ms "
+                     "(ASTC decode or texel copy and encode)",
+                     upload.kind, upload.width, upload.height, upload.layers, upload.levels,
+                     upload.format, upload.bytes >> 20, static_cast<double>(ns) / 1e6);
+        }
+    }
+}
+
+void Context::Impl::LogBcTimeWindow(u64 present) {
+    const u64 uploads = bc_window.uploads.exchange(0, std::memory_order_relaxed);
+    const u64 untimed = bc_window.untimed.exchange(0, std::memory_order_relaxed);
+    const u64 bytes = bc_window.bytes.exchange(0, std::memory_order_relaxed);
+    const u64 gpu_ns = bc_window.gpu_ns.exchange(0, std::memory_order_relaxed);
+    const u64 max_ns = bc_window.max_ns.exchange(0, std::memory_order_relaxed);
+    if (uploads + untimed != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "[nvn] BC stand-in uploads completed in presents {}-{}: {} ({} MiB), GPU {:.1f} ms "
+                 "(largest {:.1f} ms){}",
+                 bc_window_first_present, present, uploads, bytes >> 20,
+                 static_cast<double>(gpu_ns) / 1e6, static_cast<double>(max_ns) / 1e6,
+                 untimed != 0 ? fmt::format(", {} more untimed", untimed) : std::string{});
+    }
+    bc_window_first_present = present + 1;
 }
 
 UntileGpu* Context::Impl::Untile() {
@@ -1075,6 +1139,9 @@ void Context::Impl::CompleteMain() {
         if (flight->gpu_prof && gpu_profiler) {
             // Timestamps: read after the timeline value was reached, never on the replay thread.
             gpu_profiler->Complete(*flight->gpu_prof);
+        }
+        if (flight->bc_times) {
+            CompleteBcTimes(*flight->bc_times);
         }
         if (flight->capture) {
             flight->capture->buffer.Invalidate();

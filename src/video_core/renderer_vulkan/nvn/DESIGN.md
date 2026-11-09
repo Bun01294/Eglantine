@@ -449,9 +449,22 @@ level (`Recorder::RecordBcUpload`): the GPU decoder fills the scratch from the p
 decoded staging is copied into it, a partial CopyBufferToTexture likewise (4x4-aligned regions
 only). Tile-backed sparse, 3D and multisampled ASTC storages stay RGBA8. A BC stand-in cannot be
 cleared, bound as an image, viewed in a non-BC format, or copied to/from another stand-in in regions
-that cut its 4x4 blocks (unsupported, logged); the storage census counts them as `as BC3 ...`.
-`renderer_vulkan.cpp` still pins the setting's override to Uncompressed so `MaxwellToVK` returns
-RGBA8; the replay reads the saved value itself.
+that cut its 4x4 blocks (unsupported, logged); the storage census counts them per format as
+`as BC3 ...`, `as BC7 ...`. `renderer_vulkan.cpp` still pins the setting's override to
+Uncompressed so `MaxwellToVK` returns RGBA8; the replay reads the saved value itself.
+`EDEN_NX2_NVN_ASTC_STANDIN=bc7` (the setting has no BC7) holds them as BC7 (same memory as BC3, far
+less loss) with `bc7_encoder.comp`, DirectXTex's BC7 compute encoder (MIT) ported to GLSL: a pass
+for modes 4/5/6, one per partitioned mode, then the encode, the best mode per block in the
+scratch's `modes` buffer between them (`BcGpuEncoder::RecordBc7`). `EDEN_NX2_NVN_BC7_QUALITY`
+picks the modes tried: 0 = 4/5/6, 1 (default) adds 1/3/7, 2 adds 0/2 (blocks modes 4-6 already
+hold within ~45 dB skip the partitioned passes). The port orients each subset's box along its
+covariance, checks the neighbours of the last pass's projected indices and refits the endpoints by
+least squares, and keeps alpha 0/255 exact and texels on their side of alpha tests at 64/128/192
+(an error penalty, endpoint rounding and the index choice). Its texel loops read no constant
+arrays: glslang copies such an array into local memory at every dynamically indexed read, which
+made the first port ~5x slower. Each upload's GPU time (decode or copy and encode) is
+measured with a timestamp pair per submission (`BcUploadTimes`): uploads of 16 MiB stand-ins or
+more get a log line, and every 60 presents a line sums the window's uploads.
 Block-linear storages that need no decode (every texel size, BCn blocks the device holds, 2D, arrays,
 3D, mip chains) of 64 KiB or more are untiled on the GPU (`nvn_untile_gpu.cpp`, idea from
 switch2-recomp's "GPU untile"): the emulated path's `block_linear_unswizzle_3d_bcn.comp` (its

@@ -473,12 +473,18 @@ public:
             // The BC blocks the stand-in holds, decoded as that BC format.
             const bool srgb = VideoCore::Surface::IsPixelFormatSRGB(storage.host.pixel_format);
             readback.bcn = true;
-            readback.pixel_format =
-                bc_bytes == 8
-                    ? (srgb ? VideoCore::Surface::PixelFormat::BC1_RGBA_SRGB
-                            : VideoCore::Surface::PixelFormat::BC1_RGBA_UNORM)
-                    : (srgb ? VideoCore::Surface::PixelFormat::BC3_SRGB
-                            : VideoCore::Surface::PixelFormat::BC3_UNORM);
+            using VideoCore::Surface::PixelFormat;
+            switch (BcStandinOf(storage.host)) {
+            case AstcStandin::Bc1:
+                readback.pixel_format = srgb ? PixelFormat::BC1_RGBA_SRGB : PixelFormat::BC1_RGBA_UNORM;
+                break;
+            case AstcStandin::Bc7:
+                readback.pixel_format = srgb ? PixelFormat::BC7_SRGB : PixelFormat::BC7_UNORM;
+                break;
+            default:
+                readback.pixel_format = srgb ? PixelFormat::BC3_SRGB : PixelFormat::BC3_UNORM;
+                break;
+            }
             size = BcBlocksSize(width, height, 1, bc_bytes);
         } else if (VideoCore::Surface::IsPixelFormatBCn(storage.host.pixel_format)) {
             const BlockInfo block = FormatBlockInfo(storage.desc.format);
@@ -671,6 +677,9 @@ private:
     /// layers [0, chunk.layers) of the scratch (GENERAL layout), then they are encoded and copied
     /// into `s` at the chunk's level, layers and offset. `guest_contents`: the texels are the
     /// guest's bytes (an upload), not a GPU write. False when nothing could be recorded.
+    /// The flight's BcUploadTimes with room for one more upload (created on first use), null
+    /// without timestamps or when it is full (counted untimed).
+    BcUploadTimes* BcTimes();
     bool RecordBcUpload(Storage& s, std::span<const BcChunk> chunks, bool guest_contents,
                         const std::function<void(const BcChunk&, BcScratch&)>& fill);
     /// Untiles a block-linear storage that needs no decode on the GPU (nvn_untile_gpu.h): from its
@@ -2291,10 +2300,30 @@ bool Recorder::RecordBcUpload(Storage& s, std::span<const BcChunk> chunks, bool 
         return false;
     }
     const u32 block_bytes = BcStandinBlockBytes(s.host);
+    const AstcStandin kind = BcStandinOf(s.host);
+    if (kind == AstcStandin::Bc7 && !encoder->HasBc7()) {
+        return false;
+    }
     const bool saved = track_writes;
     track_writes = track_writes && !guest_contents;
     PrepareImages({{&s, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
     track_writes = saved;
+    // The upload's GPU time: a timestamp pair around its chunks (CompleteBcTimes).
+    BcUploadTimes* const times = BcTimes();
+    u32 query = 0;
+    if (times) {
+        query = static_cast<u32>(times->uploads.size() * 2);
+        times->uploads.push_back({
+            .width = s.extent.width,
+            .height = s.extent.height,
+            .layers = s.layers,
+            .levels = s.levels,
+            .format = s.desc.format,
+            .bytes = s.vram_bytes,
+            .kind = AstcStandinName(kind),
+        });
+        Cmd().WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *times->pool, query);
+    }
     bool recorded = false;
     for (const BcChunk& chunk : chunks) {
         const std::shared_ptr<BcScratch> scratch =
@@ -2336,9 +2365,16 @@ bool Recorder::RecordBcUpload(Storage& s, std::span<const BcChunk> chunks, bool 
                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, texels_written);
         const u32 blocks_x = (chunk.width + 3) / 4;
         const u32 blocks_y = (chunk.height + 3) / 4;
-        encoder->Record(Cmd(), *scratch->view, chunk.width, chunk.height, chunk.layers,
-                        block_bytes == 16, *scratch->blocks,
-                        BcBlocksSize(chunk.width, chunk.height, chunk.layers, block_bytes));
+        const u64 blocks_size = BcBlocksSize(chunk.width, chunk.height, chunk.layers, block_bytes);
+        if (kind == AstcStandin::Bc7) {
+            encoder->RecordBc7(Cmd(), *scratch->view, chunk.width, chunk.height, chunk.layers,
+                               impl.bc7_quality, *scratch->modes,
+                               BcBlocksSize(chunk.width, chunk.height, chunk.layers, 8),
+                               *scratch->blocks, blocks_size);
+        } else {
+            encoder->Record(Cmd(), *scratch->view, chunk.width, chunk.height, chunk.layers,
+                            kind == AstcStandin::Bc3, *scratch->blocks, blocks_size);
+        }
         const VkMemoryBarrier blocks_written{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .pNext = nullptr,
@@ -2365,11 +2401,48 @@ bool Recorder::RecordBcUpload(Storage& s, std::span<const BcChunk> chunks, bool 
                                 region);
         recorded = true;
     }
+    if (times) {
+        Cmd().WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *times->pool, query + 1);
+    }
     if (recorded) {
         barrier_pending = true;
         impl.stats.astc_bc_encodes.fetch_add(1, std::memory_order_relaxed);
     }
     return recorded;
+}
+
+BcUploadTimes* Recorder::BcTimes() {
+    if (!impl.bc_timing) {
+        return nullptr;
+    }
+    if (!flight.bc_times) {
+        auto times = std::make_unique<BcUploadTimes>();
+        try {
+            times->pool = impl.device.GetLogical().CreateQueryPool({
+                .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                .queryCount = BcUploadTimes::CAPACITY * 2,
+                .pipelineStatistics = 0,
+            });
+        } catch (const vk::Exception&) {
+            impl.bc_timing = false;
+            return nullptr;
+        }
+        if (impl.device.IsHostQueryResetSupported()) {
+            impl.device.GetLogical().ResetQueryPool(*times->pool, 0, BcUploadTimes::CAPACITY * 2);
+        } else {
+            Cmd().ResetQueryPool(*times->pool, 0, BcUploadTimes::CAPACITY * 2);
+        }
+        times->uploads.reserve(BcUploadTimes::CAPACITY);
+        flight.bc_times = std::move(times);
+    }
+    if (flight.bc_times->uploads.size() >= BcUploadTimes::CAPACITY) {
+        impl.bc_window.untimed.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    return flight.bc_times.get();
 }
 
 bool Recorder::UploadUntileOnGpu(Storage& s, const UploadPlan& plan, Pool& pool, const u8* data,
@@ -5822,8 +5895,12 @@ void Context::Impl::ProcessSubmit(CmdSubmit&& submit) {
 }
 
 void Context::Impl::ProcessPresent(CmdPresent&& present) {
-    if (stats.presents.fetch_add(1, std::memory_order_relaxed) % 900 == 899) {
+    const u64 presented = stats.presents.fetch_add(1, std::memory_order_relaxed);
+    if (presented % 900 == 899) {
         LogStorageCensus();
+    }
+    if (bc_timing && presented % 60 == 59) {
+        LogBcTimeWindow(presented);
     }
     // Textures die and storages age without a new image being made: the trim looks at them here.
     TrimStorageCache(true);

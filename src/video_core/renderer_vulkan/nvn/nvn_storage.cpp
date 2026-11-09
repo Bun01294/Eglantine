@@ -1112,7 +1112,8 @@ void Context::Impl::LogStorageCensus() {
         u64 count{};
         u64 bytes{};
     };
-    Kind sparse, targets, depth, astc, astc_bc, other, gpu_written;
+    Kind sparse, targets, depth, astc, other, gpu_written;
+    std::array<Kind, 4> astc_bc{}; // by AstcStandin
     u64 sparse_bound = 0;
     std::vector<const Storage*> largest;
     const auto add = [&](const Storage& s) {
@@ -1127,8 +1128,9 @@ void Context::Impl::LogStorageCensus() {
         ++kind.count;
         kind.bytes += s.vram_bytes;
         if (s.host.bc_standin) {
-            ++astc_bc.count;
-            astc_bc.bytes += s.vram_bytes;
+            Kind& bc = astc_bc[static_cast<size_t>(BcStandinOf(s.host))];
+            ++bc.count;
+            bc.bytes += s.vram_bytes;
         }
         if (s.sparse) {
             sparse_bound += s.sparse->BoundBytes();
@@ -1151,13 +1153,25 @@ void Context::Impl::LogStorageCensus() {
     std::partial_sort(largest.begin(), largest.begin() + top, largest.end(),
                       [](const Storage* a, const Storage* b) { return a->vram_bytes > b->vram_bytes; });
     const auto mib = [](u64 bytes) { return bytes >> 20; };
+    // The BC stand-ins by format ("as BC3 <MiB> (<n>)", one entry per format held), else what
+    // new ones become.
+    std::string as_bc;
+    for (const AstcStandin bc : {AstcStandin::Bc1, AstcStandin::Bc3, AstcStandin::Bc7}) {
+        const Kind& held = astc_bc[static_cast<size_t>(bc)];
+        if (held.count != 0) {
+            as_bc += fmt::format("{}as {} {} ({})", as_bc.empty() ? "" : ", ", AstcStandinName(bc),
+                                 mib(held.bytes), held.count);
+        }
+    }
+    if (as_bc.empty()) {
+        as_bc = fmt::format("as {} 0 (0)", AstcStandinName(astc_standin));
+    }
     LOG_INFO(Render_Vulkan,
              "[nvn] storage census: {} images, estimated MiB (count): sparse {} ({}, bound {}), depth {} "
-             "({}), colour targets {} ({}), compressed stand-ins {} ({}; as {} {} ({})), other {} "
+             "({}), colour targets {} ({}), compressed stand-ins {} ({}; {}), other {} "
              "({}); GPU-written {} ({}); cache {} MiB; sparse pages {} MiB",
              seen.size(), mib(sparse.bytes), sparse.count, mib(sparse_bound), mib(depth.bytes),
-             depth.count, mib(targets.bytes), targets.count, mib(astc.bytes), astc.count,
-             AstcStandinName(astc_standin), mib(astc_bc.bytes), astc_bc.count,
+             depth.count, mib(targets.bytes), targets.count, mib(astc.bytes), astc.count, as_bc,
              mib(other.bytes), other.count, mib(gpu_written.bytes), gpu_written.count,
              mib(storage_cache_bytes), sparse_pages ? mib(sparse_pages->UsedBytes()) : 0);
     {
@@ -1315,13 +1329,12 @@ void Context::Impl::LogStorageCensus() {
     }
     for (size_t i = 0; i < top; ++i) {
         const Storage& s = *largest[i];
-        LOG_INFO(Render_Vulkan, "[nvn] storage census: #{} {}x{}x{} lv {} fmt {:#x} flags {:#x} {} MiB{}{}{}",
+        LOG_INFO(Render_Vulkan, "[nvn] storage census: #{} {}x{}x{} lv {} fmt {:#x} flags {:#x} {} MiB{}{}{}{}",
                  i + 1, s.extent.width, s.extent.height, s.layers, s.levels, s.desc.format,
                  s.desc.flags, mib(s.vram_bytes), s.sparse ? " sparse" : "",
-                 s.host.bc_standin        ? (BcStandinBlockBytes(s.host) == 8 ? " stand-in BC1"
-                                                                                 : " stand-in BC3")
-                 : s.host.needs_transcode ? " stand-in"
-                                          : "",
+                 s.host.needs_transcode ? " stand-in" : "",
+                 s.host.bc_standin ? fmt::format(" {}", AstcStandinName(BcStandinOf(s.host)))
+                                   : std::string{},
                  s.origin == StorageOrigin::Gpu ? " gpu-written" : "");
     }
 }

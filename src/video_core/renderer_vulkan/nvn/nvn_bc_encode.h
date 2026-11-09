@@ -95,6 +95,28 @@ struct BcScratch {
     }
 };
 
+/// GPU time of the BC stand-in uploads of one submission: a timestamp pair around each upload's
+/// chunks (Recorder::RecordBcUpload: the ASTC decode or texel copy and the encode), read once the
+/// submission completed (Context::Impl::CompleteBcTimes).
+struct BcUploadTimes {
+    /// Uploads timed per submission; later ones are counted untimed.
+    static constexpr u32 CAPACITY = 128;
+    struct Upload {
+        u32 width{};
+        u32 height{};
+        u32 layers{};
+        u32 levels{};
+        s32 format{}; ///< NVN format of the ASTC texture
+        u64 bytes{};  ///< the stand-in's memory
+        const char* kind{};
+    };
+    vk::QueryPool pool;          ///< 2 * CAPACITY timestamps
+    std::vector<Upload> uploads; ///< upload i: queries 2i and 2i + 1
+};
+
+/// Uploads of stand-ins this large or larger get a log line of their own with their GPU time.
+inline constexpr u64 BC_TIMED_LOG_BYTES = u64{16} << 20;
+
 /// Creates a scratch of `width` x `height` x `layers` texels (`bc7`: with `modes`). Throws
 /// vk::Exception.
 [[nodiscard]] std::shared_ptr<BcScratch> MakeBcScratch(const Device& device,

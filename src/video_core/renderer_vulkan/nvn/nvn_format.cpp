@@ -228,6 +228,9 @@ AstcStandin ChooseAstcStandin(const char* environment, Settings::AstcRecompressi
         if (value == "bc3") {
             return AstcStandin::Bc3;
         }
+        if (value == "bc7") {
+            return AstcStandin::Bc7;
+        }
     }
     switch (setting) {
     case Settings::AstcRecompression::Bc1:
@@ -245,6 +248,8 @@ const char* AstcStandinName(AstcStandin standin) {
         return "BC1";
     case AstcStandin::Bc3:
         return "BC3";
+    case AstcStandin::Bc7:
+        return "BC7";
     default:
         return "RGBA8";
     }
@@ -257,9 +262,17 @@ HostFormat ToBcStandin(const HostFormat& host, AstcStandin standin) {
     }
     const bool srgb = VideoCore::Surface::IsPixelFormatSRGB(host.pixel_format);
     HostFormat result = host;
-    result.format = standin == AstcStandin::Bc1
-                        ? (srgb ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK)
-                        : (srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK);
+    switch (standin) {
+    case AstcStandin::Bc1:
+        result.format = srgb ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+        break;
+    case AstcStandin::Bc7:
+        result.format = srgb ? VK_FORMAT_BC7_SRGB_BLOCK : VK_FORMAT_BC7_UNORM_BLOCK;
+        break;
+    default:
+        result.format = srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
+        break;
+    }
     result.bc_standin = true;
     result.attachable = false;
     result.storage = false;
@@ -268,16 +281,31 @@ HostFormat ToBcStandin(const HostFormat& host, AstcStandin standin) {
     return result;
 }
 
-u32 BcStandinBlockBytes(const HostFormat& host) {
+AstcStandin BcStandinOf(const HostFormat& host) {
     if (!host.bc_standin) {
-        return 0;
+        return AstcStandin::Rgba8;
     }
     switch (host.format) {
     case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
     case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
-        return 8;
+        return AstcStandin::Bc1;
     case VK_FORMAT_BC3_UNORM_BLOCK:
     case VK_FORMAT_BC3_SRGB_BLOCK:
+        return AstcStandin::Bc3;
+    case VK_FORMAT_BC7_UNORM_BLOCK:
+    case VK_FORMAT_BC7_SRGB_BLOCK:
+        return AstcStandin::Bc7;
+    default:
+        return AstcStandin::Rgba8;
+    }
+}
+
+u32 BcStandinBlockBytes(const HostFormat& host) {
+    switch (BcStandinOf(host)) {
+    case AstcStandin::Bc1:
+        return 8;
+    case AstcStandin::Bc3:
+    case AstcStandin::Bc7:
         return 16;
     default:
         return 0;
@@ -291,7 +319,11 @@ bool ViewsBcStandin(VkFormat format, VkFormat standin) {
     const auto bc3 = [](VkFormat f) {
         return f == VK_FORMAT_BC3_UNORM_BLOCK || f == VK_FORMAT_BC3_SRGB_BLOCK;
     };
-    return (bc1(format) && bc1(standin)) || (bc3(format) && bc3(standin));
+    const auto bc7 = [](VkFormat f) {
+        return f == VK_FORMAT_BC7_UNORM_BLOCK || f == VK_FORMAT_BC7_SRGB_BLOCK;
+    };
+    return (bc1(format) && bc1(standin)) || (bc3(format) && bc3(standin)) ||
+           (bc7(format) && bc7(standin));
 }
 
 VkFormat SameSizeUintFormat(u32 bytes) {

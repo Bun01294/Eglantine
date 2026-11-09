@@ -399,6 +399,8 @@ struct InFlight {
     std::unique_ptr<CounterFlight> counters;
     /// GPU timestamps of this submission (EDEN_NX2_NVN_GPU_PROFILE); null when the profiler is off.
     std::unique_ptr<GpuProf::Flight> gpu_prof;
+    /// GPU time of this submission's BC stand-in uploads; null until one is recorded.
+    std::unique_ptr<BcUploadTimes> bc_times;
 
     /// A capture of the presented picture (EDEN_NX2_FRAME_CAPTURE), written at completion.
     struct Capture {
@@ -1241,6 +1243,24 @@ struct Context::Impl {
     std::shared_ptr<BcScratch> bc_scratch;
     bool bc_scratch_failed_logged{false};
     [[nodiscard]] std::shared_ptr<BcScratch> AcquireBcScratch(u32 width, u32 height, u32 layers);
+    /// EDEN_NX2_NVN_BC7_QUALITY (nvn_bc_encode.h) for BC7 stand-ins.
+    u32 bc7_quality{BC7_QUALITY_DEFAULT};
+    /// GPU time of the BC stand-in uploads (BcUploadTimes, timestamps per submission): false when
+    /// the graphics queue has no timestamps. CompleteBcTimes (completion thread) logs the uploads
+    /// of BC_TIMED_LOG_BYTES or more and adds every one to the window ProcessPresent logs.
+    bool bc_timing{false};
+    double bc_timestamp_period{1.0};
+    u64 bc_timestamp_mask{~u64{0}};
+    struct BcTimeWindow {
+        std::atomic<u64> uploads{};
+        std::atomic<u64> untimed{};
+        std::atomic<u64> bytes{};
+        std::atomic<u64> gpu_ns{};
+        std::atomic<u64> max_ns{};
+    } bc_window;
+    u64 bc_window_first_present{};
+    void CompleteBcTimes(const BcUploadTimes& times);
+    void LogBcTimeWindow(u64 present);
     /// Block-linear untiling on the GPU (nvn_untile_gpu.h), created like the ASTC decoder on a
     /// worker at startup; uploads before it is ready untile on the CPU. Null when creation failed.
     bool untile_gpu_enabled{false};
