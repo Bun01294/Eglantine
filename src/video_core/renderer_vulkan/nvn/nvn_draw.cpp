@@ -1388,12 +1388,29 @@ void DrawContext::StageVertexRanges() {
             [](VC::Op op) { return op != VC::Op::SetRenderTargets && OpKeepsPass(op); },
             stage_scan);
     }
+    const bool diag = impl.vtxcov_diag;
+    if (diag) {
+        VtxCovNoteScan(ahead);
+    }
+    const auto outcome = [&](const VC::BufferRange& range, VtxCov reason) {
+        if (diag) {
+            stage_outcomes.insert_or_assign(range.address, StageOutcome{reason, range.size});
+        }
+    };
     // Few draws do not pay for a copy of their own, but a range a pool mirror serves costs only
     // its stale pages (usually none): the pass is scanned for those whatever its size.
     const bool copy_worth = stage_scan.draws >= VERTEX_STAGE_LIMITS.min_draws;
     if (!copy_worth && !impl.vtx_mirror) {
+        if (diag) {
+            for (const VC::BufferRange& range : stage_scan.ranges) {
+                outcome(range, VtxCov::FewDraws);
+            }
+        }
         return;
     }
+    // EDEN_NX2_TRY_VTXCOV_BOUND raises the bound: the copies are exact at any size.
+    const u64 mirror_copy_bound =
+        (impl.vtxcov & VTXCOV_BOUND) != 0 ? VTXCOV_COPY_BYTES : VTX_MIRROR_COPY_BYTES;
     stage_sources.clear();
     u64 mirror_copy_bytes = 0;
     u64 reused = 0;
@@ -1405,6 +1422,7 @@ void DrawContext::StageVertexRanges() {
             if (it->second.size >= range.size) {
                 ++reused;
                 reused_bytes += range.size;
+                outcome(range, it->second.mirror ? VtxCov::Mirror : VtxCov::Staged);
                 continue;
             }
             staged_vertex.erase(it);
@@ -1412,9 +1430,13 @@ void DrawContext::StageVertexRanges() {
         Pool* pool = nullptr;
         u64 offset = 0;
         // Only host memory is worth a copy; ranges the draws cannot resolve stay theirs to report.
-        if (!impl.ResolveBuffer(range.address, range.size, pool, offset) ||
-            pool->pending.load(std::memory_order_acquire) ||
+        if (!impl.ResolveBuffer(range.address, range.size, pool, offset)) {
+            continue;
+        }
+        if (pool->pending.load(std::memory_order_acquire) ||
             pool->backing != Pool::Backing::Imported) {
+            outcome(range, pool->backing != Pool::Backing::Imported ? VtxCov::Device
+                                                                     : VtxCov::Pending);
             continue;
         }
         // A live storage shadow holds newer bytes than the pool; a draw that reads them ends the
@@ -1423,6 +1445,7 @@ void DrawContext::StageVertexRanges() {
             return shadow.pool == pool && offset < shadow.end && shadow.begin < offset + range.size;
         });
         if (shadowed) {
+            outcome(range, VtxCov::Shadowed);
             continue;
         }
         if (!pool->vram_mirror && impl.vtx_mirror) {
@@ -1430,10 +1453,11 @@ void DrawContext::StageVertexRanges() {
         }
         if (PoolMirror* const mirror = pool->vram_mirror.get()) {
             // The pool's VRAM mirror serves the range: only its stale pages are copied in, and
-            // no more than VTX_MIRROR_COPY_BYTES of them per pass (the later passes take the
-            // rest; the draws of this one read the range from guest memory).
-            if (impl.vtx_mirror && mirror_copy_bytes >= VTX_MIRROR_COPY_BYTES) {
+            // no more than the bound of them per pass (the later passes take the rest; the draws
+            // of this one read the range from guest memory).
+            if (impl.vtx_mirror && mirror_copy_bytes >= mirror_copy_bound) {
                 impl.stats.vram_vertex_budget_skips.fetch_add(1, std::memory_order_relaxed);
+                outcome(range, VtxCov::CopyBound);
                 continue;
             }
             mirror_runs.clear();
@@ -1447,14 +1471,18 @@ void DrawContext::StageVertexRanges() {
                                                        .buffer = *mirror->buffer,
                                                        .offset = offset,
                                                        .pool = pool,
-                                                       .pool_offset = offset});
+                                                       .pool_offset = offset,
+                                                       .mirror = true});
             impl.stats.vram_bindings.fetch_add(1, std::memory_order_relaxed);
             impl.stats.vram_vertex_ranges.fetch_add(1, std::memory_order_relaxed);
+            outcome(range, VtxCov::Mirror);
             continue;
         }
         if (!copy_worth) {
+            outcome(range, diag ? impl.ReadOnlyMirrorMiss(*pool) : VtxCov::Other);
             continue;
         }
+        outcome(range, VtxCov::Staged);
         stage_sources.push_back({.pool = std::bit_cast<u64>(pool),
                                  .offset = offset,
                                  .size = range.size,
@@ -1484,6 +1512,13 @@ void DrawContext::StageVertexRanges() {
                                              .size = span.end - span.begin}});
         stage_span_dst.push_back({buffer, staged_offset});
         bytes += span.end - span.begin;
+    }
+    if (diag) {
+        for (const VertexStageSource& source : stage_sources) {
+            if (source.span >= stage_span_dst.size()) {
+                outcome({source.address, source.size}, VtxCov::NoDeviceMemory);
+            }
+        }
     }
     if (stage_copies.empty()) {
         return;
@@ -1587,6 +1622,96 @@ void DrawContext::StageVertexRanges() {
     counters.vertex_stage_ranges += ranges;
     counters.vertex_stage_regions += stage_copies.size();
     counters.vertex_stage_bytes += bytes;
+}
+
+void DrawContext::VtxCovNoteScan(std::span<const u64> ahead) {
+    stage_outcomes.clear();
+    stage_unscanned = VtxCov::NotScanned;
+    if (stage_scan.capped) {
+        stage_unscanned = VtxCov::TotalCap;
+        return;
+    }
+    const u64* const end = stage_scan.end;
+    if (end == nullptr || end < ahead.data() || end > ahead.data() + ahead.size()) {
+        return;
+    }
+    VC::RecordReader reader{end, static_cast<size_t>(ahead.data() + ahead.size() - end)};
+    const VC::RecordHeader* const header = reader.Next();
+    if (header == nullptr) {
+        stage_unscanned = VtxCov::NotScannedEnd; // the list's End (or the end of its records)
+        return;
+    }
+    switch (VC::RecordOp(header)) {
+    case VC::Op::SetRenderTargets:
+        stage_unscanned = VtxCov::NotScannedTargets;
+        break;
+    case VC::Op::CallList:
+        stage_unscanned = VtxCov::NotScannedCall;
+        break;
+    default:
+        break;
+    }
+}
+
+VtxCov DrawContext::VtxCovServeOrMiss(BufferRef& ref, u64 address, u64 size, bool indirect_index,
+                                      const DrawPlan& plan, VtxCov found) {
+    Pool& pool = *ref.pool;
+    // EDEN_NX2_TRY_VTXCOV_INPASS / _SHADERWRITES (DESIGN.md "Vertex and index coverage"): the
+    // pool's mirror serves the range where it is current; its pages were copied in before this
+    // pass began (copy-ins are recorded outside passes and ordered by the pass begin's barrier)
+    // and nothing recorded since wrote them (NotePoolWrite and raw-writing draws invalidate at
+    // record time, the page tracker sees the guest CPU). Else its pages join the pool's prefetch
+    // set and PrefetchMirrors copies them in at the next pass begin.
+    const u32 bind_switch = pass_shader_writes ? VTXCOV_SHADER_WRITES : VTXCOV_INPASS;
+    if ((impl.vtxcov & bind_switch) != 0 && size <= VTXCOV_BIND_MAX_BYTES &&
+        !pool.pending.load(std::memory_order_acquire)) {
+        PoolMirror* const mirror = impl.VramMirror(pool, true, false);
+        if (mirror != nullptr) {
+            // A read-only mirror does not hold what this draw's raw stores write.
+            if (!mirror->storage && plan.raw_global_writes) {
+                return VtxCov::RawWrites;
+            }
+            if (impl.MirrorCurrent(pool, ref.pool_offset, size)) {
+                ref.buffer = *mirror->buffer;
+                ref.offset = ref.pool_offset;
+                impl.stats.vram_bindings.fetch_add(1, std::memory_order_relaxed);
+                return VtxCov::MirrorBind;
+            }
+            mirror->prefetch = true;
+            if (!mirror->wanted) {
+                mirror->wanted = std::make_unique<MirrorPages>(pool.size);
+            }
+            mirror->wanted->Set(ref.pool_offset, size);
+            return VtxCov::MirrorStale;
+        }
+    }
+    if (!impl.vtxcov_diag) {
+        return VtxCov::Other;
+    }
+    if (!Debug::Get().vertex_stage) {
+        return VtxCov::StageOff;
+    }
+    if (pass_shader_writes) {
+        return VtxCov::ShaderWrites;
+    }
+    if (found == VtxCov::SizeShort) {
+        return found;
+    }
+    if (indirect_index) {
+        return VtxCov::IndexIndirect;
+    }
+    if (size > VERTEX_STAGE_LIMITS.max_range_bytes) {
+        return VtxCov::TooLarge;
+    }
+    const auto it = stage_outcomes.find(address);
+    if (it == stage_outcomes.end()) {
+        return stage_unscanned;
+    }
+    if (it->second.size < size) {
+        return VtxCov::SizeShort;
+    }
+    // Staged by the scan but not found at the bind: a pool write dropped the copy since.
+    return VtxCovServed(it->second.reason) ? VtxCov::Dropped : it->second.reason;
 }
 
 VkRect2D DrawContext::ClearRect() const {
@@ -2188,30 +2313,70 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
         }
     }
     host->HostBeforeDraw();
-    if (!staged_vertex.empty() && !pass_shader_writes) {
-        // Streams (and the index buffer) of imported pools whose range the pass staged read the
-        // device-local copy. Once a draw of the pass wrote through shaders, the pool may hold newer
-        // bytes than the copy.
+    // Streams (and the index buffer) of imported pools whose range the pass staged read the
+    // device-local copy. Once a draw of the pass wrote through shaders, the pool may hold newer
+    // bytes than the copy. EDEN_NX2_NVN_VTXCOV_DIAG counts every bind by where it is read from;
+    // EDEN_NX2_TRY_VTXCOV_* serve more of them from pool mirrors (VtxCovServeOrMiss).
+    const bool use_staged = !staged_vertex.empty() && !pass_shader_writes;
+    const bool vtxcov = impl.vtxcov_diag || impl.vtxcov != 0;
+    if (use_staged || vtxcov) {
+        // True when the staged copy serves the range; `found` says why not otherwise.
+        const auto take_staged = [&](BufferRef& ref, u64 address, u64 size, VtxCov& found) {
+            found = VtxCov::Other;
+            if (!use_staged) {
+                return false;
+            }
+            const auto it = staged_vertex.find(address);
+            if (it == staged_vertex.end()) {
+                return false;
+            }
+            if (it->second.size < size) {
+                found = VtxCov::SizeShort;
+                return false;
+            }
+            ref.buffer = it->second.buffer;
+            ref.offset = it->second.offset;
+            found = it->second.mirror ? VtxCov::Mirror : VtxCov::Staged;
+            return true;
+        };
         for (u32 s = 0; s < MAX_VERTEX_STREAMS; ++s) {
-            if (!((used_streams >> s) & 1) || vertex[s].pool == nullptr ||
-                vertex[s].pool->backing != Pool::Backing::Imported) {
+            if (!((used_streams >> s) & 1) || vertex[s].pool == nullptr) {
                 continue;
             }
-            const auto it = staged_vertex.find(vertex_buffers[s].address);
-            if (it == staged_vertex.end() || it->second.size < vertex_buffers[s].size) {
+            const u64 size = vertex_buffers[s].size;
+            if (vertex[s].pool->backing != Pool::Backing::Imported) {
+                if (impl.vtxcov_diag) {
+                    impl.NoteVtxCov(false, VtxCov::Device, size);
+                }
                 continue;
             }
-            vertex[s].buffer = it->second.buffer;
-            vertex[s].offset = it->second.offset;
-            ++counters.vertex_stage_binds;
+            VtxCov reason;
+            if (take_staged(vertex[s], vertex_buffers[s].address, size, reason)) {
+                ++counters.vertex_stage_binds;
+            } else if (vtxcov) {
+                reason = VtxCovServeOrMiss(vertex[s], vertex_buffers[s].address, size, false, plan,
+                                           reason);
+            }
+            if (impl.vtxcov_diag) {
+                impl.NoteVtxCov(false, reason, size);
+            }
         }
-        if (index && index_ref.pool != nullptr &&
-            index_ref.pool->backing == Pool::Backing::Imported) {
-            if (const auto it = staged_vertex.find(index->address);
-                it != staged_vertex.end() && it->second.size >= index->bytes) {
-                index_ref.buffer = it->second.buffer;
-                index_ref.offset = it->second.offset;
-                ++counters.index_stage_binds;
+        if (index && index_ref.pool != nullptr) {
+            if (index_ref.pool->backing != Pool::Backing::Imported) {
+                if (impl.vtxcov_diag) {
+                    impl.NoteVtxCov(true, VtxCov::Device, index->bytes);
+                }
+            } else {
+                VtxCov reason;
+                if (take_staged(index_ref, index->address, index->bytes, reason)) {
+                    ++counters.index_stage_binds;
+                } else if (vtxcov) {
+                    reason = VtxCovServeOrMiss(index_ref, index->address, index->bytes,
+                                               element_count == 0, plan, reason);
+                }
+                if (impl.vtxcov_diag) {
+                    impl.NoteVtxCov(true, reason, index->bytes);
+                }
             }
         }
     }

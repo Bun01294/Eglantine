@@ -221,6 +221,15 @@ Context::Impl::Impl(const Device& device_, std::mutex& submit_mutex_,
     // The uniform mirrors are pool mirrors: they need the mode's machinery (and the write tracker).
     ubo_mirror = options.ubo_mirror.value_or(Debug::Get().try_ubo_mirror) && pool_mirror_mode != 0;
     vtx_mirror = options.vtx_mirror.value_or(Debug::Get().try_vtx_mirror) && pool_mirror_mode != 0;
+    vtxcov = vtx_mirror ? options.vtxcov.value_or(Debug::Get().try_vtxcov) & VTXCOV_ALL : 0u;
+    vtxcov_diag = options.vtxcov_diag.value_or(Debug::Get().vtxcov_diag);
+    if (vtxcov != 0 || vtxcov_diag) {
+        LOG_INFO(Render_Vulkan, "[nvn] vtxcov: switches {} (EDEN_NX2_TRY_VTXCOV_*), diag {}{}",
+                 VtxCovSwitchNames(vtxcov), vtxcov_diag ? "on" : "off",
+                 options.vtxcov.value_or(Debug::Get().try_vtxcov) != 0 && !vtx_mirror
+                     ? "; the switches need EDEN_NX2_TRY_VTX_MIRROR=1 and pool mirrors"
+                     : "");
+    }
     dispatch_order_by_barriers =
         options.dispatch_order_by_barriers.value_or(Debug::Get().try_dispatch_order);
     flush_tracked = options.flush_tracked.value_or(Debug::Get().try_flush_tracked);
@@ -1456,7 +1465,58 @@ ContextStats Context::Stats() const {
         stats.counter_reports_samples_uncounted = c.reports_samples_uncounted.load(relaxed);
         stats.counter_occlusion_folds = c.occlusion_folds.load(relaxed);
     }
+    for (size_t r = 0; r < VTXCOV_REASONS; ++r) {
+        stats.vtxcov_binds[r] =
+            impl->vtxcov_binds[0][r].load(relaxed) + impl->vtxcov_binds[1][r].load(relaxed);
+    }
     return stats;
+}
+
+VtxCovCounts Context::Impl::VtxCovSnapshot() const {
+    VtxCovCounts counts;
+    for (size_t kind = 0; kind < 2; ++kind) {
+        for (size_t r = 0; r < VTXCOV_REASONS; ++r) {
+            counts.binds[kind][r] = vtxcov_binds[kind][r].load(std::memory_order_relaxed);
+            counts.bytes[kind][r] = vtxcov_bytes[kind][r].load(std::memory_order_relaxed);
+        }
+    }
+    return counts;
+}
+
+void Context::Impl::VtxCovOnPresent() {
+    const auto now = std::chrono::steady_clock::now();
+    const u64 presents = stats.presents.load(std::memory_order_relaxed);
+    const u64 copy_in = stats.vram_copy_in_bytes.load(std::memory_order_relaxed);
+    const u64 staged =
+        draw_resources ? draw_resources->counters.vertex_stage_bytes.load(std::memory_order_relaxed)
+                       : 0;
+    if (vtxcov_logged_at == std::chrono::steady_clock::time_point{}) {
+        vtxcov_logged_at = now;
+        vtxcov_logged = VtxCovSnapshot();
+        vtxcov_logged_copy_in = copy_in;
+        vtxcov_logged_staged = staged;
+        vtxcov_logged_presents = presents;
+        return;
+    }
+    if (now - vtxcov_logged_at < std::chrono::seconds{10} || presents == vtxcov_logged_presents) {
+        return;
+    }
+    const VtxCovCounts total = VtxCovSnapshot();
+    VtxCovCounts delta;
+    for (size_t kind = 0; kind < 2; ++kind) {
+        for (size_t r = 0; r < VTXCOV_REASONS; ++r) {
+            delta.binds[kind][r] = total.binds[kind][r] - vtxcov_logged.binds[kind][r];
+            delta.bytes[kind][r] = total.bytes[kind][r] - vtxcov_logged.bytes[kind][r];
+        }
+    }
+    LOG_INFO(Render_Vulkan, "[nvn] vtxcov: {}",
+             FormatVtxCov(delta, presents - vtxcov_logged_presents, copy_in - vtxcov_logged_copy_in,
+                          staged - vtxcov_logged_staged, vtxcov));
+    vtxcov_logged_at = now;
+    vtxcov_logged = total;
+    vtxcov_logged_copy_in = copy_in;
+    vtxcov_logged_staged = staged;
+    vtxcov_logged_presents = presents;
 }
 
 void Context::Impl::WriteCapture(const InFlight::Capture& capture) const {

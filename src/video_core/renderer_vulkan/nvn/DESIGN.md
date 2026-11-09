@@ -1507,6 +1507,78 @@ reads is a `PoolMirror` with `storage == false`:
   `pool_mirror.cpp` covers `MirrorPages::Set` / `TakeInvalidWithin`; `core/page_tracker.cpp`
   covers write epochs.
 
+### Vertex and index coverage (`nvn_vtxcov.{h,cpp}`, `EDEN_NX2_NVN_VTXCOV_DIAG`, `EDEN_NX2_TRY_VTXCOV_*`)
+
+OoT Kokiri (RTX 5080, build 44, standing still): ~42 ms of GPU per frame, latency-bound; the cost split puts ~5 ms
+on vertex+index placement, but with `TRY_VTX_MIRROR` + `TRY_RO_MIRROR_EXACT` only ~800 of ~4,000 vertex/index
+ranges per frame came from VRAM and the GPU time did not move. **Diagnostic** (`EDEN_NX2_NVN_VTXCOV_DIAG=1`, on by
+itself with `TRY_VTX_MIRROR` or any `TRY_VTXCOV` switch): every vertex stream and index buffer a draw binds
+(`PrepareDraw`, after `PrepareOutsidePass`/`BeginPass`) is counted by `VtxCov`, with its bound bytes, separately for
+vertex and index. Served (device-local): `staged` (a staging copy), `mirror` (a pool mirror through the pass's
+scan), `mirror_bind` (a pool mirror at the bind, switches below), `device` (the pool itself is device-local).
+Not served, read from imported memory:
+
+| Reason | Meaning |
+|---|---|
+| `stage_off` | `EDEN_NX2_NVN_VERTEX_STAGE=0` |
+| `shader_writes` | a draw of the pass wrote through shaders (storage, image or raw stores): staged copies are not used |
+| `too_large` | over 1 MiB (`max_range_bytes`), the scan leaves it out |
+| `total_cap` | the scan reached 64 MiB first |
+| `not_scanned_rt` / `_call` / `_end` / `not_scanned` | bound past the op that ended the pass's scan while the pass went on: a SetRenderTargets that kept the targets, a CallList (the called list's records), the end of the list; other |
+| `index_indirect` | an indirect draw's index buffer (count on the GPU, never staged) |
+| `pending`, `shadowed` | the pool was still being backed / a live storage shadow covered the range at the scan |
+| `few_draws` | a pass under 32 draws without pool mirrors |
+| `no_mirror_size` / `_budget` / `_align` / `_refused` | a pass under 32 draws and `VramMirror` makes no read-only mirror: pool over `TRY_STORAGE_VRAM_MAX_MIB`, read-only half of the budget used, pool not page aligned, refused for good earlier (budget, tracker, allocation, or the storage size limit when a storage use came first) |
+| `no_device_memory` | no shadow chunk for its staging copy |
+| `copy_bound` | the pass's mirror copy-ins reached their bound first |
+| `mirror_stale`, `raw_writes` | bind-time serving (below): the mirror is not current there / the draw stores through raw pointers into a read-only mirror's pool |
+| `dropped`, `size_short` | staged by the scan but the copy was dropped since (a pool write) / staged with fewer bytes |
+
+The scan records what it did with each range (`DrawContext::stage_outcomes`) and the op that ended it
+(`stage_unscanned`); a bind that finds no copy looks its address up there. Every 10 s of presents the replay thread
+logs `[nvn] vtxcov: presents=N per present, vertex/index: served=v/i{reason=v/i,..} not_served=v/i{..} bytes
+served_KiB=v/i not_served_KiB=v/i{..} copy_in_KiB=.. stage_copy_KiB=.. switches=..` (per present, reasons with no
+bind left out; `copy_in` the pool mirror copy-ins, `stage_copy` the staging gathers). Totals: `ContextStats::vtxcov_binds`.
+
+**Switches** (candidates, off by default; they act with `TRY_VTX_MIRROR` and pool mirrors; `EDEN_NX2_TRY_VTXCOV=1`
+sets all four, the startup line `[nvn] vtxcov: switches ...` names them):
+
+- `EDEN_NX2_TRY_VTXCOV_INPASS=1`: a vertex/index range of an imported pool that no staged copy serves (not scanned,
+  indirect index, past the copy bound, a pass whose copy was dropped) is served at its bind from the pool's mirror
+  (made read-only at the bind if needed) when `MirrorCurrent` holds for it; otherwise its pages go into
+  `PoolMirror::wanted` and `PrefetchMirrors` copies the stale ones in at every pass begin (it now runs for these
+  pools without `TRY_UBO_MIRROR`). OoT draws the same geometry every frame, so the second frame finds it current.
+  Ranges over 16 MiB (`VTXCOV_BIND_MAX_BYTES`: an indirect draw's index range runs to the end of its pool) are left
+  alone. Why it is exact: a page is valid only after a copy-in, and copy-ins are recorded outside passes and ordered
+  before every later vertex fetch by the all-stages barrier of the next pass begin (`HostFlushBarrier`, whose first
+  scope also takes earlier command buffers of the queue) or by the staging scan's own `TRANSFER -> VERTEX_INPUT`
+  barrier; every writer since is seen at record time: replay writes through the pool's buffer (`NotePoolWrite`),
+  raw-writing draws (`MirrorInvalidateReadOnly`, or the write-through alias with `TRY_RO_MIRROR_EXACT`), the guest
+  CPU (page tracker / write epoch). A use overlapping a live storage shadow or mirror entry ends it before the bind
+  (`ClassifyShadows`). The same rule already serves read-only storage ranges inside a pass. A draw with raw stores
+  into a read-only mirror's pool is not served (`raw_writes`). Not a cost: a prefetch copies only stale wanted pages.
+- `EDEN_NX2_TRY_VTXCOV_SHADERWRITES=1`: the same bind-time serving after a draw of the pass wrote through shaders
+  (staged copies stay unused there). Why it is exact: a shader store reaches pool bytes only through a descriptor
+  write (noted per draw at record time, `NotePoolWrite`, or redirected into a mirror entry that a vertex use ends
+  first) or a raw store (invalidates read-only mirrors at record time, or writes the mirror through with
+  `TRY_RO_MIRROR_EXACT`; storage mirrors are the raw table's target and hold the newest bytes), so a current page
+  holds what the guest bytes hold. A store and a later vertex fetch in the same pass are unordered on the console
+  too (NVN orders them only through a Barrier, which ends the pass).
+- `EDEN_NX2_TRY_VTXCOV_BOUND=1`: the stale pages a pass copies into mirrors for its scan stop at 32 MiB
+  (`VTXCOV_COPY_BYTES`) instead of 4 MiB. Cost only: copies are exact at any size; a pool's first use may copy more
+  in one pass.
+- `EDEN_NX2_TRY_VTXCOV_BIGPOOL=1`: read-only mirrors also for pools over `TRY_STORAGE_VRAM_MAX_MIB` (64 MiB; the
+  read-only half of `POOL_MIRROR_MAX_MIB` still bounds them). The limit is there for storage mirrors (raw-global
+  dispatches copy in every stale page of each one and raw-writing draws snapshot it whole); read-only mirrors are
+  not in the raw table and copy in only used pages. Such a mirror is never promoted and the pool gets no storage
+  mirror (`VramMirror(..., storage)` returns null, not refused for good): its storage ranges stay in guest memory,
+  their writes make the mirror's pages stale (`NotePoolWrite`), as for any read-only mirror.
+
+Tests: `compute_vulkan.cpp` "NVN vertex coverage" (a stream bound after a SetRenderTargets that kept the pass is
+`not_scanned_rt`, and `mirror_bind` from the next pass on with INPASS, guest writes seen through the prefetch;
+BIGPOOL mirrors a pool over the limit and does not promote it), `pool_mirror.cpp` (the line), `pass_state.cpp`
+(`VertexStageScan::capped`).
+
 ### Uniform snapshot at submit (`EDEN_NX2_NVN_UBO_SNAPSHOT`, `uniform_snapshot.*`, `nvn_uniform_snapshot.*`)
 
 The replay runs a frame or more behind the game, and uniform bindings name guest memory directly. A game

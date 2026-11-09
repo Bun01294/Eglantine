@@ -79,6 +79,7 @@ struct VertexStageScan {
     std::vector<VideoCommon::Nvn::BufferRange> ranges;
     u32 draws{}; ///< Draw / DrawIndexed records before the scan stopped
     u64 bytes{}; ///< sum of the ranges' sizes
+    bool capped{}; ///< a range (or a larger size of one) was left out for max_total_bytes
     /// Where the scan stopped: the first record it did not read (the op that ends the window, the
     /// list's End) or the end of the records; null for an empty list.
     const u64* end{};
@@ -89,6 +90,7 @@ struct VertexStageScan {
         index.clear();
         draws = 0;
         bytes = 0;
+        capped = false;
         end = nullptr;
     }
 };
@@ -162,6 +164,7 @@ void ScanPassVertexRanges(std::span<const u64> records,
         if (inserted) {
             if (out.bytes + range.size > limits.max_total_bytes) {
                 out.index.erase(it);
+                out.capped = true;
                 return;
             }
             out.ranges.push_back(range);
@@ -169,9 +172,13 @@ void ScanPassVertexRanges(std::span<const u64> records,
             return;
         }
         VC::BufferRange& known = out.ranges[it->second];
-        if (range.size > known.size && out.bytes + (range.size - known.size) <= limits.max_total_bytes) {
-            out.bytes += range.size - known.size;
-            known.size = range.size;
+        if (range.size > known.size) {
+            if (out.bytes + (range.size - known.size) <= limits.max_total_bytes) {
+                out.bytes += range.size - known.size;
+                known.size = range.size;
+            } else {
+                out.capped = true;
+            }
         }
     };
     for (const VC::BufferRange& range : bound) {

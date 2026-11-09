@@ -20,6 +20,7 @@
 #include "common/logging.h"
 #include "video_core/renderer_vulkan/nvn/nvn_debug.h"
 #include "video_core/renderer_vulkan/nvn/nvn_gpu_profile.h"
+#include "video_core/renderer_vulkan/nvn/nvn_vtxcov.h"
 
 namespace Vulkan::Nvn::Debug {
 namespace {
@@ -146,6 +147,15 @@ Config Read() {
     config.try_stage_span = EnvFlag("EDEN_NX2_TRY_STAGE_SPAN");
     config.try_ubo_mirror = EnvFlag("EDEN_NX2_TRY_UBO_MIRROR");
     config.try_vtx_mirror = EnvFlag("EDEN_NX2_TRY_VTX_MIRROR");
+    if (EnvFlag("EDEN_NX2_TRY_VTXCOV")) {
+        config.try_vtxcov = VTXCOV_ALL;
+    }
+    config.try_vtxcov |= EnvFlag("EDEN_NX2_TRY_VTXCOV_INPASS") ? VTXCOV_INPASS : 0u;
+    config.try_vtxcov |= EnvFlag("EDEN_NX2_TRY_VTXCOV_SHADERWRITES") ? VTXCOV_SHADER_WRITES : 0u;
+    config.try_vtxcov |= EnvFlag("EDEN_NX2_TRY_VTXCOV_BOUND") ? VTXCOV_BOUND : 0u;
+    config.try_vtxcov |= EnvFlag("EDEN_NX2_TRY_VTXCOV_BIGPOOL") ? VTXCOV_BIGPOOL : 0u;
+    config.vtxcov_diag = EnvFlag("EDEN_NX2_NVN_VTXCOV_DIAG", config.try_vtx_mirror ||
+                                                                 config.try_vtxcov != 0);
     config.try_raw_keep_entries = EnvFlag("EDEN_NX2_TRY_RAW_KEEP_ENTRIES", true);
     config.diag_ro_raw_keep = EnvFlag("EDEN_NX2_NVN_DIAG_RO_RAW_KEEP");
     if (const char* mode = std::getenv("EDEN_NX2_NVN_DEPTH_MODE"); mode != nullptr && *mode != '\0') {

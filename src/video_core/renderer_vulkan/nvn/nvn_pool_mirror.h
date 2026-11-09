@@ -92,12 +92,14 @@ struct PoolMirror {
     /// This mirror is in the current raw-store alias table: read-only mirrors are kept current,
     /// and storage mirrors also write to imported guest memory. False if excluded from the table.
     bool written_through{false};
-    /// Made for uniform buffer bindings (EDEN_NX2_TRY_UBO_MIRROR): every stale page of `wanted` is
-    /// copied in at a pass begin (DrawContext::PrefetchMirrors), so the draws of the pass find the
-    /// pages earlier uniform bindings used current instead of reading host memory.
+    /// Made for uniform buffer bindings (EDEN_NX2_TRY_UBO_MIRROR), or a vertex/index range found it
+    /// stale at its bind (EDEN_NX2_TRY_VTXCOV_INPASS): every stale page of `wanted` is copied in at
+    /// a pass begin (DrawContext::PrefetchMirrors), so the draws of the pass find the pages earlier
+    /// bindings used current instead of reading host memory.
     bool prefetch{false};
-    /// The pages uniform bindings used so far (bits set by DrawContext::ApplyMirrors): the
-    /// prefetch's working set, which bounds its copies (null until the first use).
+    /// The pages those bindings used so far (bits set by DrawContext::ApplyMirrors and
+    /// VtxCovServeOrMiss): the prefetch's working set, which bounds its copies (null until the
+    /// first use).
     std::unique_ptr<MirrorPages> wanted;
     /// The tracker's write counter of the pool's registration (GuestMemory::WriteEpoch) and its
     /// value from before the last whole-pool collect of CPU writes: while they are equal no page

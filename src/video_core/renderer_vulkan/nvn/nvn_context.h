@@ -12,6 +12,7 @@
 #include "common/common_types.h"
 #include "core/frontend/framebuffer_layout.h"
 #include "video_core/nvn/sink.h"
+#include "video_core/renderer_vulkan/nvn/nvn_vtxcov.h"
 
 namespace Core::Frontend {
 class EmuWindow;
@@ -131,6 +132,10 @@ struct ContextOptions {
     /// mirrors for vertex, index and uniform ranges; they also need `pool_mirror` != 0).
     std::optional<bool> vtx_mirror{};
     std::optional<bool> ubo_mirror{};
+    /// Test overrides for EDEN_NX2_TRY_VTXCOV_* (VtxCovSwitch bits, nvn_vtxcov.h; they need
+    /// `vtx_mirror`) and EDEN_NX2_NVN_VTXCOV_DIAG.
+    std::optional<u32> vtxcov{};
+    std::optional<bool> vtxcov_diag{};
     /// Dispatches are ordered after earlier dispatches' shader writes only by the game's barriers
     /// (NVN semantics; DESIGN.md "Dispatch ordering"). Unset: EDEN_NX2_TRY_DISPATCH_ORDER decides.
     std::optional<bool> dispatch_order_by_barriers{};
@@ -205,6 +210,8 @@ struct ContextStats {
     u64 vram_raw_alias_rebuilds{};
     u64 vram_vertex_ranges{};
     u64 vram_vertex_budget_skips{};
+    /// EDEN_NX2_NVN_VTXCOV_DIAG: vertex and index binds (summed) by VtxCov (nvn_vtxcov.h).
+    std::array<u64, VTXCOV_REASONS> vtxcov_binds{};
     u64 vram_flush_pages_kept{};   ///< flushed pages a mirror kept (EDEN_NX2_TRY_FLUSH_TRACKED)
     u64 vram_flush_pages_taken{};  ///< flushed pages the mirror had to copy in again
     u64 pools_device_local{};

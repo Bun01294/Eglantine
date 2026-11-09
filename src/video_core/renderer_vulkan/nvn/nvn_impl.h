@@ -1160,6 +1160,30 @@ struct Context::Impl {
     /// are served from (read-only) pool mirrors, which StageVertexRanges creates and keeps
     /// current page by page.
     bool vtx_mirror{false};
+    /// ContextOptions::vtxcov, else EDEN_NX2_TRY_VTXCOV_*: VtxCovSwitch bits (nvn_vtxcov.h); 0
+    /// unless vtx_mirror.
+    u32 vtxcov{0};
+    /// ContextOptions::vtxcov_diag, else EDEN_NX2_NVN_VTXCOV_DIAG: vertex/index binds are counted
+    /// by VtxCov (`vtxcov_counts`) and logged every 10 s of presents (VtxCovOnPresent).
+    bool vtxcov_diag{false};
+    std::array<std::array<std::atomic<u64>, VTXCOV_REASONS>, 2> vtxcov_binds{};
+    std::array<std::array<std::atomic<u64>, VTXCOV_REASONS>, 2> vtxcov_bytes{};
+    /// The counters, copy-in and staging bytes and presents at the last `[nvn] vtxcov:` line.
+    VtxCovCounts vtxcov_logged{};
+    u64 vtxcov_logged_copy_in{};
+    u64 vtxcov_logged_staged{};
+    u64 vtxcov_logged_presents{};
+    std::chrono::steady_clock::time_point vtxcov_logged_at{};
+    void NoteVtxCov(bool index, VtxCov reason, u64 bytes) {
+        const size_t r = static_cast<size_t>(reason);
+        vtxcov_binds[index ? 1 : 0][r].fetch_add(1, std::memory_order_relaxed);
+        vtxcov_bytes[index ? 1 : 0][r].fetch_add(bytes, std::memory_order_relaxed);
+    }
+    [[nodiscard]] VtxCovCounts VtxCovSnapshot() const;
+    /// Every present (replay thread): the `[nvn] vtxcov:` line once 10 s passed since the last.
+    void VtxCovOnPresent();
+    /// Why VramMirror(pool, true, false) makes no read-only mirror for `pool` (EDEN_NX2_NVN_VTXCOV_DIAG).
+    [[nodiscard]] VtxCov ReadOnlyMirrorMiss(const Pool& pool) const;
     /// ContextOptions::try_storage_vram, else EDEN_NX2_TRY_STORAGE_VRAM.
     bool try_storage_vram{false};
     u64 try_storage_vram_max_bytes{u64{64} << 20};

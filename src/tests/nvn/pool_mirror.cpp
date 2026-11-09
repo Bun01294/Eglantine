@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Vortex727 (FUKKO)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// Pool mirror page bookkeeping (nvn_pool_mirror.h). The GPU paths are in compute_vulkan.cpp
-// ("NVN pool mirror").
+// Pool mirror page bookkeeping (nvn_pool_mirror.h) and the vertex coverage line (nvn_vtxcov.h).
+// The GPU paths are in compute_vulkan.cpp ("NVN pool mirror", "NVN vertex coverage").
 
 #include <utility>
 #include <vector>
@@ -10,6 +10,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "video_core/renderer_vulkan/nvn/nvn_pool_mirror.h"
+#include "video_core/renderer_vulkan/nvn/nvn_vtxcov.h"
 
 namespace {
 
@@ -137,4 +138,30 @@ TEST_CASE("NVN pool mirror pages: a pool that ends inside a word keeps its last 
     REQUIRE(runs.size() == 1);
     CHECK(runs[0].first == 60 * PAGE);
     CHECK(runs[0].second == 70 * PAGE - 100);
+}
+
+TEST_CASE("NVN vertex coverage: the vtxcov line is per present, vertex/index, reasons that happened",
+          "[nvn]") {
+    using Vulkan::Nvn::VtxCov;
+    const auto at = [](VtxCov reason) { return static_cast<size_t>(reason); };
+    Vulkan::Nvn::VtxCovCounts counts;
+    counts.binds[0][at(VtxCov::Staged)] = 10;
+    counts.bytes[0][at(VtxCov::Staged)] = 10 * 1024;
+    counts.binds[1][at(VtxCov::Mirror)] = 2;
+    counts.bytes[1][at(VtxCov::Mirror)] = 2 * 1024;
+    counts.binds[0][at(VtxCov::NotScannedTargets)] = 4;
+    counts.bytes[0][at(VtxCov::NotScannedTargets)] = 4 * 4096;
+    counts.binds[1][at(VtxCov::IndexIndirect)] = 6;
+    counts.bytes[1][at(VtxCov::IndexIndirect)] = 6 * 1024;
+    CHECK(Vulkan::Nvn::FormatVtxCov(counts, 2, 8192, 4096,
+                                    Vulkan::Nvn::VTXCOV_INPASS | Vulkan::Nvn::VTXCOV_BOUND) ==
+          "presents=2 per present, vertex/index: served=5.0/1.0{staged=5.0/0.0,mirror=0.0/1.0} "
+          "not_served=2.0/3.0{not_scanned_rt=2.0/0.0,index_indirect=0.0/3.0} bytes "
+          "served_KiB=5/1 not_served_KiB=8/3{not_scanned_rt=8/0,index_indirect=0/3} "
+          "copy_in_KiB=4 stage_copy_KiB=2 switches=inpass,bound");
+    CHECK(Vulkan::Nvn::VtxCovSwitchNames(0) == "none");
+    CHECK(Vulkan::Nvn::VtxCovSwitchNames(Vulkan::Nvn::VTXCOV_ALL) ==
+          "inpass,shaderwrites,bound,bigpool");
+    CHECK(Vulkan::Nvn::VtxCovServed(VtxCov::Device));
+    CHECK_FALSE(Vulkan::Nvn::VtxCovServed(VtxCov::StageOff));
 }

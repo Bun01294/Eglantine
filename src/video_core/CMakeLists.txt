@@ -316,6 +316,8 @@ add_library(video_core STATIC
     renderer_vulkan/nvn/nvn_vertex_stage_gpu.cpp
     renderer_vulkan/nvn/nvn_vertex_stage_gpu.h
     renderer_vulkan/nvn/nvn_viewport.h
+    renderer_vulkan/nvn/nvn_vtxcov.cpp
+    renderer_vulkan/nvn/nvn_vtxcov.h
     renderer_vulkan/nvn/nvn_write_back.cpp
     renderer_vulkan/nvn/nvn_write_back.h
     renderer_vulkan/pipeline_helper.h

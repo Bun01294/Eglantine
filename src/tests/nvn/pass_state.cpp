@@ -352,6 +352,7 @@ TEST_CASE("NVN vertex staging: one copy per address, the largest size, within th
     CHECK(scan.ranges[2].address == 0x50000);
     // 0x60000 would take the pass past max_total_bytes.
     CHECK(scan.bytes == 0x2300);
+    CHECK(scan.capped); // EDEN_NX2_NVN_VTXCOV_DIAG: total_cap
 
     // A scan starts over: nothing of the previous pass is left.
     Records next;
@@ -361,6 +362,7 @@ TEST_CASE("NVN vertex staging: one copy per address, the largest size, within th
     CHECK(scan.draws == 4);
     CHECK(scan.ranges.empty());
     CHECK(scan.bytes == 0);
+    CHECK_FALSE(scan.capped);
 }
 
 TEST_CASE("NVN vertex staging: a malformed or missing list stops the scan", "[nvn][pass_state]") {

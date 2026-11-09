@@ -4882,6 +4882,9 @@ GpuProf::Tag Recorder::ProfTexture(GpuProf::Kind kind, u64 serial, u32 count) co
 void Recorder::RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>& generated,
                              const VideoCommon::Nvn::PresentCrop& window_crop) {
     VideoCommon::NvnDrawProbe::OnPresent();
+    if (impl.vtxcov_diag) {
+        impl.VtxCovOnPresent();
+    }
     Storage& guest = *texture.storage;
     const bool own_upscaled = impl.ndsr_upscaled_since_present;
     const auto own_stage = impl.upscaled_stage;

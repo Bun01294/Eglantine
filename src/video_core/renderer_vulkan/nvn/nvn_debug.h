@@ -243,6 +243,14 @@ struct Config {
     /// VTX_MIRROR_COPY_BYTES per pass, instead of copying every range of every pass with 32+ draws
     /// (VertexStage) or reading it over PCIe (passes of fewer draws).
     bool try_vtx_mirror{false};
+    /// EDEN_NX2_TRY_VTXCOV_INPASS / _SHADERWRITES / _BOUND / _BIGPOOL=1 (candidates, off by
+    /// default; EDEN_NX2_TRY_VTXCOV=1 sets them all): VtxCovSwitch bits (nvn_vtxcov.h). They act
+    /// with TRY_VTX_MIRROR.
+    u32 try_vtxcov{0};
+    /// EDEN_NX2_NVN_VTXCOV_DIAG=1 (on by itself with TRY_VTX_MIRROR or a TRY_VTXCOV switch): every
+    /// vertex/index bind is counted by where it was read from or why it stayed in host memory,
+    /// logged as `[nvn] vtxcov:` every 10 s of presents.
+    bool vtxcov_diag{false};
     /// EDEN_NX2_NVN_DIAG_RO_RAW_KEEP=1 (measurement only, the picture may be wrong): a raw-writing
     /// draw leaves the read-only mirrors' pages valid. The gap between this and the real switch is
     /// the cost of Impl::MirrorInvalidateReadOnly (the copies the invalidation makes the next

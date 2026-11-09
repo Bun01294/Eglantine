@@ -202,7 +202,16 @@ void Context::Impl::AttachStorageState(Pool& pool, PoolMirror& mirror) {
 }
 
 PoolMirror* Context::Impl::VramMirror(Pool& pool, bool create, bool storage) {
+    // EDEN_NX2_TRY_VTXCOV_BIGPOOL: a read-only mirror of a pool over the TRY_STORAGE_VRAM limit
+    // stays read-only, and the pool gets no storage mirror (the limit bounds what raw-global
+    // dispatches copy in and snapshot); its storage ranges stay in guest memory, whose writes
+    // (NotePoolWrite) make the read-only mirror's pages stale.
+    const bool big_read_only = (vtxcov & VTXCOV_BIGPOOL) != 0 && try_storage_vram &&
+                               pool.size > try_storage_vram_max_bytes;
     if (pool.vram_mirror) {
+        if (storage && !pool.vram_mirror->storage && create && big_read_only) {
+            return nullptr;
+        }
         if (storage && !pool.vram_mirror->storage && create) {
             // A read-only mirror takes its first written storage range: from here on it is a
             // storage mirror (raw table, raw-writing snapshots, write-back merges). Its valid
@@ -228,7 +237,13 @@ PoolMirror* Context::Impl::VramMirror(Pool& pool, bool create, bool storage) {
                   pool.address, pool.size, why);
         return nullptr;
     };
-    if (pool.size > try_storage_vram_max_bytes && (try_storage_vram || !storage)) {
+    if ((vtxcov & VTXCOV_BIGPOOL) != 0 && pool.size > try_storage_vram_max_bytes) {
+        // Read-only mirrors of any size (the budget below still holds); a storage one is not
+        // refused for good, so a later read-only use may still mirror the pool.
+        if (storage && try_storage_vram) {
+            return nullptr;
+        }
+    } else if (pool.size > try_storage_vram_max_bytes && (try_storage_vram || !storage)) {
         if (!storage && !try_storage_vram) {
             return nullptr; // only a read-only mirror is too big; a storage one is not limited
         }
@@ -294,6 +309,26 @@ PoolMirror* Context::Impl::VramMirror(Pool& pool, bool create, bool storage) {
              pool.address, pool.size, pool.flags, storage ? "" : "read-only ",
              vram_mirror_bytes >> 20, vram_mirrored.size());
     return pool.vram_mirror.get();
+}
+
+VtxCov Context::Impl::ReadOnlyMirrorMiss(const Pool& pool) const {
+    // The rules of VramMirror(pool, true, false), in its order.
+    if (!vtx_mirror) {
+        return VtxCov::FewDraws;
+    }
+    if (pool.vram_mirror_refused) {
+        return VtxCov::NoMirrorRefused;
+    }
+    if (pool.address % MirrorPages::PAGE != 0) {
+        return VtxCov::NoMirrorAlign;
+    }
+    if (pool.size > try_storage_vram_max_bytes && (vtxcov & VTXCOV_BIGPOOL) == 0) {
+        return VtxCov::NoMirrorSize;
+    }
+    if (vram_mirror_bytes + pool.size > Debug::Get().pool_mirror_max_bytes / 2) {
+        return VtxCov::NoMirrorBudget;
+    }
+    return VtxCov::Other;
 }
 
 bool Context::Impl::MirrorCurrent(Pool& pool, u64 offset, u64 size) {

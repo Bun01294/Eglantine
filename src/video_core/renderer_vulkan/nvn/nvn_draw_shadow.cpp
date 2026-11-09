@@ -475,7 +475,9 @@ void DrawContext::RecordMirrorCopies(bool before_vertex_input) {
 }
 
 void DrawContext::PrefetchMirrors() {
-    if (!impl.ubo_mirror) {
+    // Uniform ranges, and the vertex/index ranges EDEN_NX2_TRY_VTXCOV_INPASS/_SHADERWRITES found
+    // stale at their bind, mark the pages they want (PoolMirror::wanted).
+    if (!impl.ubo_mirror && (impl.vtxcov & (VTXCOV_INPASS | VTXCOV_SHADER_WRITES)) == 0) {
         return;
     }
     for (Pool* const pool : impl.vram_mirrored) {

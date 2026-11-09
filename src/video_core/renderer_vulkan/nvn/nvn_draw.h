@@ -844,8 +844,18 @@ private:
         u64 offset;
         const Pool* pool;
         u64 pool_offset;
+        bool mirror{}; ///< `buffer` is the pool's VRAM mirror (TRY_VTX_MIRROR)
     };
     std::unordered_map<u64, StagedRange> staged_vertex;
+    /// EDEN_NX2_NVN_VTXCOV_DIAG: what the last staging scan did with each range it found (by
+    /// address; a served reason: it went into staged_vertex), and why a range it did not find is
+    /// not staged (the op that ended the scan, or the byte cap).
+    struct StageOutcome {
+        VtxCov reason;
+        u64 size;
+    };
+    std::unordered_map<u64, StageOutcome> stage_outcomes;
+    VtxCov stage_unscanned{VtxCov::NotScanned};
     /// EDEN_NX2_TRY_STAGE_SPAN: the records [begin, end) of the current list the last staging scan
     /// covered, while its copies are current: a pass beginning inside does not scan again.
     const u64* stage_covered_begin{};
@@ -883,6 +893,15 @@ private:
     /// Records the copies of the ranges the pass about to begin reads (outside a pass, after the
     /// pending barrier was flushed).
     void StageVertexRanges();
+    /// EDEN_NX2_NVN_VTXCOV_DIAG: notes the scan just made of `ahead` (stage_outcomes cleared,
+    /// stage_unscanned from the op that ended it).
+    void VtxCovNoteScan(std::span<const u64> ahead);
+    /// A vertex stream or index buffer of an imported pool that no staged copy serves: served
+    /// from its pool's mirror when EDEN_NX2_TRY_VTXCOV_INPASS/_SHADERWRITES allow it and the
+    /// mirror is current (`ref` rebound), else why it stays in host memory. `found`: what the
+    /// staged copy lookup found (SizeShort, else Other).
+    VtxCov VtxCovServeOrMiss(BufferRef& ref, u64 address, u64 size, bool indirect_index,
+                             const DrawPlan& plan, VtxCov found);
     std::vector<PassBoundState::WriteSig> scratch_write_sigs;
     u32 feedback_logged{0};
     std::vector<PassBoundState::ImageSig> scratch_image_sigs;

@@ -3027,9 +3027,15 @@ constexpr Inst AtomgAdd(u32 rd, u32 ra, u32 rb) {
 }
 
 struct VertexMirrorRig {
-    VertexMirrorRig(HeadlessVulkan& vulkan, bool vtx_mirror, bool ubo_mirror)
+    VertexMirrorRig(HeadlessVulkan& vulkan, bool vtx_mirror, bool ubo_mirror, u32 vtxcov = 0,
+                    std::optional<u64> storage_vram_max_bytes = std::nullopt)
         : context(*vulkan.device, vulkan.submit_mutex, nullptr,
-                  {.pool_mirror = 1, .vtx_mirror = vtx_mirror, .ubo_mirror = ubo_mirror}) {
+                  {.pool_mirror = 1,
+                   .try_storage_vram_max_bytes = storage_vram_max_bytes,
+                   .vtx_mirror = vtx_mirror,
+                   .ubo_mirror = ubo_mirror,
+                   .vtxcov = vtxcov,
+                   .vtxcov_diag = true}) {
         report = memory.Add(POOL_VA, 64_KiB);
         std::memset(report, 0xCD, 64_KiB);
         vertex = memory.Add(VERTEX_POOL_VA, 64_KiB);
@@ -3076,7 +3082,11 @@ struct VertexMirrorRig {
         const VC::VertexStreamState stream{.stride = 4, .divisor = 0};
         Push(list, VC::Op::BindVertexStreams, VC::BindVertexStreamsPayload{.first = 0, .count = 1},
              {reinterpret_cast<const u8*>(&stream), sizeof(stream)});
-        const VC::BufferRange range{VERTEX_POOL_VA, 4096};
+        BindVertexBuffer(list, 0);
+    }
+    /// Binds the page at `offset` of the vertex pool as stream 0's buffer.
+    static void BindVertexBuffer(std::vector<u64>& list, u64 offset) {
+        const VC::BufferRange range{VERTEX_POOL_VA + offset, 4096};
         Push(list, VC::Op::BindVertexBuffers, VC::BindVertexBuffersPayload{.first = 0, .count = 1},
              {reinterpret_cast<const u8*>(&range), sizeof(range)});
     }
@@ -3450,6 +3460,178 @@ TEST_CASE("NVN vertex mirror: a written storage range promotes the mirror and bo
     rig.CpuSetVertex(4, F32_ONE_64TH);
     REQUIRE(rig.Draw(PROGRAM_ATTRIBUTE, 3, 1, binds) == 3);
     REQUIRE(WordAt(rig.vertex, 0x800 + 5 * 4) == 105);
+}
+
+// ---- vertex coverage (EDEN_NX2_NVN_VTXCOV_DIAG, EDEN_NX2_TRY_VTXCOV_*, nvn_vtxcov.h) ------------
+
+namespace {
+
+using Vulkan::Nvn::VtxCov;
+
+u64 CovBinds(const Vulkan::Nvn::ContextStats& stats, VtxCov reason) {
+    return stats.vtxcov_binds[static_cast<size_t>(reason)];
+}
+
+/// One submission of one pass: a draw of 3 points from page 2 of the vertex pool (bound before
+/// the pass), the same SetRenderTargets again (the pass goes on, the staging scan stopped there)
+/// and a draw of 3 points from page 0, bound only then. Returns the SAMPLES_PASSED of both.
+u32 DrawInPass(VertexMirrorRig& rig) {
+    ++rig.seq;
+    std::vector<u64> list;
+    Push(list, VC::Op::SetRenderTargets, VC::SetRenderTargetsPayload{0, 0}, {});
+    const VC::ViewportRect viewport{0.0f, 0.0f, 64.0f, 64.0f};
+    Push(list, VC::Op::SetViewports, VC::SetViewportsPayload{.first = 0, .count = 1},
+         {reinterpret_cast<const u8*>(&viewport), sizeof(viewport)});
+    Push(list, VC::Op::SetPointSize, VC::F32Payload{.value = 1.0f});
+    Push(list, VC::Op::BindProgram,
+         VC::BindProgramPayload{.program_serial = PROGRAM_ATTRIBUTE, .stages = 1u << 0});
+    VertexMirrorRig::BindVertices(list);
+    VertexMirrorRig::BindVertexBuffer(list, 0x2000);
+    Push(list, VC::Op::ResetCounter, VC::ResetCounterPayload{.counter_type = SAMPLES_PASSED});
+    Push(list, VC::Op::Draw, VC::DrawPayload{.mode = 0, .first = 0, .count = 3, .instance_count = 1});
+    Push(list, VC::Op::SetRenderTargets, VC::SetRenderTargetsPayload{0, 0}, {});
+    VertexMirrorRig::BindVertexBuffer(list, 0);
+    Push(list, VC::Op::Draw, VC::DrawPayload{.mode = 0, .first = 0, .count = 3, .instance_count = 1});
+    const u64 report_offset = 0x2000 + 16 * rig.seq;
+    Push(list, VC::Op::ReportCounter,
+         VC::ReportCounterPayload{.address = POOL_VA + report_offset, .counter_type = SAMPLES_PASSED});
+    PushEnd(list);
+    rig.context.Submit(MakeSubmission(rig.seq, std::move(list), {PROGRAM_ATTRIBUTE, 1, 2}));
+    REQUIRE(rig.context.Wait(rig.seq, 60s));
+    return WordAt(rig.report, report_offset);
+}
+
+} // namespace
+
+TEST_CASE("NVN vertex coverage: a stream bound inside an open pass is counted, and served from the "
+          "mirror from the next pass on with TRY_VTXCOV_INPASS",
+          "[nvn][compute][mirror]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    {
+        // No pool mirrors: page 2 is in a pass of too few draws to stage, page 0 was not scanned.
+        VertexMirrorRig rig(*vulkan, false, false);
+        for (u32 i = 0; i < 3; ++i) {
+            rig.SetVertex(i, F32_ONE_64TH);
+            rig.SetVertex(0x2000 / 4 + i, F32_FIVE);
+        }
+        REQUIRE(DrawInPass(rig) == 3); // the pool is backed by its first use
+        REQUIRE(DrawInPass(rig) == 3);
+        const Vulkan::Nvn::ContextStats before = rig.context.Stats();
+        REQUIRE(DrawInPass(rig) == 3);
+        const Vulkan::Nvn::ContextStats after = rig.context.Stats();
+        const auto delta = [&](VtxCov reason) {
+            return CovBinds(after, reason) - CovBinds(before, reason);
+        };
+        if (after.pools_imported == 0) {
+            // No host import: the pool is device-local itself (Backing::Mirror).
+            CHECK(delta(VtxCov::Device) == 2);
+        } else {
+            CHECK(delta(VtxCov::FewDraws) == 1);
+            CHECK(delta(VtxCov::NotScannedTargets) == 1);
+        }
+        CHECK(delta(VtxCov::MirrorBind) == 0);
+        CHECK(after.ops_failed == 0);
+    }
+    for (const bool inpass : {false, true}) {
+        INFO("inpass " << inpass);
+        VertexMirrorRig rig(*vulkan, true, false, inpass ? Vulkan::Nvn::VTXCOV_INPASS : 0u);
+        for (u32 i = 0; i < 3; ++i) {
+            rig.SetVertex(i, F32_ONE_64TH);               // page 0: on the screen
+            rig.SetVertex(0x2000 / 4 + i, F32_FIVE);      // page 2: off the screen
+        }
+        bool mirrored = false;
+        for (u32 attempt = 0; attempt < 4 && !mirrored; ++attempt) {
+            REQUIRE(DrawInPass(rig) == 3);
+            mirrored = rig.context.Stats().vram_mirrors_read_only != 0;
+        }
+        if (!mirrored) {
+            SKIP("pool mirrors are unavailable on this device (no host import / write tracking)");
+        }
+        // One more pass: with the switch, page 0 joined the prefetch set at its bind.
+        REQUIRE(DrawInPass(rig) == 3);
+        Vulkan::Nvn::ContextStats before = rig.context.Stats();
+        REQUIRE(DrawInPass(rig) == 3);
+        Vulkan::Nvn::ContextStats after = rig.context.Stats();
+        const auto delta = [&](VtxCov reason) {
+            return CovBinds(after, reason) - CovBinds(before, reason);
+        };
+        CHECK(delta(VtxCov::Mirror) == 1); // page 2, through the pass's scan
+        CHECK(delta(VtxCov::NotScannedTargets) == (inpass ? 0u : 1u));
+        CHECK(delta(VtxCov::MirrorBind) == (inpass ? 1u : 0u));
+        CHECK(after.ops_failed == 0);
+
+        // The guest moves a point of page 0 off the screen: the prefetch at the next pass begin
+        // copies the written page in, and the bind still finds the mirror current.
+        rig.CpuSetVertex(4, F32_FIVE);
+        before = rig.context.Stats();
+        REQUIRE(DrawInPass(rig) == 2);
+        after = rig.context.Stats();
+        CHECK(delta(VtxCov::MirrorBind) == (inpass ? 1u : 0u));
+        rig.CpuSetVertex(4, F32_ONE_64TH);
+        REQUIRE(DrawInPass(rig) == 3);
+        REQUIRE(rig.context.Stats().ops_failed == 0);
+    }
+}
+
+TEST_CASE("NVN vertex coverage: TRY_VTXCOV_BIGPOOL mirrors a pool over the storage size limit "
+          "read-only and never promotes it",
+          "[nvn][compute][mirror]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    const auto binds = [&](std::vector<u64>& list) { VertexMirrorRig::BindVertices(list); };
+    {
+        // Without the switch the 64 KiB pool is over the (test) limit of 32 KiB: no mirror.
+        VertexMirrorRig rig(*vulkan, true, false, 0, 32_KiB);
+        for (u32 i = 0; i < 3; ++i) {
+            rig.SetVertex(i, F32_ONE_64TH);
+        }
+        for (u32 i = 0; i < 4; ++i) {
+            REQUIRE(rig.Draw(PROGRAM_ATTRIBUTE, 3, 1, binds) == 3);
+        }
+        const Vulkan::Nvn::ContextStats stats = rig.context.Stats();
+        CHECK(stats.vram_mirrors_read_only == 0);
+        CHECK(CovBinds(stats, VtxCov::Mirror) == 0);
+    }
+    VertexMirrorRig rig(*vulkan, true, false, Vulkan::Nvn::VTXCOV_BIGPOOL, 32_KiB);
+    rig.context.CreateProgram(
+        MakeProgram(PROGRAM, FillProgramBase(0x20, 100), {.uniform = 1, .storage = 1}));
+    for (u32 i = 0; i < 3; ++i) {
+        rig.SetVertex(i, F32_ONE_64TH);
+    }
+    if (!rig.WarmUp(PROGRAM_ATTRIBUTE, 3, 1, 3, binds)) {
+        SKIP("pool mirrors are unavailable on this device (no host import / write tracking)");
+    }
+    CHECK(CovBinds(rig.context.Stats(), VtxCov::Mirror) >= 1);
+    // A written storage range of the pool: with TRY_STORAGE_VRAM it stays in guest memory (the
+    // mirror stays read-only) and makes the mirror's page stale; the next draw sees both writers.
+    rig.CpuSetVertex(4, F32_FIVE);
+    const auto fill = [&](std::vector<u64>& list) {
+        Dispatch(list, PROGRAM, VERTEX_POOL_VA + 0x800, 256, 6);
+    };
+    REQUIRE(rig.Draw(PROGRAM_ATTRIBUTE, 3, 1, binds, fill) == 2);
+    for (u32 i = 0; i < 6; ++i) {
+        INFO("word " << i);
+        REQUIRE(WordAt(rig.vertex, 0x800 + i * 4) == 100 + i);
+    }
+    const char* const storage_vram_env = std::getenv("EDEN_NX2_TRY_STORAGE_VRAM");
+    const bool storage_vram = vulkan->device->IsBufferDeviceAddressSupported() &&
+                              vulkan->device->IsShaderInt64Supported() &&
+                              vulkan->device->IsDescriptorAliasingSupported() &&
+                              (storage_vram_env == nullptr || std::string_view{storage_vram_env} != "0");
+    const Vulkan::Nvn::ContextStats stats = rig.context.Stats();
+    if (storage_vram) {
+        CHECK(stats.vram_mirrors_promoted == 0);
+        CHECK(stats.vram_mirrors == 1);
+    }
+    CHECK(stats.ops_failed == 0);
+    rig.CpuSetVertex(4, F32_ONE_64TH);
+    REQUIRE(rig.Draw(PROGRAM_ATTRIBUTE, 3, 1, binds) == 3);
+    REQUIRE(rig.context.Stats().ops_failed == 0);
 }
 
 TEST_CASE("NVN uniform mirror: the first copy is the pages the bindings use, not the pool",
