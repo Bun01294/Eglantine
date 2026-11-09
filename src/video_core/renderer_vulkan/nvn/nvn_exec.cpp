@@ -294,10 +294,12 @@ public:
     }
     bool HostNeedsCommands(Storage& storage, bool will_overwrite) override {
         storage.last_used_seq = flight.seq;
+        storage.last_used_present = impl.stats.presents.load(std::memory_order_relaxed);
         return impl.StorageNeedsCommands(storage, will_overwrite, flight.seq);
     }
     bool HostNeedsNativeUpdate(Storage& storage) override {
         storage.last_used_seq = flight.seq;
+        storage.last_used_present = impl.stats.presents.load(std::memory_order_relaxed);
         return impl.StorageNeedsCommands(storage, false, flight.seq, true);
     }
     bool HostPrepareScaledTarget(Storage& native) override {
@@ -1598,6 +1600,7 @@ bool Recorder::EnsureContents(Storage& s, bool will_overwrite, bool keep_scaled)
         return false;
     }
     s.last_used_seq = flight.seq;
+    s.last_used_present = impl.stats.presents.load(std::memory_order_relaxed);
     if (s.scale_owner != nullptr) {
         return true; // a twin: the guest storage that owns it decides what is current
     }
@@ -5817,6 +5820,8 @@ void Context::Impl::ProcessPresent(CmdPresent&& present) {
     if (stats.presents.fetch_add(1, std::memory_order_relaxed) % 900 == 899) {
         LogStorageCensus();
     }
+    // Textures die and storages age without a new image being made: the trim looks at them here.
+    TrimStorageCache(true);
     NoteUse(present.request.texture_serial, present.request.seq);
     PumpStreams(true);
     // A present is ordered after everything its queue submitted before it.

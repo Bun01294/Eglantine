@@ -572,9 +572,31 @@ of the pool, which took the bytes over at their own use, cover every byte of its
 of the pool that is not superseded holds GPU texels no guest byte can rebuild and is never
 dropped), then the ones that hold guest bytes. A game that re-allocates its render targets over
 the same pool bytes in ever other shapes (a changing resolution, a frame graph) would otherwise add
-one image per shape until the pool is finalized (`EvictPoolStorages`). `mem(... storage_cache(MB/
-superseded_evicted)=` in the `[nvn] replay` status line and the second `[nvn] storage census`
-line (idle GPU-written images, how many of the first 1024 are superseded) show it.
+one image per shape until the pool is finalized (`EvictPoolStorages`).
+
+Two more rules (`EDEN_NX2_NVN_TRIM_LEGACY=1` turns them and the passes at presents off). A pass
+also runs every 30 presents, cache over the budget or not: textures die and storages age without
+a new image being made. **Age**: an idle render target (colour or depth attachment usage) unused
+for `EDEN_NX2_NVN_TRIM_AGE_PRESENTS` presents (300, 0 off; `Storage::last_used_present`) is
+dropped under the budget too when it costs nothing to rebuild: it holds guest bytes or nothing
+(the next texture over them uploads them again), or it is GPU-written and superseded. **Device
+budget**: when the device's usage plus the allocator's empty block space is over the
+VK_EXT_memory_budget budget (the heartbeat's `device(usage/budget/slack)_MB`), the pass drops the
+same kinds as over the cache budget (superseded, then guest bytes, oldest first) by the excess and
+1/32 of the device budget, sparing storages used in the last 4 presents (the transient targets a
+game re-creates every frame). GPU-written storages that are not superseded stay in every case:
+the replay never writes GPU texels to guest memory, so nothing could rebuild them, and a texture
+re-created over the same bytes in the same shape gets them back. `EDEN_NX2_NVN_STORAGE_BUDGET_MIB`
+replaces the 6144 MiB budget.
+
+`mem(... storage_cache(MB/superseded/aged/pressure_evicted)=` in the `[nvn] replay` status line
+and the `[nvn] storage census` lines show it: the second has the idle GPU-written images and how
+many of the first 1024 are superseded; the third who holds the cached images (live textures and
+their render-target aliases, other holders: retired textures and views waiting for their last
+submission, submissions in flight, bound targets; idle GPU-written; idle rebuildable), the bytes
+per origin and the Resolution setting's twins (outside the cache's count); the fourth the render
+targets by presents since their last use (all, held by live textures, idle GPU-written), the
+evictions by rule and the device excess at the last pass.
 
 ## Records
 

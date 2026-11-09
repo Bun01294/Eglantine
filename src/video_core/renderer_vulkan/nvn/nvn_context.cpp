@@ -221,8 +221,11 @@ Context::Impl::Impl(const Device& device_, std::mutex& submit_mutex_,
     mirror_hash_tracked = options.mirror_hash_tracked.value_or(!Debug::Get().mirror_hash_always);
     invalidate_wait_ms = options.invalidate_wait_ms.value_or(Debug::Get().try_invalidate_writeback);
     raw_keep_entries = options.raw_keep_entries.value_or(Debug::Get().try_raw_keep_entries);
-    storage_cache_budget =
-        options.storage_cache_budget_bytes.value_or(DEFAULT_STORAGE_CACHE_BUDGET);
+    storage_cache_budget = options.storage_cache_budget_bytes.value_or(
+        Debug::Get().storage_budget_bytes != 0 ? Debug::Get().storage_budget_bytes
+                                               : DEFAULT_STORAGE_CACHE_BUDGET);
+    trim_age_presents = options.storage_trim_age_presents.value_or(Debug::Get().trim_age_presents);
+    trim_legacy = options.storage_trim_legacy.value_or(Debug::Get().trim_legacy);
     barrier_merge =
         BarrierMergeMask(options.barrier_merge.value_or(Debug::Get().try_barrier_merge));
     astc_gpu_enabled = AstcGpuDecoder::Supported(device);
@@ -1374,6 +1377,8 @@ ContextStats Context::Stats() const {
         .storages_reused = s.storages_reused.load(relaxed),
         .storages_evicted = s.storages_evicted.load(relaxed),
         .storages_superseded_evicted = s.storages_superseded_evicted.load(relaxed),
+        .storages_aged_evicted = s.storages_aged_evicted.load(relaxed),
+        .storages_pressure_evicted = s.storages_pressure_evicted.load(relaxed),
         .storage_cache_bytes = s.storage_cache_bytes.load(relaxed),
         .alias_transfers = s.alias_transfers.load(relaxed),
         .alias_byte_transfers = s.alias_byte_transfers.load(relaxed),
@@ -1652,7 +1657,7 @@ std::string Context::DescribeState() const {
         " mem(storages new/reuse/evict={}/{}/{} uploads={} MB={} cpu check/change={}/{} "
         "hash_ms={} hash_MB={} (compressed {} dynamic {}) decode_ms={} decode_MB={} alias_xfer={} "
         "alias_seen={} virt={} astc gpu/fallback/bc={}/{}/{} untile gpu/direct/fallback={}/{}/{} "
-        "untile_gpu_MB={} storage_cache(MB/superseded_evicted)={}/{})",
+        "untile_gpu_MB={} storage_cache(MB/superseded/aged/pressure_evicted)={}/{}/{}/{})",
         s.storages_created.load(), s.storages_reused.load(), s.storages_evicted.load(),
         s.uploads.load(), s.upload_bytes.load() >> 20, s.cpu_checks.load(), s.cpu_changes.load(),
         s.hash_ns.load() / 1'000'000, s.hash_bytes.load() >> 20,
@@ -1662,7 +1667,8 @@ std::string Context::DescribeState() const {
         s.astc_cpu_fallbacks.load(), s.astc_bc_encodes.load(), s.untile_gpu_uploads.load(),
         s.untile_gpu_direct.load(),
         s.untile_cpu_fallbacks.load(), s.untile_gpu_bytes.load() >> 20,
-        s.storage_cache_bytes.load() >> 20, s.storages_superseded_evicted.load());
+        s.storage_cache_bytes.load() >> 20, s.storages_superseded_evicted.load(),
+        s.storages_aged_evicted.load(), s.storages_pressure_evicted.load());
     if (const LineGuardStats& g = *impl->line_guard_stats;
         g.line_bytes.load() + g.exact_bytes.load() != 0) {
         // Line-mode write-back merges (EDEN_NX2_TRY_WB_LINES, nvn_line_guard.h), cumulative: MiB
