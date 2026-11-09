@@ -2381,7 +2381,7 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
         }
     }
     if (VideoCommon::NvnDrawProbe::Active()) [[unlikely]] {
-        if (ProbeDraw(mode, element_count, index, vertex, used_streams, active->mesh)) {
+        if (ProbeDraw(*active, mode, element_count, index, vertex, used_streams, active->mesh)) {
             ++counters.draws_skipped;
             return false;
         }

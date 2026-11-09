@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <tuple>
 
 #include <fmt/format.h>
 
+#include "common/fs/file.h"
 #include "video_core/nvn_draw_probe.h"
 
 namespace VideoCommon::NvnDrawProbe {
@@ -39,6 +41,9 @@ struct State {
     // Dump.
     DumpState dump;
     std::string dump_directory;
+    std::string dump_path; ///< fixed by the first claimed section
+    u32 dump_claimed{};
+    u64 dump_generation{};
 };
 
 State& S() {
@@ -46,10 +51,28 @@ State& S() {
     return state;
 }
 
+/// The armed dump has sections left to claim.
+bool DumpWanted(const State& s) {
+    return s.dump.armed && s.dump_claimed < s.dump.count && s.dump.error.empty();
+}
+
 void UpdateActiveLocked(State& s) {
     const bool active = s.census_presents_left != 0 || !s.skip.empty() ||
-                        s.skip_mode == SkipMode::Only || (s.dump.armed && !s.dump.done);
+                        s.skip_mode == SkipMode::Only || DumpWanted(s);
     Detail::g_active.store(active, std::memory_order_relaxed);
+}
+
+std::optional<DumpTicket> ClaimDumpLocked(State& s, const char* kind) {
+    if (s.dump_claimed == 0) {
+        s.dump.kind = kind;
+        s.dump_path = fmt::format("{}/nvn-{}-dump-{:016x}-p{}.txt", s.dump_directory, kind,
+                                  s.dump.hash, s.presents);
+    } else if (s.dump.kind != kind) {
+        return std::nullopt;
+    }
+    DumpTicket ticket{s.dump_path, s.dump_claimed++, s.dump.count, s.dump_generation};
+    UpdateActiveLocked(s);
+    return ticket;
 }
 
 bool Matches(const std::vector<u64>& set, const DrawInfo& info) {
@@ -155,27 +178,84 @@ void OnPresent() {
     UpdateActiveLocked(s);
 }
 
-std::optional<std::string> DumpRequested(const DrawInfo& info) {
+std::optional<DumpTicket> DumpRequested(const DrawInfo& info) {
     State& s = S();
     std::scoped_lock lock{s.mutex};
-    if (!s.dump.armed || s.dump.done) {
+    if (!DumpWanted(s) ||
+        std::find(info.hashes.begin(), info.hashes.end(), s.dump.hash) == info.hashes.end()) {
         return std::nullopt;
     }
-    if (std::find(info.hashes.begin(), info.hashes.end(), s.dump.hash) == info.hashes.end()) {
-        return std::nullopt;
-    }
-    // Claimed: one draw only.
-    s.dump.done = true;
-    UpdateActiveLocked(s);
-    return fmt::format("{}/nvn-draw-dump-{:016x}-p{}.txt", s.dump_directory, s.dump.hash,
-                       s.presents);
+    return ClaimDumpLocked(s, "draw");
 }
 
-void DumpDone(std::string path, std::string error) {
+std::optional<DumpTicket> DumpRequested(const DispatchInfo& info) {
     State& s = S();
     std::scoped_lock lock{s.mutex};
-    s.dump.path = std::move(path);
-    s.dump.error = std::move(error);
+    if (!DumpWanted(s) || info.hash != s.dump.hash) {
+        return std::nullopt;
+    }
+    return ClaimDumpLocked(s, "dispatch");
+}
+
+void WriteDump(const DumpTicket& ticket, std::string_view text) {
+    const size_t written =
+        ticket.index == 0
+            ? Common::FS::WriteStringToFile(ticket.path, Common::FS::FileType::BinaryFile, text)
+            : Common::FS::AppendStringToFile(ticket.path, Common::FS::FileType::BinaryFile, text);
+    State& s = S();
+    std::scoped_lock lock{s.mutex};
+    if (ticket.generation != s.dump_generation) {
+        return; // re-armed meanwhile
+    }
+    if (written != text.size()) {
+        s.dump.error = "cannot write " + ticket.path;
+    } else {
+        s.dump.path = ticket.path;
+        ++s.dump.written;
+    }
+    s.dump.done = s.dump.written >= s.dump.count || !s.dump.error.empty();
+    UpdateActiveLocked(s);
+}
+
+void AppendRows(std::string& text, std::span<const u8> bytes) {
+    constexpr size_t Row = 16;
+    size_t zero_run = 0;
+    const auto flush_zeros = [&](size_t end) {
+        if (zero_run == 1) {
+            text += fmt::format("  {:06x}: zeros\n", end - Row);
+        } else if (zero_run > 1) {
+            text += fmt::format("  {:06x}..{:06x}: zeros ({} rows)\n", end - zero_run * Row,
+                                end - 1, zero_run);
+        }
+        zero_run = 0;
+    };
+    for (size_t offset = 0; offset < bytes.size(); offset += Row) {
+        const size_t length = (std::min)(Row, bytes.size() - offset);
+        const auto row = bytes.subspan(offset, length);
+        if (length == Row && std::all_of(row.begin(), row.end(), [](u8 b) { return b == 0; })) {
+            ++zero_run;
+            continue;
+        }
+        flush_zeros(offset);
+        text += fmt::format("  {:06x}:", offset);
+        for (size_t i = 0; i < Row; ++i) {
+            text += i < length ? fmt::format(" {:02x}", row[i]) : std::string(3, ' ');
+        }
+        text += " | f32";
+        for (size_t i = 0; i + 4 <= length; i += 4) {
+            f32 value;
+            std::memcpy(&value, row.data() + i, sizeof(value));
+            text += fmt::format(" {:.7g}", value);
+        }
+        text += " | u32";
+        for (size_t i = 0; i + 4 <= length; i += 4) {
+            u32 value;
+            std::memcpy(&value, row.data() + i, sizeof(value));
+            text += fmt::format(" {}", value);
+        }
+        text += '\n';
+    }
+    flush_zeros(bytes.size() - bytes.size() % Row);
 }
 
 bool ArmCensus(u32 presents) {
@@ -208,6 +288,9 @@ void Reset() {
     s.skip_mode = SkipMode::Skip;
     s.dump = {};
     s.dump_directory.clear();
+    s.dump_path.clear();
+    s.dump_claimed = 0;
+    ++s.dump_generation;
     UpdateActiveLocked(s);
 }
 
@@ -228,11 +311,14 @@ void GetSkip(std::vector<u64>& hashes, SkipMode& mode) {
     mode = s.skip_mode;
 }
 
-void ArmDump(u64 hash, std::string directory) {
+void ArmDump(u64 hash, std::string directory, u32 count) {
     State& s = S();
     std::scoped_lock lock{s.mutex};
-    s.dump = DumpState{.armed = true, .done = false, .hash = hash};
+    s.dump = DumpState{.armed = true, .hash = hash, .count = std::clamp(count, 1u, MaxDumpCount)};
     s.dump_directory = std::move(directory);
+    s.dump_path.clear();
+    s.dump_claimed = 0;
+    ++s.dump_generation;
     UpdateActiveLocked(s);
 }
 

@@ -6,22 +6,25 @@
 #include <array>
 #include <atomic>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "common/common_types.h"
 
-/// Live draw and dispatch census, draw and dispatch skipping by program hash and a one-shot draw
-/// dump for the NVN replay (VTX-HLE), driven by the debug server methods `nvn_draws`,
+/// Live draw and dispatch census, draw and dispatch skipping by program hash and a draw or
+/// dispatch dump for the NVN replay (VTX-HLE), driven by the debug server methods `nvn_draws`,
 /// `nvn_draw_skip` and `nvn_draw_dump` (core/debugger/nx2_debug_tools.cpp). No Vulkan types: the
-/// replay fills it (DrawContext::ProbeDraw, DrawContext::Dispatch), the debug server thread reads
-/// it. Unused cost: one relaxed atomic load per draw and dispatch.
+/// replay fills it (DrawContext::ProbeDraw, DrawContext::ProbeDispatchDump), the debug server
+/// thread reads it. Unused cost: one relaxed atomic load per draw and dispatch.
 namespace VideoCommon::NvnDrawProbe {
 
 /// NVNshaderStage numbering: 0 vertex, 1 fragment, 2 geometry, 3 tess control, 4 tess eval,
 /// 5 compute (never set), 6 task, 7 mesh.
 inline constexpr size_t StageCount = 8;
 inline constexpr size_t MaxStreams = 4; ///< vertex streams described per draw
+inline constexpr u32 MaxDumpCount = 8;  ///< draws or dispatches one dump file can hold
 
 struct Stream {
     u32 slot{};
@@ -103,10 +106,23 @@ extern std::atomic<bool> g_active;
 [[nodiscard]] bool OnDispatch(const DispatchInfo& info);
 /// A present was recorded: the census of the frame so far becomes the last one.
 void OnPresent();
-/// A dump is armed for a draw with one of these hashes: returns the file path to write.
-[[nodiscard]] std::optional<std::string> DumpRequested(const DrawInfo& info);
-/// The armed dump was written (or failed: `path` empty, `error` set).
-void DumpDone(std::string path, std::string error);
+/// One section of the armed dump, claimed by a matching draw or dispatch.
+struct DumpTicket {
+    std::string path;
+    u32 index{}; ///< 0-based: section `index` of `count` in the file
+    u32 count{};
+    u64 generation{}; ///< the ArmDump call the section belongs to
+};
+/// A dump is armed for a draw having the hash in any stage: claims the next section.
+[[nodiscard]] std::optional<DumpTicket> DumpRequested(const DrawInfo& info);
+/// The same for a dispatch whose compute hash matches.
+[[nodiscard]] std::optional<DumpTicket> DumpRequested(const DispatchInfo& info);
+/// Writes a claimed section (the first one creates the file, the others append to it). The dump
+/// is done when its last section is written or a write failed.
+void WriteDump(const DumpTicket& ticket, std::string_view text);
+/// The dump files' byte rows: per 16 bytes the offset, the bytes in hex, four f32 and four u32.
+/// Runs of rows of zeros are collapsed into one line.
+void AppendRows(std::string& text, std::span<const u8> bytes);
 
 // ---- debug server ----
 /// Keeps the census running for the next `presents` presents. False when it was not running: the
@@ -119,13 +135,17 @@ void Reset();
 /// Replaces the set. Returns the current set and mode.
 void SetSkip(std::vector<u64> hashes, SkipMode mode);
 void GetSkip(std::vector<u64>& hashes, SkipMode& mode);
-/// Arms a dump of the first draw having `hash` in any stage; `directory` receives the file.
-void ArmDump(u64 hash, std::string directory);
-/// State of the last armed dump: done, path, error.
+/// Arms a dump of the next `count` (1 to MaxDumpCount) draws having `hash` in any stage, or
+/// dispatches of the compute program `hash`, into one file in `directory`.
+void ArmDump(u64 hash, std::string directory, u32 count = 1);
+/// State of the last armed dump.
 struct DumpState {
     bool armed{};
-    bool done{};
+    bool done{}; ///< every section written, or `error`
     u64 hash{};
+    u32 count{};
+    u32 written{};
+    std::string kind; ///< "draw" or "dispatch" once the first section is claimed
     std::string path;
     std::string error;
 };

@@ -298,17 +298,29 @@ TOOLS = [
     },
     {
         "name": "nvn_draw_dump",
-        "description": "VTX-HLE only. Arms a one-shot dump of the next recorded draw having 'hash' "
-                       "in any stage: vertex input layout, each vertex stream's first 256 vertices "
-                       "(hex, and 32-bit float attributes of the first 32), the index range's "
-                       "min/max, the first 256 bytes of each bound uniform buffer and 64 of each "
-                       "storage buffer, as the CPU sees guest memory. Written to the dump "
-                       "directory; waits up to wait_ms (default 3000) and returns the path. "
-                       "Without 'hash': the state and path of the last dump.",
+        "description": "VTX-HLE only. Arms a dump of the next 'count' (default 1, max 8) recorded "
+                       "draws having 'hash' in any stage, or dispatches of the compute program "
+                       "'hash' (nvn_draws 'dispatches', gpuprof cs=), into one text file. A "
+                       "dispatch section: group counts (indirect: the argument address and its "
+                       "guest bytes), thread-group size, push constants. A draw section: vertex "
+                       "input layout, each vertex stream's first 256 vertices (hex, and 32-bit "
+                       "float attributes of the first 32), the index range's min/max. Both then "
+                       "list every descriptor binding: constant buffers (cN = uniform slot N-3; c0 "
+                       "driver bank of a dispatch and c1 program constants as built by the replay, "
+                       "game buffers up to 4 KiB), storage buffers (first 256 bytes, written flag) "
+                       "with guest address, size and where the GPU reads them (imported, mirror "
+                       "pool, VRAM mirror, device shadow, uniform snapshot, private copy with "
+                       "inline updates), as 16-byte rows of hex, f32 and u32 the CPU sees when the "
+                       "call is recorded (bytes of a VRAM copy the GPU wrote are not read back); "
+                       "textures and images (handle, texture, guest address, format, size, view "
+                       "type, sampler); raw global table state. Written to the dump directory; "
+                       "waits up to wait_ms (default 3000) and returns the path and how many "
+                       "sections were written. Without 'hash': the state of the last dump.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "hash": {"type": "string", "maxLength": 18},
+                "count": {"type": "integer", "minimum": 1, "maximum": 8},
                 "wait_ms": {"type": "integer", "minimum": 0, "maximum": 10000},
             },
         },

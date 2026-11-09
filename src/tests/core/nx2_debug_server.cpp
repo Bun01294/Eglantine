@@ -4,12 +4,15 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <thread>
 
 #include <boost/asio.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include "common/fs/file.h"
+#include "common/fs/fs_util.h"
 #include "common/page_table.h"
 #include "common/scope_exit.h"
 #include "core/core.h"
@@ -511,15 +514,93 @@ TEST_CASE("NVN draw probe skips by stage hash and takes a census per full frame"
     REQUIRE(census.rows[0].elements == 12);
     REQUIRE_FALSE(Probe::Active());
 
-    Probe::ArmDump(0xb0, "dir");
+    const std::filesystem::path directory =
+        std::filesystem::temp_directory_path() / "eden-nvn-draw-probe-test";
+    std::filesystem::create_directories(directory);
+    SCOPE_EXIT {
+        std::filesystem::remove_all(directory);
+    };
+    const std::string dir = Common::FS::ToUTF8String(directory.generic_u8string());
+    Probe::ArmDump(0xb0, dir);
     REQUIRE_FALSE(Probe::DumpRequested(a).has_value());
-    const auto path = Probe::DumpRequested(b);
-    REQUIRE(path.has_value());
-    REQUIRE(path->starts_with("dir/nvn-draw-dump-00000000000000b0-p"));
+    const auto ticket = Probe::DumpRequested(b);
+    REQUIRE(ticket.has_value());
+    REQUIRE(ticket->path.starts_with(dir + "/nvn-draw-dump-00000000000000b0-p"));
+    REQUIRE(ticket->count == 1);
     REQUIRE_FALSE(Probe::DumpRequested(b).has_value());
     REQUIRE_FALSE(Probe::Active());
-    Probe::DumpDone(*path, {});
-    REQUIRE(Probe::GetDump().path == *path);
+    REQUIRE_FALSE(Probe::GetDump().done);
+    Probe::WriteDump(*ticket, "draw\n");
+    REQUIRE(Probe::GetDump().done);
+    REQUIRE(Probe::GetDump().path == ticket->path);
+}
+
+TEST_CASE("NVN draw probe dumps the next dispatches of a compute program into one file",
+          "[core][nx2_debug_server]") {
+    namespace Probe = VideoCommon::NvnDrawProbe;
+    Probe::Reset();
+    const std::filesystem::path directory =
+        std::filesystem::temp_directory_path() / "eden-nvn-dispatch-probe-test";
+    std::filesystem::create_directories(directory);
+    SCOPE_EXIT {
+        Probe::Reset();
+        std::filesystem::remove_all(directory);
+    };
+    const std::string dir = Common::FS::ToUTF8String(directory.generic_u8string());
+    const Probe::DispatchInfo sky{.hash = 0xfd1176a6c7fe62ce, .groups = {1, 1, 1}};
+    const Probe::DispatchInfo other{.hash = 0xc1, .groups = {8, 1, 1}};
+    Probe::DrawInfo draw{};
+    draw.hashes[0] = 0xfd1176a6c7fe62ce; // a draw never matches a dispatch dump that started
+
+    Probe::ArmDump(sky.hash, dir, 2);
+    REQUIRE(Probe::Active());
+    REQUIRE(Probe::GetDump().count == 2);
+    REQUIRE_FALSE(Probe::DumpRequested(other).has_value());
+    const auto first = Probe::DumpRequested(sky);
+    REQUIRE(first.has_value());
+    REQUIRE(first->path.starts_with(dir + "/nvn-dispatch-dump-fd1176a6c7fe62ce-p"));
+    REQUIRE((first->index == 0 && first->count == 2));
+    REQUIRE(Probe::GetDump().kind == "dispatch");
+    REQUIRE_FALSE(Probe::DumpRequested(draw).has_value());
+    REQUIRE(Probe::Active()); // one section left
+
+    // A constant buffer row as the replay formats it: 8.0 at 0x10 of c3, zero rows collapsed.
+    std::array<u8, 0x60> c3{};
+    const std::array<f32, 4> exposure{8.0f, 1.0f, 0.5f, -2.0f};
+    std::memcpy(c3.data() + 0x10, exposure.data(), sizeof(exposure));
+    const u32 marker = 0xdeadbeef;
+    std::memcpy(c3.data() + 0x50, &marker, sizeof(marker));
+    std::string section = "NVN dispatch dump 1 of 2\nbinding 2 compute c3 uniform slot 0:\n";
+    Probe::AppendRows(section, c3);
+    Probe::WriteDump(*first, section);
+    REQUIRE(Probe::GetDump().written == 1);
+    REQUIRE_FALSE(Probe::GetDump().done);
+
+    const auto second = Probe::DumpRequested(sky);
+    REQUIRE(second.has_value());
+    REQUIRE((second->index == 1 && second->path == first->path));
+    REQUIRE_FALSE(Probe::Active());
+    REQUIRE_FALSE(Probe::DumpRequested(sky).has_value());
+    Probe::WriteDump(*second, "NVN dispatch dump 2 of 2\n");
+    const Probe::DumpState state = Probe::GetDump();
+    REQUIRE((state.done && state.written == 2 && state.error.empty()));
+    REQUIRE(state.path == first->path);
+
+    const std::string text =
+        Common::FS::ReadStringFromFile(first->path, Common::FS::FileType::BinaryFile);
+    INFO(text);
+    REQUIRE(text == section + "NVN dispatch dump 2 of 2\n");
+    REQUIRE(text.find("  000000: zeros\n") != std::string::npos);
+    REQUIRE(text.find("  000010: 00 00 00 41 00 00 80 3f 00 00 00 3f 00 00 00 c0 | f32 8 1 0.5 -2 "
+                      "| u32 1090519040 1065353216 1056964608 3221225472\n") != std::string::npos);
+    REQUIRE(text.find("  000020..00004f: zeros (3 rows)\n") != std::string::npos);
+    REQUIRE(text.find("  000050: ef be ad de") != std::string::npos);
+
+    // Re-arming forgets the old dump; a section claimed before it is not counted.
+    Probe::ArmDump(sky.hash, dir, 99);
+    REQUIRE(Probe::GetDump().count == Probe::MaxDumpCount);
+    Probe::WriteDump(*second, "late\n");
+    REQUIRE(Probe::GetDump().written == 0);
 }
 
 TEST_CASE("NVN draw probe skips dispatches by compute hash and takes their census",

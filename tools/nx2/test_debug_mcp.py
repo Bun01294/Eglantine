@@ -49,6 +49,12 @@ class FakeEmulator:
         if method == "nvn_draw_skip":
             return {"result": {"mode": request["params"].get("mode", "skip"),
                                "hashes": request["params"].get("hashes", [])}}
+        if method == "nvn_draw_dump":
+            params = request["params"]
+            return {"result": {"hash": params["hash"], "kind": "dispatch",
+                               "count": params.get("count", 1),
+                               "written": params.get("count", 1),
+                               "path": "dumps/nvn-dispatch-dump-fd1176a6c7fe62ce-p7.txt"}}
         if method in ("input", "input_sequence"):
             return {"result": {"controller": "player1", "frames": 3}}
         if method == "write_memory":
@@ -150,6 +156,17 @@ class AdapterTest(unittest.TestCase):
         result = self.call("nvn_draw_skip", arguments)
         self.assertFalse(result["isError"])
         self.assertEqual(json.loads(result["content"][0]["text"])["mode"], "only")
+        self.assertEqual(self.fake.requests[-1]["params"], arguments)
+
+    def test_nvn_draw_dump_of_dispatches_is_forwarded(self):
+        tool = next(tool for tool in debug_mcp.TOOLS if tool["name"] == "nvn_draw_dump")
+        self.assertIn("dispatches of the compute program", tool["description"])
+        self.assertEqual(tool["inputSchema"]["properties"]["count"]["maximum"], 8)
+        arguments = {"hash": "fd1176a6c7fe62ce", "count": 4}
+        result = self.call("nvn_draw_dump", arguments)
+        self.assertFalse(result["isError"])
+        reply = json.loads(result["content"][0]["text"])
+        self.assertEqual((reply["kind"], reply["written"]), ("dispatch", 4))
         self.assertEqual(self.fake.requests[-1]["params"], arguments)
 
     def test_screenshot_becomes_image_content(self):

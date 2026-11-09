@@ -822,34 +822,42 @@ json NvnDrawSkip(ToolState&, const json& params) {
 json NvnDrawDump(ToolState& state, const json& params) {
     if (!params.contains("hash")) {
         const Probe::DumpState dump = Probe::GetDump();
-        return {{"armed", dump.armed},
-                {"done", dump.done},
-                {"hash", Hex(dump.hash)},
-                {"path", dump.path},
-                {"error", dump.error}};
+        return {{"armed", dump.armed},   {"done", dump.done},   {"hash", Hex(dump.hash)},
+                {"kind", dump.kind},     {"count", dump.count}, {"written", dump.written},
+                {"path", dump.path},     {"error", dump.error}};
     }
     const u64 hash = ParseDrawHash(params.at("hash").get<std::string>());
     if (hash == 0) {
         throw std::runtime_error{"hash 0 matches every unused stage"};
     }
+    const u32 count = Param<u32>(params, "count", 1, 1, Probe::MaxDumpCount);
     std::filesystem::create_directories(state.dump_directory);
     const std::string directory = PathText(state.dump_directory);
-    Probe::ArmDump(hash, directory);
+    Probe::ArmDump(hash, directory, count);
     const int wait_ms = Param<int>(params, "wait_ms", 3000, 0, 10000);
     Probe::DumpState dump = Probe::GetDump();
     PollFor(state, std::chrono::milliseconds{wait_ms}, [&] {
         dump = Probe::GetDump();
-        return dump.done && (!dump.path.empty() || !dump.error.empty());
+        return dump.done;
     });
     if (!dump.error.empty()) {
         throw std::runtime_error{dump.error};
     }
-    json out = {{"hash", Hex(hash)}, {"directory", directory}};
+    json out = {{"hash", Hex(hash)}, {"directory", directory}, {"count", count},
+                {"written", dump.written}};
+    if (!dump.kind.empty()) {
+        out["kind"] = dump.kind;
+    }
     if (!dump.path.empty()) {
         out["path"] = dump.path;
-    } else {
-        out["note"] = "Armed: no draw with that hash was recorded yet. Call nvn_draw_dump without "
-                      "arguments later to get the path.";
+    }
+    if (dump.written == 0) {
+        out["note"] = "Armed: no draw or dispatch with that hash was recorded yet. Call "
+                      "nvn_draw_dump without arguments later to get the path.";
+    } else if (!dump.done) {
+        out["note"] = fmt::format("{} of {} written so far; the file grows as more match. Call "
+                                  "nvn_draw_dump without arguments later.",
+                                  dump.written, count);
     }
     return out;
 }

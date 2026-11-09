@@ -339,11 +339,13 @@ void DrawContext::Dispatch(const VC::DispatchPayload& p) {
     // nvn_draws / nvn_draw_skip (video_core/nvn_draw_probe.h): a skipped direct dispatch is
     // recorded with zero groups below, a skipped indirect one is not recorded.
     bool probe_skip = false;
-    if (VideoCommon::NvnDrawProbe::Active()) [[unlikely]] {
-        probe_skip = VideoCommon::NvnDrawProbe::OnDispatch(
-            {.hash = program_hash,
-             .groups = indirect ? std::array<u32, 3>{} : std::array<u32, 3>{p.x, p.y, p.z},
-             .indirect = indirect});
+    const bool probe_active = VideoCommon::NvnDrawProbe::Active();
+    const VideoCommon::NvnDrawProbe::DispatchInfo probe_info{
+        .hash = program_hash,
+        .groups = indirect ? std::array<u32, 3>{} : std::array<u32, 3>{p.x, p.y, p.z},
+        .indirect = indirect};
+    if (probe_active) [[unlikely]] {
+        probe_skip = VideoCommon::NvnDrawProbe::OnDispatch(probe_info);
         if (probe_skip && indirect) {
             skipped();
             return;
@@ -489,6 +491,13 @@ void DrawContext::Dispatch(const VC::DispatchPayload& p) {
     if (!BindDescriptors(*compute, VK_PIPELINE_BIND_POINT_COMPUTE)) {
         skipped();
         return;
+    }
+    // nvn_draw_dump: claimed only now, so every claimed section is written.
+    if (probe_active) [[unlikely]] {
+        if (const auto ticket = VideoCommon::NvnDrawProbe::DumpRequested(probe_info)) {
+            ProbeDispatchDump(*ticket, *compute, *control, p, indirect ? &arguments : nullptr,
+                              program_hash, probe_skip);
+        }
     }
     const Debug::Config& backing_config = Debug::Get();
     if (backing_config.log_backing_program == hash_it->second[STAGE_COMPUTE] &&
