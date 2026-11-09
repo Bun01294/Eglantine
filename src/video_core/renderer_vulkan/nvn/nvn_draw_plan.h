@@ -75,6 +75,9 @@ struct DrawPlan {
         /// Non-zero: the source is a 1x1x1 2D texture sampled as another type; its texel goes
         /// to a 1x1x1 3D scratch (1) or to every face of a cube scratch (6).
         u32 retype_layers{0};
+        /// The source is a 2D texture sampled as 1D: its first row goes to a 1D scratch. Skipped
+        /// like a feedback copy while the scratch still holds it (PruneFreshFeedback).
+        bool retype_row{false};
     };
     std::vector<ImageUse> images;
     std::vector<RangeUse> ranges;

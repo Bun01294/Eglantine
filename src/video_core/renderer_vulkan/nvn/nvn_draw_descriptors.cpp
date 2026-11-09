@@ -1389,22 +1389,28 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                                                      scratch});
                         }
                     } else {
-                        // A 1x1x1 2D placeholder where the shader samples a 3D or cube texture:
-                        // sample a one-texel image of the shader's type holding its texel (what
-                        // the hardware returns for a single texel), refreshed by a copy per draw.
+                        // A 2D placeholder where the shader samples a 3D or cube texture: sample a
+                        // one-texel image of the shader's type holding its texel (what the
+                        // hardware returns for a single texel), refreshed by a copy per draw. One
+                        // sampled as 1D (Hyrule Warriors' vertex shaders on its 8x8 default
+                        // texture): a 1D image holding its first row.
+                        const bool row = binding.type == Shader::TextureType::Color1D;
                         const bool typed_target =
-                            binding.type == Shader::TextureType::Color3D ||
+                            row || binding.type == Shader::TextureType::Color3D ||
                             binding.type == Shader::TextureType::ColorCube ||
                             binding.type == Shader::TextureType::ColorArrayCube;
                         if (typed_target && !is_image && s.type == VK_IMAGE_TYPE_2D &&
                             s.levels == 1 && s.layers == 1 &&
-                            (binding.type == Shader::TextureType::Color3D ||
+                            (row || binding.type == Shader::TextureType::Color3D ||
                              s.extent.width == s.extent.height) &&
                             s.layers == 1 && s.samples == VK_SAMPLE_COUNT_1_BIT &&
                             !s.host.depth && !s.host.stencil) {
-                            const bool cube = binding.type != Shader::TextureType::Color3D;
+                            const bool cube = !row && binding.type != Shader::TextureType::Color3D;
+                            const auto target = row    ? DrawResources::RetypeTarget::Row
+                                                : cube ? DrawResources::RetypeTarget::Cube
+                                                       : DrawResources::RetypeTarget::Volume;
                             DrawResources::Scratch* made = resources.GetRetypedScratch(
-                                s, 200u + static_cast<u32>(binding.type), cube);
+                                s, 200u + static_cast<u32>(binding.type), target);
                             if (made) {
                                 if (placeholder_logged
                                         .insert(texture->serial << 8 ^ static_cast<u64>(binding.type))
@@ -1412,11 +1418,14 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                                     LOG_INFO(Render_Vulkan,
                                              "[nvn] texture {:#x} ({}x{} 2D, format {:#x}) is "
                                              "sampled as {} by program {:016x} stage {}: bound as "
-                                             "a one-texel {} holding its texel",
+                                             "{}",
                                              texture->serial, s.extent.width, s.extent.height,
-                                             s.desc.format, cube ? "a cube" : "a 3D texture",
+                                             s.desc.format,
+                                             row ? "1D" : cube ? "a cube" : "a 3D texture",
                                              ProfStageHash(stage), stage,
-                                             cube ? "cube" : "3D texture");
+                                             row    ? "a 1D texture holding its first row"
+                                             : cube ? "a one-texel cube holding its texel"
+                                                    : "a one-texel 3D texture holding its texel");
                                 }
                                 const u32 faces = cube ? 6u : 1u;
                                 bool have_copy = false;
@@ -1426,9 +1435,11 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                                 }
                                 if (!have_copy) {
                                     plan.feedback.push_back({texture->storage, made->storage,
-                                                             made->texture, 0, 1, 0, 1, faces});
+                                                             made->texture, 0, 1, 0, 1,
+                                                             row ? 0u : faces, row});
                                 }
-                                key.type = !cube ? VK_IMAGE_VIEW_TYPE_3D
+                                key.type = row     ? VK_IMAGE_VIEW_TYPE_1D
+                                           : !cube ? VK_IMAGE_VIEW_TYPE_3D
                                            : binding.type == Shader::TextureType::ColorCube
                                                ? VK_IMAGE_VIEW_TYPE_CUBE
                                                : VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
@@ -1645,6 +1656,26 @@ void DrawContext::RecordFeedbackCopies(DrawPlan& plan) {
                                           region);
             }
             host->HostMarkWritten();
+            ++counters.placeholder_copies;
+            continue;
+        }
+        if (copy.retype_row) {
+            // A 2D texture sampled as 1D: its first row of level 0.
+            const VkImageCopy region{
+                .srcSubresource = {.aspectMask = source.aspect, .mipLevel = 0,
+                                   .baseArrayLayer = 0, .layerCount = 1},
+                .srcOffset = {0, 0, 0},
+                .dstSubresource = {.aspectMask = source.aspect, .mipLevel = 0,
+                                   .baseArrayLayer = 0, .layerCount = 1},
+                .dstOffset = {0, 0, 0},
+                .extent = {source.extent.width, 1, 1},
+            };
+            host->HostCmd().CopyImage(*source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                      *scratch.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
+            host->HostMarkWritten();
+            if (DrawResources::Scratch* record = resources.FindScratch(scratch)) {
+                record->copied.Record(copy.source, this, render_target_epoch.value, {0, 1, 0, 1});
+            }
             ++counters.placeholder_copies;
             continue;
         }

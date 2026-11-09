@@ -447,10 +447,13 @@ struct DrawResources {
     Scratch* GetScratch(const Storage& source, u32 slot);
     /// The scratch whose image is `storage` (null when it is not one).
     Scratch* FindScratch(const Storage& storage);
-    /// A scratch image of one texel of `source`'s format and the type a shader samples it as: a
-    /// 1x1x1 3D image (`cube` false) or a 1x1x6 cube-compatible 2D image (`cube` true). `slot`
-    /// tells apart the scratches of one draw. Created lazily and kept. Null on failure.
-    Scratch* GetRetypedScratch(const Storage& source, u32 slot, bool cube);
+    /// The type a shader samples a 2D texture as (GetRetypedScratch).
+    enum class RetypeTarget { Volume, Cube, Row };
+    /// A scratch image of `source`'s format and the type a shader samples it as: a one-slice 3D
+    /// image (Volume), a cube-compatible 2D image of six faces (Cube) or a 1D image of its width
+    /// (Row). `slot` tells apart the scratches of one draw. Created lazily and kept. Null on
+    /// failure.
+    Scratch* GetRetypedScratch(const Storage& source, u32 slot, RetypeTarget target);
 
     // --- arena ---
     std::mutex arena_mutex;
