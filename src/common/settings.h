@@ -924,6 +924,13 @@ struct Values {
     bool record_frame_times;
     Setting<bool> use_gdbstub{linkage, false, "use_gdbstub", Category::Debugging};
     Setting<u16> gdbstub_port{linkage, 6543, "gdbstub_port", Category::Debugging};
+    // Built-in MCP server (see tools/mcp/README.md). Loopback only, off by default.
+    Setting<bool> enable_mcp_server{linkage, false, "enable_mcp_server", Category::Debugging};
+    Setting<u16> mcp_port{linkage, 6544, "mcp_port", Category::Debugging};
+    // Never saved: Allow Writes is granted per session (menu or --mcp-allow-writes), not remembered.
+    Setting<bool> mcp_allow_writes{linkage, false, "mcp_allow_writes", Category::Debugging,
+                                   Specialization::Default, false};
+    Setting<std::string> mcp_token{linkage, std::string{}, "mcp_token", Category::Debugging};
     SwitchableSetting<std::string> program_args{linkage,
                                                 std::string(),
                                                 "program_args",

@@ -62,6 +62,16 @@
 #include "util/overlay_dialog.h"
 
 #include "multiplayer/state.h"
+#ifdef YUZU_ENABLE_MCP
+#include <atomic>
+#include <thread>
+#include <QClipboard>
+#include <QCoreApplication>
+#include <QGuiApplication>
+#include <QSignalBlocker>
+#include "mcp/server.h"
+#include "yuzu/mcp_host_qt.h"
+#endif
 
 // Qt Stuff //
 #define QT_NO_OPENGL
@@ -587,6 +597,9 @@ MainWindow::MainWindow(bool has_broken_vulkan)
         auto const lp =
             Core::ParseLaunchParams(*QtCommon::system, args_cstr.size(), args_cstr.data(), nullptr);
 
+        // Before booting, so the server records the boot.
+        MaybeStartMcpServer(lp.mcp_enable, lp.mcp_port, lp.mcp_allow_writes);
+
         // Override fullscreen setting if gamepath or argument is provided
         if (!lp.filepath.empty() || lp.fullscreen) {
             ui->action_Fullscreen->setChecked(lp.fullscreen);
@@ -608,14 +621,243 @@ MainWindow::MainWindow(bool has_broken_vulkan)
                 QString::fromStdString(hbl_path),
                 LibraryAppletParameters(0x010000000000100Dull, Service::AM::AppletId::QLaunch));
         }
+    } else {
+        MaybeStartMcpServer(false, std::nullopt, false);
     }
 }
+
+void MainWindow::MaybeStartMcpServer([[maybe_unused]] bool cli_enable,
+                                     [[maybe_unused]] std::optional<u16> cli_port,
+                                     [[maybe_unused]] bool cli_allow_writes) {
+#ifdef YUZU_ENABLE_MCP
+    mcp_cli_port = cli_port;
+    mcp_cli_allow_writes = cli_allow_writes;
+    SetupMcpMenu();
+    // Always-on indicator (created in InitializeWidgets; the game status labels only update
+    // while a game runs, this one every second).
+    connect(&mcp_status_timer, &QTimer::timeout, this, &MainWindow::UpdateMcpStatusLabel);
+    mcp_status_timer.start(1000);
+    if (cli_enable || Settings::values.enable_mcp_server.GetValue()) {
+        StartMcpServer();
+    }
+    UpdateMcpMenu();
+#endif
+}
+
+#ifdef YUZU_ENABLE_MCP
+void MainWindow::StartMcpServer() {
+    if (mcp_server || mcp_stopping) {
+        return;
+    }
+    Mcp::ServerConfig mcp_config;
+    mcp_config.port = mcp_cli_port.value_or(Settings::values.mcp_port.GetValue());
+    mcp_config.allow_writes = mcp_cli_allow_writes || Settings::values.mcp_allow_writes.GetValue();
+    mcp_config.bearer_token = Settings::values.mcp_token.GetValue();
+
+    if (!mcp_host) {
+        mcp_host = std::make_unique<QtMcpHost>(*this);
+        connect(this, &MainWindow::statsUpdated, this,
+                [this](const Core::PerfStatsResults& results,
+                       const VideoCore::ShaderNotify& shaders) {
+                    if (mcp_host) {
+                        mcp_host->OnStatsUpdated(results, shaders);
+                    }
+                });
+    }
+    mcp_server = std::make_unique<Mcp::Server>(*QtCommon::system, *mcp_host, mcp_config);
+    if (const std::string error = mcp_server->Start(); !error.empty()) {
+        mcp_last_error = error;
+        mcp_server.reset();
+        statusBar()->showMessage(
+            tr("MCP server failed to start: %1").arg(QString::fromStdString(error)), 15000);
+        return;
+    }
+    mcp_last_error.clear();
+}
+
+void MainWindow::StopMcpServer() {
+    if (!mcp_server) {
+        return;
+    }
+    // Stopping waits for in-flight requests, and some of those (pause, boot, TAS...) wait for
+    // this GUI thread: stop on a helper thread and keep handling events until it is done.
+    // The member is cleared here first, so the events handled meanwhile see no server.
+    std::unique_ptr<Mcp::Server> stopping = std::move(mcp_server);
+    mcp_stopping = true;
+    std::atomic<bool> done{false};
+    std::thread stopper{[&stopping, &done] {
+        stopping.reset();
+        done = true;
+    }};
+    while (!done) {
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+    }
+    stopper.join();
+    mcp_stopping = false;
+}
+
+void MainWindow::SetupMcpMenu() {
+    if (mcp_menu) {
+        return;
+    }
+    ui->menu_Tools->addSeparator();
+    mcp_menu = ui->menu_Tools->addMenu(tr("MCP Server"));
+    mcp_status_action = mcp_menu->addAction(QString{});
+    mcp_status_action->setEnabled(false);
+    mcp_menu->addSeparator();
+
+    mcp_enable_action = mcp_menu->addAction(tr("Enabled"));
+    mcp_enable_action->setCheckable(true);
+    connect(mcp_enable_action, &QAction::toggled, this, [this](bool enabled) {
+        Settings::values.enable_mcp_server.SetValue(enabled);
+        if (enabled) {
+            StartMcpServer();
+        } else {
+            StopMcpServer();
+        }
+        UpdateMcpMenu();
+    });
+
+    mcp_writes_action = mcp_menu->addAction(tr("Allow Writes (input, memory, TAS, determinism)"));
+    mcp_writes_action->setCheckable(true);
+    connect(mcp_writes_action, &QAction::toggled, this, [this](bool allowed) {
+        // --mcp-allow-writes only sets the starting state: the menu overrides it.
+        mcp_cli_allow_writes = false;
+        Settings::values.mcp_allow_writes.SetValue(allowed); // not saved to the config
+        if (mcp_server) {
+            mcp_server->SetWritesAllowed(allowed);
+        }
+        UpdateMcpMenu();
+    });
+
+
+    mcp_menu->addSeparator();
+    const auto url = [this] {
+        const u16 port = mcp_cli_port.value_or(Settings::values.mcp_port.GetValue());
+        return QStringLiteral("http://127.0.0.1:%1/mcp").arg(port);
+    };
+    connect(mcp_menu->addAction(tr("Open Dashboard")), &QAction::triggered, this, [this] {
+        const u16 port = mcp_cli_port.value_or(Settings::values.mcp_port.GetValue());
+        QDesktopServices::openUrl(QUrl{QStringLiteral("http://127.0.0.1:%1/").arg(port)});
+    });
+    connect(mcp_menu->addAction(tr("Copy Connection URL")), &QAction::triggered, this,
+            [url] { QGuiApplication::clipboard()->setText(url()); });
+    connect(mcp_menu->addAction(tr("Copy Claude Code Command")), &QAction::triggered, this,
+            [url] {
+                QGuiApplication::clipboard()->setText(
+                    QStringLiteral("claude mcp add --transport http eglantine %1").arg(url()));
+            });
+}
+
+void MainWindow::UpdateMcpMenu() {
+    if (!mcp_menu) {
+        return;
+    }
+    const QSignalBlocker block_enable{mcp_enable_action};
+    const QSignalBlocker block_writes{mcp_writes_action};
+    mcp_enable_action->setChecked(mcp_server != nullptr);
+    mcp_writes_action->setChecked(mcp_cli_allow_writes ||
+                                  Settings::values.mcp_allow_writes.GetValue());
+    if (mcp_server) {
+        mcp_status_action->setText(
+            tr("Listening on %1").arg(QString::fromStdString(mcp_server->Url())));
+    } else if (!mcp_last_error.empty()) {
+        mcp_status_action->setText(
+            tr("Failed: %1").arg(QString::fromStdString(mcp_last_error)));
+    } else {
+        mcp_status_action->setText(tr("Stopped"));
+    }
+    UpdateMcpStatusLabel();
+}
+
+void MainWindow::UpdateMcpStatusLabel() {
+    if (!mcp_status_label) {
+        return;
+    }
+    // Shown only while the server runs, or when it was turned on but could not start.
+    if (!mcp_server) {
+        mcp_status_label->setVisible(!mcp_last_error.empty());
+        mcp_status_label->setText(tr("MCP failed"));
+        mcp_status_label->setStyleSheet(QStringLiteral("color: #e05555;"));
+        mcp_status_label->setToolTip(QString::fromStdString(mcp_last_error));
+        return;
+    }
+    mcp_status_label->setVisible(true);
+    const auto s = mcp_server->GetSummary();
+    const auto& a = s.activity;
+    const auto idle_s =
+        a.tool_calls == 0
+            ? -1
+            : std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() -
+                                                               a.last_tool_time)
+                  .count();
+    const bool active = idle_s >= 0 && idle_s < 10;
+
+    QStringList parts;
+    parts << QStringLiteral("MCP :%1").arg(mcp_server->Config().port);
+    if (!s.controller.empty()) {
+        parts << tr("agent: %1").arg(QString::fromStdString(s.controller));
+    } else if (s.sessions > 0) {
+        parts << tr("%n client(s)", "", static_cast<int>(s.sessions));
+    }
+    if (a.recording) {
+        parts << tr("REC %1 (%2 frames, %3 checkpoints)")
+                     .arg(QString::fromStdString(a.record_name))
+                     .arg(a.record_frames)
+                     .arg(a.record_checkpoints);
+    }
+    // A finished route stays visible for 30 s, then the indicator goes back to idle.
+    const bool route_recent =
+        a.route_state == "running" ||
+        std::chrono::steady_clock::now() - a.route_changed < std::chrono::seconds{30};
+    if (!a.route.empty() && !a.route_state.empty() && route_recent) {
+        parts << tr("route %1 %2/%3 %4")
+                     .arg(QString::fromStdString(a.route))
+                     .arg(a.route_step)
+                     .arg(a.route_total)
+                     .arg(QString::fromStdString(a.route_state));
+    }
+    if (active) {
+        parts << tr("last: %1").arg(QString::fromStdString(a.last_tool));
+    }
+    mcp_status_label->setText(parts.join(QStringLiteral(" · ")));
+    // Red while recording, accent while an agent is acting, plain when idle.
+    mcp_status_label->setStyleSheet(a.recording ? QStringLiteral("color: #e05555;")
+                                    : active    ? QStringLiteral("color: #4aa3ff;")
+                                                : QString{});
+    QString tip = tr("MCP server %1\nClients: %2\nWrites: %3\nControl: %4\nTool calls: %5")
+                      .arg(QString::fromStdString(s.url))
+                      .arg(s.sessions)
+                      .arg(s.writes ? tr("allowed") : tr("off"))
+                      .arg(s.controller.empty() ? tr("free") : QString::fromStdString(s.controller))
+                      .arg(a.tool_calls);
+    if (idle_s >= 0) {
+        tip += tr("\nLast call: %1 (%2 s ago)").arg(QString::fromStdString(a.last_tool)).arg(idle_s);
+    }
+    if (!a.route_detail.empty()) {
+        tip += QStringLiteral("\n") + QString::fromStdString(a.route_detail);
+    }
+    tip += tr("\nDashboard: %1").arg(QString::fromStdString(s.url.substr(0, s.url.size() - 3)));
+    // Tooltips auto-detect rich text; the agent/route/tool names in here come from MCP clients.
+    tip.replace(QLatin1Char('<'), QStringLiteral("\u2039"));
+    mcp_status_label->setToolTip(tip);
+}
+#endif
 
 MainWindow::~MainWindow() {
     if (nup_cancel) {
         nup_cancel->store(true);
     }
     nup_watcher.waitForFinished();
+#ifdef YUZU_ENABLE_MCP
+    // Normally stopped in closeEvent already; this is the fallback (e.g. quit() without a close).
+    // Not mcp_server.reset(): stopping joins the HTTP workers, and a worker inside a host call
+    // waits for this very thread, so StopMcpServer stops it on a helper thread while pumping
+    // events. The event loop has ended by now but the QApplication is alive (it outlives the
+    // window in main()), so those calls are still served.
+    StopMcpServer();
+    mcp_host.reset();
+#endif
 #ifdef __APPLE__
     AllowOSSleep();
 #endif
@@ -1054,6 +1296,19 @@ void MainWindow::InitializeWidgets() {
 
     statusBar()->addPermanentWidget(multiplayer_state->GetStatusText(), 0);
     statusBar()->addPermanentWidget(multiplayer_state->GetStatusIcon(), 0);
+
+#ifdef YUZU_ENABLE_MCP
+    // The widgets below are each inserted at 0, so this first one ends up rightmost of the group
+    // (after TAS, volume and the other toggles).
+    mcp_status_label = new QLabel();
+    mcp_status_label->setObjectName(QStringLiteral("McpStatusLabel"));
+    // Agent names, route names and tool names are client-supplied: never interpret them as rich
+    // text (an <img src="\\host\share"> in a QLabel would be fetched).
+    mcp_status_label->setTextFormat(Qt::PlainText);
+    mcp_status_label->setFocusPolicy(Qt::NoFocus);
+    mcp_status_label->setContentsMargins(4, 0, 4, 0);
+    statusBar()->insertPermanentWidget(0, mcp_status_label);
+#endif
 
     tas_label = new QLabel();
     tas_label->setObjectName(QStringLiteral("TASlabel"));
@@ -5139,6 +5394,11 @@ void MainWindow::closeEvent(QCloseEvent* event) {
         return;
     }
     LOG_INFO(Frontend, "Closing frontend after emulation cleanup");
+
+#ifdef YUZU_ENABLE_MCP
+    // While the event loop still runs: in-flight requests may be waiting for this thread.
+    StopMcpServer();
+#endif
 
     UpdateUISettings();
     game_list->SaveInterfaceLayout();
