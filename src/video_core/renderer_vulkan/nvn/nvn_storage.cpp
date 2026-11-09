@@ -974,7 +974,7 @@ void Context::Impl::LogStorageCensus() {
         u64 count{};
         u64 bytes{};
     };
-    Kind sparse, targets, depth, astc, other, gpu_written;
+    Kind sparse, targets, depth, astc, astc_bc, other, gpu_written;
     u64 sparse_bound = 0;
     std::vector<const Storage*> largest;
     const auto add = [&](const Storage& s) {
@@ -988,6 +988,10 @@ void Context::Impl::LogStorageCensus() {
                                               : other;
         ++kind.count;
         kind.bytes += s.vram_bytes;
+        if (s.host.bc_standin) {
+            ++astc_bc.count;
+            astc_bc.bytes += s.vram_bytes;
+        }
         if (s.sparse) {
             sparse_bound += s.sparse->BoundBytes();
         }
@@ -1011,10 +1015,11 @@ void Context::Impl::LogStorageCensus() {
     const auto mib = [](u64 bytes) { return bytes >> 20; };
     LOG_INFO(Render_Vulkan,
              "[nvn] storage census: {} images, estimated MiB (count): sparse {} ({}, bound {}), depth {} "
-             "({}), colour targets {} ({}), compressed stand-ins {} ({}), other {} ({}); GPU-written {} "
-             "({}); cache {} MiB; sparse pages {} MiB",
+             "({}), colour targets {} ({}), compressed stand-ins {} ({}; as {} {} ({})), other {} "
+             "({}); GPU-written {} ({}); cache {} MiB; sparse pages {} MiB",
              seen.size(), mib(sparse.bytes), sparse.count, mib(sparse_bound), mib(depth.bytes),
              depth.count, mib(targets.bytes), targets.count, mib(astc.bytes), astc.count,
+             AstcStandinName(astc_standin), mib(astc_bc.bytes), astc_bc.count,
              mib(other.bytes), other.count, mib(gpu_written.bytes), gpu_written.count,
              mib(storage_cache_bytes), sparse_pages ? mib(sparse_pages->UsedBytes()) : 0);
     {
@@ -1058,7 +1063,10 @@ void Context::Impl::LogStorageCensus() {
         LOG_INFO(Render_Vulkan, "[nvn] storage census: #{} {}x{}x{} lv {} fmt {:#x} flags {:#x} {} MiB{}{}{}",
                  i + 1, s.extent.width, s.extent.height, s.layers, s.levels, s.desc.format,
                  s.desc.flags, mib(s.vram_bytes), s.sparse ? " sparse" : "",
-                 s.host.needs_transcode ? " stand-in" : "",
+                 s.host.bc_standin        ? (BcStandinBlockBytes(s.host) == 8 ? " stand-in BC1"
+                                                                                 : " stand-in BC3")
+                 : s.host.needs_transcode ? " stand-in"
+                                          : "",
                  s.origin == StorageOrigin::Gpu ? " gpu-written" : "");
     }
 }

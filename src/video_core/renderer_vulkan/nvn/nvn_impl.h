@@ -36,6 +36,7 @@
 #include "video_core/renderer_vulkan/nvn/nvn_debug.h"
 #include "video_core/renderer_vulkan/nvn/nvn_alias_gpu.h"
 #include "video_core/renderer_vulkan/nvn/nvn_astc_gpu.h"
+#include "video_core/renderer_vulkan/nvn/nvn_bc_encode.h"
 #include "video_core/renderer_vulkan/nvn/nvn_mesh_indirect.h"
 #include "video_core/renderer_vulkan/nvn/nvn_untile_gpu.h"
 #include "video_core/renderer_vulkan/nvn/nvn_vertex_stage_gpu.h"
@@ -718,6 +719,7 @@ struct Context::Impl {
         std::atomic<u64> astc_gpu_uploads{};     ///< ASTC storages decoded on the GPU (no CPU work)
         std::atomic<u64> astc_gpu_bytes{};       ///< ... guest bytes they read
         std::atomic<u64> astc_cpu_fallbacks{};   ///< ASTC storages with GPU decode enabled that took the CPU path
+        std::atomic<u64> astc_bc_encodes{};      ///< ASTC uploads re-encoded into a BC stand-in
         std::atomic<u64> untile_gpu_uploads{};   ///< block-linear storages untiled on the GPU
         std::atomic<u64> untile_gpu_direct{};    ///< ... read in place (imported / GPU-only pool)
         std::atomic<u64> untile_gpu_bytes{};     ///< ... linear bytes they produced
@@ -1155,6 +1157,21 @@ struct Context::Impl {
     std::future<std::unique_ptr<AstcGpuDecoder>> astc_decoder_future;
     bool astc_decoder_failed{false};
     [[nodiscard]] AstcGpuDecoder* AstcDecoder();
+    /// What ASTC stand-ins hold (nvn_format.h AstcStandin): EDEN_NX2_NVN_ASTC_STANDIN over the
+    /// astc_recompression setting, Rgba8 on devices that hold ASTC or cannot run the BC encoder.
+    AstcStandin astc_standin{AstcStandin::Rgba8};
+    /// The BC encoder of the BC stand-ins (nvn_bc_encode.h), compiled on a worker at startup like
+    /// the ASTC decoder; BcEncoder() waits for it (a BC stand-in has no other way to get texels).
+    std::unique_ptr<BcGpuEncoder> bc_encoder;
+    std::future<std::unique_ptr<BcGpuEncoder>> bc_encoder_future;
+    bool bc_encoder_failed{false};
+    [[nodiscard]] BcGpuEncoder* BcEncoder();
+    /// Replay thread: the scratch BC stand-in uploads reuse (grown up to BC_SCRATCH_BUDGET).
+    /// AcquireBcScratch returns it, a bigger one, or a one-off for a single layer above the
+    /// budget; null when no image could be created (logged once).
+    std::shared_ptr<BcScratch> bc_scratch;
+    bool bc_scratch_failed_logged{false};
+    [[nodiscard]] std::shared_ptr<BcScratch> AcquireBcScratch(u32 width, u32 height, u32 layers);
     /// Block-linear untiling on the GPU (nvn_untile_gpu.h), created like the ASTC decoder on a
     /// worker at startup; uploads before it is ready untile on the CPU. Null when creation failed.
     bool untile_gpu_enabled{false};

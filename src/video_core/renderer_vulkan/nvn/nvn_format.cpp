@@ -6,6 +6,7 @@
 // dm/gfx/nvn/nvn_tex.c.
 
 #include <array>
+#include <string_view>
 
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/nvn/nvn_format.h"
@@ -213,6 +214,84 @@ std::optional<HostFormat> ResolveHostFormat(const Device& device, s32 nvn_format
         }
     }
     return result;
+}
+
+AstcStandin ChooseAstcStandin(const char* environment, Settings::AstcRecompression setting) {
+    if (environment != nullptr) {
+        const std::string_view value{environment};
+        if (value == "rgba8") {
+            return AstcStandin::Rgba8;
+        }
+        if (value == "bc1") {
+            return AstcStandin::Bc1;
+        }
+        if (value == "bc3") {
+            return AstcStandin::Bc3;
+        }
+    }
+    switch (setting) {
+    case Settings::AstcRecompression::Bc1:
+        return AstcStandin::Bc1;
+    case Settings::AstcRecompression::Bc3:
+        return AstcStandin::Bc3;
+    default:
+        return AstcStandin::Rgba8;
+    }
+}
+
+const char* AstcStandinName(AstcStandin standin) {
+    switch (standin) {
+    case AstcStandin::Bc1:
+        return "BC1";
+    case AstcStandin::Bc3:
+        return "BC3";
+    default:
+        return "RGBA8";
+    }
+}
+
+HostFormat ToBcStandin(const HostFormat& host, AstcStandin standin) {
+    if (!host.needs_transcode || standin == AstcStandin::Rgba8 ||
+        !VideoCore::Surface::IsPixelFormatASTC(host.pixel_format)) {
+        return host;
+    }
+    const bool srgb = VideoCore::Surface::IsPixelFormatSRGB(host.pixel_format);
+    HostFormat result = host;
+    result.format = standin == AstcStandin::Bc1
+                        ? (srgb ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK)
+                        : (srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK);
+    result.bc_standin = true;
+    result.attachable = false;
+    result.storage = false;
+    result.storage_view = VK_FORMAT_UNDEFINED;
+    result.storage_alias = false;
+    return result;
+}
+
+u32 BcStandinBlockBytes(const HostFormat& host) {
+    if (!host.bc_standin) {
+        return 0;
+    }
+    switch (host.format) {
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+        return 8;
+    case VK_FORMAT_BC3_UNORM_BLOCK:
+    case VK_FORMAT_BC3_SRGB_BLOCK:
+        return 16;
+    default:
+        return 0;
+    }
+}
+
+bool ViewsBcStandin(VkFormat format, VkFormat standin) {
+    const auto bc1 = [](VkFormat f) {
+        return f == VK_FORMAT_BC1_RGBA_UNORM_BLOCK || f == VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
+    };
+    const auto bc3 = [](VkFormat f) {
+        return f == VK_FORMAT_BC3_UNORM_BLOCK || f == VK_FORMAT_BC3_SRGB_BLOCK;
+    };
+    return (bc1(format) && bc1(standin)) || (bc3(format) && bc3(standin));
 }
 
 VkFormat SameSizeUintFormat(u32 bytes) {

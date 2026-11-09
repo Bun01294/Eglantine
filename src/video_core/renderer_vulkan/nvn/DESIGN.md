@@ -439,6 +439,19 @@ copy. Its pipeline compiles on `NvnAstcInit` without sharing an externally-synch
 cache; uploads before it is ready, other pool kinds, and unsupported layouts use the CPU path.
 `EDEN_NX2_NVN_NO_ASTC_GPU=1` forces the CPU path, and `EDEN_NX2_NVN_ASTC_VERIFY=1` additionally does
 the CPU decode and a readback comparison (slow, for validation).
+**BC stand-ins.** With the `astc_recompression` setting at Bc1/Bc3 (or `EDEN_NX2_NVN_ASTC_STANDIN=
+rgba8|bc1|bc3`, which overrides it) the 2D single-sample ASTC stand-ins are BC1_RGBA / BC3 images
+(UNORM or SRGB as the ASTC format; `ToBcStandin` in `BuildTexture`, `HostFormat::bc_standin`), an
+eighth / a quarter of the RGBA8 memory. Their upload decodes into a reused RGBA8 scratch image
+(`nvn_bc_encode.h` `BcScratch`, up to 64 MiB of texels per fill, a level's layers in chunks), runs
+the emulated path's `bc_encoder.comp` into the scratch's block buffer and copies the blocks into the
+level (`Recorder::RecordBcUpload`): the GPU decoder fills the scratch from the pool, the CPU path's
+decoded staging is copied into it, a partial CopyBufferToTexture likewise (4x4-aligned regions
+only). Tile-backed sparse, 3D and multisampled ASTC storages stay RGBA8. A BC stand-in cannot be
+cleared, bound as an image, viewed in a non-BC format, or copied to/from another stand-in in regions
+that cut its 4x4 blocks (unsupported, logged); the storage census counts them as `as BC3 ...`.
+`renderer_vulkan.cpp` still pins the setting's override to Uncompressed so `MaxwellToVK` returns
+RGBA8; the replay reads the saved value itself.
 Block-linear storages that need no decode (every texel size, BCn blocks the device holds, 2D, arrays,
 3D, mip chains) of 64 KiB or more are untiled on the GPU (`nvn_untile_gpu.cpp`, idea from
 switch2-recomp's "GPU untile"): the emulated path's `block_linear_unswizzle_3d_bcn.comp` (its

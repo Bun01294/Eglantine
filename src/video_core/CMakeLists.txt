@@ -229,6 +229,8 @@ add_library(video_core STATIC
     renderer_vulkan/nvn/nvn_astc_gpu.h
     renderer_vulkan/nvn/nvn_backing_log.h
     renderer_vulkan/nvn/nvn_barrier.h
+    renderer_vulkan/nvn/nvn_bc_encode.cpp
+    renderer_vulkan/nvn/nvn_bc_encode.h
     renderer_vulkan/nvn/nvn_barrier_track.h
     renderer_vulkan/nvn/nvn_compute.cpp
     renderer_vulkan/nvn/nvn_condition_prefetch.h

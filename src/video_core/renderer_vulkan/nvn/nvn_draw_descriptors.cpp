@@ -797,6 +797,11 @@ bool DrawContext::ViewKeyOf(const Texture& texture, const Storage& s, Shader::Te
             compatible = false;
         }
     }
+    if (s.host.bc_standin && !ViewsBcStandin(key.format, s.host.format)) {
+        // A view of another format than the BC stand-in's (a reinterpretation of the ASTC bytes)
+        // cannot address its blocks.
+        compatible = false;
+    }
     slot.texture = &texture;
     slot.serial = texture.serial;
     slot.storage = &s;

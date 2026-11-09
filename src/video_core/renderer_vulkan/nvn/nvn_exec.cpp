@@ -466,6 +466,17 @@ public:
         u64 size = 0;
         if (const u32 bytes = Debug::PixelBytes(storage.host.format, aspect); bytes != 0) {
             size = static_cast<u64>(width) * height * bytes;
+        } else if (const u32 bc_bytes = BcStandinBlockBytes(storage.host); bc_bytes != 0) {
+            // The BC blocks the stand-in holds, decoded as that BC format.
+            const bool srgb = VideoCore::Surface::IsPixelFormatSRGB(storage.host.pixel_format);
+            readback.bcn = true;
+            readback.pixel_format =
+                bc_bytes == 8
+                    ? (srgb ? VideoCore::Surface::PixelFormat::BC1_RGBA_SRGB
+                            : VideoCore::Surface::PixelFormat::BC1_RGBA_UNORM)
+                    : (srgb ? VideoCore::Surface::PixelFormat::BC3_SRGB
+                            : VideoCore::Surface::PixelFormat::BC3_UNORM);
+            size = BcBlocksSize(width, height, 1, bc_bytes);
         } else if (VideoCore::Surface::IsPixelFormatBCn(storage.host.pixel_format)) {
             const BlockInfo block = FormatBlockInfo(storage.desc.format);
             if (block.bytes == 0) {
@@ -644,6 +655,21 @@ private:
     /// records the dispatches and leaves the image in GENERAL layout. False (nothing recorded)
     /// when the storage or its pool cannot take that path; the caller then decodes on the CPU.
     bool UploadAstcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool);
+    /// The levels UploadAstcOnGpu decodes, false when the storage or its pool cannot take the GPU
+    /// path (nothing recorded).
+    bool AstcGpuLevels(Storage& s, const UploadPlan& plan, Pool& pool,
+                       const AstcGpuDecoder& decoder, std::vector<AstcGpuDecoder::Level>& levels);
+    /// UploadAstcOnGpu for a BC stand-in: decodes into the BC scratch, chunk by chunk, and encodes.
+    bool UploadAstcBcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool);
+    /// A BC stand-in's RGBA8 texels decoded by the CPU into `staging` (`plan`'s pieces): copied
+    /// into the BC scratch, encoded and copied into the image.
+    void UploadBcFromStaging(Storage& s, const UploadPlan& plan, const StagingRange& staging);
+    /// Records every chunk of a BC stand-in upload: `fill` writes the chunk's RGBA8 texels into
+    /// layers [0, chunk.layers) of the scratch (GENERAL layout), then they are encoded and copied
+    /// into `s` at the chunk's level, layers and offset. `guest_contents`: the texels are the
+    /// guest's bytes (an upload), not a GPU write. False when nothing could be recorded.
+    bool RecordBcUpload(Storage& s, std::span<const BcChunk> chunks, bool guest_contents,
+                        const std::function<void(const BcChunk&, BcScratch&)>& fill);
     /// Untiles a block-linear storage that needs no decode on the GPU (nvn_untile_gpu.h): from its
     /// imported or GPU-only pool in place, else from a copy of the tiled bytes `data` in staging, into a
     /// device-local buffer copied into the image with the CPU path's regions. False (nothing
@@ -1877,9 +1903,11 @@ void Recorder::UploadStorage(Storage& s) {
     auto log_filled = log_hashed;
     UploadStats upload_stats;
     bool on_gpu = false;
-    if (s.astc_gpu && impl.astc_gpu_enabled && plan.decode == UploadPlan::Decode::Astc) {
-        on_gpu = UploadAstcOnGpu(s, plan, pool);
-        if (on_gpu && Debug::Get().astc_verify) {
+    if ((s.astc_gpu || s.host.bc_standin) && impl.astc_gpu_enabled &&
+        plan.decode == UploadPlan::Decode::Astc) {
+        on_gpu = s.host.bc_standin ? UploadAstcBcOnGpu(s, plan, pool)
+                                   : UploadAstcOnGpu(s, plan, pool);
+        if (on_gpu && Debug::Get().astc_verify && !s.host.bc_standin) {
             VerifyAstcGpu(s, plan, data, size);
         }
         if (!on_gpu) {
@@ -1911,14 +1939,18 @@ void Recorder::UploadStorage(Storage& s) {
         impl.stats.upload_bytes.fetch_add(plan.staging_size, std::memory_order_relaxed);
         impl.stats.decode_ns.fetch_add(upload_stats.decode_ns, std::memory_order_relaxed);
         impl.stats.decode_bytes.fetch_add(upload_stats.decode_bytes, std::memory_order_relaxed);
-        const std::vector<VkBufferImageCopy> regions = MakeUploadRegions(s, plan, staging.offset);
-        const bool saved = track_writes;
-        track_writes = false;
-        PrepareImages({{&s, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
-        track_writes = saved;
-        Cmd().CopyBufferToImage(staging.buffer, *s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                regions);
-        barrier_pending = true;
+        if (s.host.bc_standin) {
+            UploadBcFromStaging(s, plan, staging);
+        } else {
+            const std::vector<VkBufferImageCopy> regions = MakeUploadRegions(s, plan, staging.offset);
+            const bool saved = track_writes;
+            track_writes = false;
+            PrepareImages({{&s, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
+            track_writes = saved;
+            Cmd().CopyBufferToImage(staging.buffer, *s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                    regions);
+            barrier_pending = true;
+        }
     }
     if (Debug::Get().upload_log) {
         const auto log_end = std::chrono::steady_clock::now();
@@ -1932,7 +1964,8 @@ void Recorder::UploadStorage(Storage& s) {
                  "decode {:.2f}",
                  impl.stats.presents.load(std::memory_order_relaxed), flight.seq, s.extent.width,
                  s.extent.height, s.extent.depth, s.levels, s.layers, s.desc.format,
-                 on_gpu           ? "astcgpu"
+                 on_gpu && s.host.bc_standin ? "astcgpu-bc"
+                 : on_gpu                    ? "astcgpu"
                  : untiled_on_gpu ? "untilegpu"
                  : plan.decode == UploadPlan::Decode::Astc  ? "astc"
                  : plan.decode == UploadPlan::Decode::Bcn ? "bcn"
@@ -2089,7 +2122,9 @@ void Recorder::SyncSparse(Storage& s, bool will_overwrite) {
     }
 }
 
-bool Recorder::UploadAstcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool) {
+bool Recorder::AstcGpuLevels(Storage& s, const UploadPlan& plan, Pool& pool,
+                             const AstcGpuDecoder& decoder,
+                             std::vector<AstcGpuDecoder::Level>& levels) {
     // Only an imported pool is readable by the GPU as the guest's own bytes; one still being
     // backed is not waited for (the CPU path does not need its buffer).
     if (pool.pending.load(std::memory_order_acquire) || pool.backing != Pool::Backing::Imported ||
@@ -2098,18 +2133,14 @@ bool Recorder::UploadAstcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool) {
         s.layout.layer_size > 0xFFFFFFFFull || (s.layout.layer_size & 15) != 0) {
         return false;
     }
-    AstcGpuDecoder* const decoder = impl.AstcDecoder();
-    if (!decoder) {
-        return false;
-    }
     const BlockInfo block = FormatBlockInfo(s.desc.format);
-    std::vector<AstcGpuDecoder::Level> levels;
+    levels.clear();
     levels.reserve(plan.pieces.size());
     for (const UploadPiece& piece : plan.pieces) {
         if (piece.layer != 0) {
             continue;
         }
-        if (piece.slices != 1 || ((s.pool_offset + piece.guest_offset) % decoder->OffsetAlignment()) != 0) {
+        if (piece.slices != 1 || ((s.pool_offset + piece.guest_offset) % decoder.OffsetAlignment()) != 0) {
             return false;
         }
         levels.push_back({
@@ -2127,7 +2158,13 @@ bool Recorder::UploadAstcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool) {
     }
     // Every level of every layer must be in the plan (a level that starts past the storage is
     // skipped by the plan and cannot be decoded either).
-    if (levels.empty() || plan.pieces.size() != levels.size() * s.layers) {
+    return !levels.empty() && plan.pieces.size() == levels.size() * s.layers;
+}
+
+bool Recorder::UploadAstcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool) {
+    AstcGpuDecoder* const decoder = impl.AstcDecoder();
+    std::vector<AstcGpuDecoder::Level> levels;
+    if (!decoder || !AstcGpuLevels(s, plan, pool, *decoder, levels)) {
         return false;
     }
     // The shader reads the pool's bytes through host memory: storage shadows over them first (the
@@ -2145,6 +2182,190 @@ bool Recorder::UploadAstcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool) {
     flight.keepalive.push_back(std::move(views));
     barrier_pending = true;
     return true;
+}
+
+bool Recorder::UploadAstcBcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool) {
+    AstcGpuDecoder* const decoder = impl.AstcDecoder();
+    std::vector<AstcGpuDecoder::Level> levels;
+    if (!decoder || !AstcGpuLevels(s, plan, pool, *decoder, levels)) {
+        return false;
+    }
+    // The decoder writes level 0 of the scratch: one dispatch per chunk of layers, each bound from
+    // its first layer's bytes.
+    std::vector<BcChunk> chunks;
+    std::vector<AstcGpuDecoder::Level> chunk_levels;
+    for (const AstcGpuDecoder::Level& level : levels) {
+        const u32 width = (std::max)(s.extent.width >> level.level, 1u);
+        const u32 height = (std::max)(s.extent.height >> level.level, 1u);
+        for (const BcChunk& chunk : SplitBcLayers(level.level, 0, s.layers, width, height)) {
+            AstcGpuDecoder::Level part = level;
+            part.level = 0;
+            part.layers = chunk.layers;
+            part.offset += u64{chunk.first_layer} * level.layer_stride;
+            if ((s.pool_offset + part.offset) % decoder->OffsetAlignment() != 0) {
+                return false;
+            }
+            chunks.push_back(chunk);
+            chunk_levels.push_back(part);
+        }
+    }
+    if (draw.HasShadows()) {
+        draw.FlushShadowsOverlapping(pool, s.pool_offset, s.layout.size);
+    }
+    FlushPending(); // earlier writes of the pool's bytes before the decoder reads them
+    size_t next = 0;
+    return RecordBcUpload(s, chunks, true, [&](const BcChunk&, BcScratch& scratch) {
+        auto views = std::make_shared<std::vector<vk::ImageView>>(
+            decoder->Record(Cmd(), pool.Handle(), s.pool_offset, pool.size - s.pool_offset,
+                            *scratch.image, std::span{&chunk_levels[next++], 1}));
+        flight.keepalive.push_back(std::move(views));
+    });
+}
+
+void Recorder::UploadBcFromStaging(Storage& s, const UploadPlan& plan,
+                                   const StagingRange& staging) {
+    // The plan's pieces by level, in layer order: runs of consecutive layers fill one chunk.
+    std::vector<const UploadPiece*> pieces;
+    pieces.reserve(plan.pieces.size());
+    for (const UploadPiece& piece : plan.pieces) {
+        pieces.push_back(&piece);
+    }
+    std::ranges::stable_sort(pieces, [](const UploadPiece* a, const UploadPiece* b) {
+        return a->level != b->level ? a->level < b->level : a->layer < b->layer;
+    });
+    std::vector<BcChunk> chunks;
+    std::vector<size_t> chunk_first; // index in `pieces` of each chunk's first layer
+    for (size_t i = 0; i < pieces.size();) {
+        size_t end = i + 1;
+        while (end < pieces.size() && pieces[end]->level == pieces[i]->level &&
+               pieces[end]->layer == pieces[end - 1]->layer + 1) {
+            ++end;
+        }
+        size_t first = i;
+        for (const BcChunk& chunk :
+             SplitBcLayers(pieces[i]->level, pieces[i]->layer, static_cast<u32>(end - i),
+                           pieces[i]->width, pieces[i]->height)) {
+            chunks.push_back(chunk);
+            chunk_first.push_back(first);
+            first += chunk.layers;
+        }
+        i = end;
+    }
+    size_t next = 0;
+    const auto fill = [&](const BcChunk& chunk, BcScratch& scratch) {
+        const size_t first = chunk_first[next++];
+        std::vector<VkBufferImageCopy> regions;
+        regions.reserve(chunk.layers);
+        for (u32 i = 0; i < chunk.layers; ++i) {
+            const UploadPiece& piece = *pieces[first + i];
+            regions.push_back({
+                .bufferOffset = staging.offset + piece.staging_offset,
+                .bufferRowLength = 0,
+                .bufferImageHeight = 0,
+                .imageSubresource{
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .mipLevel = 0,
+                    .baseArrayLayer = i,
+                    .layerCount = 1,
+                },
+                .imageOffset = {0, 0, 0},
+                .imageExtent = {piece.width, piece.height, 1},
+            });
+        }
+        Cmd().CopyBufferToImage(staging.buffer, *scratch.image, VK_IMAGE_LAYOUT_GENERAL, regions);
+    };
+    if (!RecordBcUpload(s, chunks, true, fill)) {
+        LogOnce(fmt::format("BC stand-in upload (format {:#x}) failed: its texels stay undefined",
+                            s.desc.format));
+    }
+}
+
+bool Recorder::RecordBcUpload(Storage& s, std::span<const BcChunk> chunks, bool guest_contents,
+                              const std::function<void(const BcChunk&, BcScratch&)>& fill) {
+    BcGpuEncoder* const encoder = impl.BcEncoder();
+    if (!encoder || chunks.empty()) {
+        return false;
+    }
+    const u32 block_bytes = BcStandinBlockBytes(s.host);
+    const bool saved = track_writes;
+    track_writes = track_writes && !guest_contents;
+    PrepareImages({{&s, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
+    track_writes = saved;
+    bool recorded = false;
+    for (const BcChunk& chunk : chunks) {
+        const std::shared_ptr<BcScratch> scratch =
+            impl.AcquireBcScratch(chunk.width, chunk.height, chunk.layers);
+        if (!scratch) {
+            break;
+        }
+        flight.keepalive.push_back(scratch);
+        // The scratch is shared by every upload: whatever used it last (here or in an earlier
+        // submission) is done before it is written again; its old texels are not kept.
+        const VkMemoryBarrier reuse{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+        };
+        const VkImageMemoryBarrier to_general{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = 0,
+            .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = *scratch->image,
+            .subresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS},
+        };
+        Cmd().PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, reuse, {}, to_general);
+        fill(chunk, *scratch);
+        const VkMemoryBarrier texels_written{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+        };
+        Cmd().PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, texels_written);
+        const u32 blocks_x = (chunk.width + 3) / 4;
+        const u32 blocks_y = (chunk.height + 3) / 4;
+        encoder->Record(Cmd(), *scratch->view, chunk.width, chunk.height, chunk.layers,
+                        block_bytes == 16, *scratch->blocks,
+                        BcBlocksSize(chunk.width, chunk.height, chunk.layers, block_bytes));
+        const VkMemoryBarrier blocks_written{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        };
+        Cmd().PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              0, blocks_written);
+        // Edge blocks: the extent may end inside a block where it reaches the level's edge.
+        const VkBufferImageCopy region{
+            .bufferOffset = 0,
+            .bufferRowLength = blocks_x * 4,
+            .bufferImageHeight = blocks_y * 4,
+            .imageSubresource{
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .mipLevel = chunk.level,
+                .baseArrayLayer = chunk.first_layer,
+                .layerCount = chunk.layers,
+            },
+            .imageOffset = {static_cast<s32>(chunk.x), static_cast<s32>(chunk.y), 0},
+            .imageExtent = {chunk.width, chunk.height, 1},
+        };
+        Cmd().CopyBufferToImage(*scratch->blocks, *s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                region);
+        recorded = true;
+    }
+    if (recorded) {
+        barrier_pending = true;
+        impl.stats.astc_bc_encodes.fetch_add(1, std::memory_order_relaxed);
+    }
+    return recorded;
 }
 
 bool Recorder::UploadUntileOnGpu(Storage& s, const UploadPlan& plan, Pool& pool, const u8* data,
@@ -2537,6 +2758,13 @@ bool Recorder::TransferOverlap(Storage& source, Storage& destination) {
         }
         const LevelExtent from = ExtentOfLevel(source, level);
         const LevelExtent to = ExtentOfLevel(destination, level);
+        const u32 width = (std::min)(from.width, to.width);
+        const u32 height = (std::min)(from.height, to.height);
+        if (source.host.bc_standin &&
+            (!BcRegionAligned(0, 0, width, height, from.width, from.height) ||
+             !BcRegionAligned(0, 0, width, height, to.width, to.height))) {
+            break; // the copy would end inside a 4x4 block of one of the BC stand-ins
+        }
         copies.push_back({
             .srcSubresource{.aspectMask = aspect, .mipLevel = level, .baseArrayLayer = 0,
                             .layerCount = layers},
@@ -2807,6 +3035,11 @@ void Recorder::ClearTexture(const VC::ClearTexturePayload& p) {
     }
     if (s.samples != VK_SAMPLE_COUNT_1_BIT) {
         Unsupported("ClearTexture", "multisampled texture");
+        return;
+    }
+    if (s.host.bc_standin) {
+        // Vulkan clears no compressed image (EDEN_NX2_NVN_ASTC_STANDIN=rgba8 keeps it clearable).
+        Unsupported("ClearTexture", "BC stand-in of an ASTC texture");
         return;
     }
     const LevelExtent extent = ExtentOfLevel(s, level);
@@ -3126,6 +3359,11 @@ bool Recorder::DecodeBufferToTexture(Storage& s, u32 level, u32 layer,
     const u32 height = p.region.height > 0
                            ? (std::min)(static_cast<u32>(p.region.height), extent.height - y)
                            : extent.height - y;
+    if (s.host.bc_standin && !BcRegionAligned(x, y, width, height, extent.width, extent.height)) {
+        Unsupported("CopyBufferToTexture",
+                    "region of a BC stand-in is not aligned to its 4x4 blocks");
+        return false;
+    }
     const bool is_3d = s.type == VK_IMAGE_TYPE_3D;
     u32 z = static_cast<u32>((std::max)(p.region.z, 0));
     u32 depth_count = p.region.depth > 0 ? static_cast<u32>(p.region.depth) : 1u;
@@ -3202,6 +3440,29 @@ bool Recorder::DecodeBufferToTexture(Storage& s, u32 level, u32 layer,
     const bool covers = x == 0 && y == 0 && width == extent.width && height == extent.height &&
                         s.levels == 1 && s.layers == 1 && !is_3d;
     EnsureContents(s, covers);
+    if (s.host.bc_standin) {
+        // 2D only (ToBcStandin): the slices are layers, decoded tightly one after the other.
+        const u64 layer_bytes = u64{width} * height * 4;
+        const std::vector<BcChunk> chunks =
+            SplitBcLayers(level, first_layer, slices, width, height, x, y);
+        const bool recorded = RecordBcUpload(s, chunks, false, [&](const BcChunk& chunk,
+                                                                   BcScratch& scratch) {
+            const VkBufferImageCopy region{
+                .bufferOffset = staging.offset + u64{chunk.first_layer - first_layer} * layer_bytes,
+                .bufferRowLength = 0,
+                .bufferImageHeight = 0,
+                .imageSubresource{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, chunk.layers},
+                .imageOffset = {0, 0, 0},
+                .imageExtent = {width, height, 1},
+            };
+            Cmd().CopyBufferToImage(staging.buffer, *scratch.image, VK_IMAGE_LAYOUT_GENERAL,
+                                    region);
+        });
+        if (!recorded) {
+            Failed("CopyBufferToTexture", "the BC stand-in could not be encoded");
+        }
+        return recorded;
+    }
     PrepareImages({{&s, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
     const VkBufferImageCopy region{
         .bufferOffset = staging.offset,
@@ -3281,9 +3542,11 @@ void Recorder::CopyTextureToTexture(const VC::CopyTextureToTexturePayload& p) {
     if (src->host.needs_transcode != dst->host.needs_transcode ||
         (src->host.needs_transcode && src->host.format != dst->host.format)) {
         // Both sides decoded to the same stand-in copy texel for texel; a decoded texture and a
-        // native one hold different bytes per texel.
+        // native one hold different bytes per texel (as do an RGBA8 and a BC stand-in).
         Unsupported("CopyTextureToTexture",
-                    "only one side is a decoded stand-in of a compressed format");
+                    src->host.needs_transcode && dst->host.needs_transcode
+                        ? "the stand-ins of the two compressed formats differ"
+                        : "only one side is a decoded stand-in of a compressed format");
         return;
     }
     const BlockInfo src_block = FormatBlockInfo(src->desc.format);
@@ -3330,6 +3593,13 @@ void Recorder::CopyTextureToTexture(const VC::CopyTextureToTexturePayload& p) {
     }
     const u32 width = (std::min)(sw, dst_extent.width - dx);
     const u32 height = (std::min)(sh, dst_extent.height - dy);
+    if (src->host.bc_standin &&
+        (!BcRegionAligned(sx, sy, width, height, src_extent.width, src_extent.height) ||
+         !BcRegionAligned(dx, dy, width, height, dst_extent.width, dst_extent.height))) {
+        // The guest's ASTC blocks need not line up with the 4x4 blocks of the BC stand-ins.
+        Unsupported("CopyTextureToTexture", "region of a BC stand-in is not aligned to its blocks");
+        return;
+    }
     const u32 count = p.src_region.depth > 0 ? static_cast<u32>(p.src_region.depth) : 1u;
     const bool src_3d = src->type == VK_IMAGE_TYPE_3D;
     const bool dst_3d = dst->type == VK_IMAGE_TYPE_3D;

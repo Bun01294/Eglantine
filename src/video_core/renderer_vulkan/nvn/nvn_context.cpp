@@ -232,6 +232,23 @@ Context::Impl::Impl(const Device& device_, std::mutex& submit_mutex_,
             return std::make_unique<AstcGpuDecoder>(device);
         });
     }
+    if (!device.IsOptimalAstcSupported()) {
+        // Read past the override renderer_vulkan.cpp sets for MaxwellToVK (Uncompressed: the
+        // replay's stand-ins start as RGBA8 and become BC per storage, ToBcStandin).
+        const AstcStandin chosen = ChooseAstcStandin(
+            std::getenv("EDEN_NX2_NVN_ASTC_STANDIN"),
+            Settings::values.astc_recompression.GetValue());
+        const bool encodable = BcGpuEncoder::Supported(device);
+        astc_standin = encodable ? chosen : AstcStandin::Rgba8;
+        LOG_INFO(Render_Vulkan, "[nvn] ASTC stand-ins: {}{}", AstcStandinName(astc_standin),
+                 chosen != astc_standin ? " (the device cannot run the BC encoder)" : "");
+        if (astc_standin != AstcStandin::Rgba8) {
+            bc_encoder_future = std::async(std::launch::async, [this] {
+                Common::SetCurrentThreadName("NvnBcInit");
+                return std::make_unique<BcGpuEncoder>(device);
+            });
+        }
+    }
     untile_gpu_enabled = UntileGpu::Supported(device);
     if (untile_gpu_enabled) {
         untile_gpu_future = std::async(std::launch::async, [this] {
@@ -321,6 +338,54 @@ AstcGpuDecoder* Context::Impl::AstcDecoder() {
     return astc_decoder.get();
 }
 
+BcGpuEncoder* Context::Impl::BcEncoder() {
+    if (!bc_encoder && bc_encoder_future.valid()) {
+        try {
+            bc_encoder = bc_encoder_future.get();
+        } catch (const std::exception& exception) {
+            bc_encoder_failed = true;
+            LOG_ERROR(Render_Vulkan, "[nvn] BC encoder unavailable, BC stand-ins stay empty: {}",
+                      exception.what());
+        }
+    }
+    return bc_encoder.get();
+}
+
+std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratch(u32 width, u32 height, u32 layers) {
+    if (bc_scratch && bc_scratch->Fits(width, height, layers)) {
+        return bc_scratch;
+    }
+    const auto texel_bytes = [](u32 w, u32 h, u32 l) { return u64{w} * h * l * 4; };
+    u32 w = width;
+    u32 h = height;
+    u32 l = layers;
+    if (bc_scratch) {
+        // Grow to cover both shapes while that stays in the budget, else take the new shape.
+        const u32 grown_w = (std::max)(bc_scratch->width, width);
+        const u32 grown_h = (std::max)(bc_scratch->height, height);
+        const u32 grown_l = (std::max)(bc_scratch->layers, layers);
+        if (texel_bytes(grown_w, grown_h, grown_l) <= BC_SCRATCH_BUDGET) {
+            w = grown_w;
+            h = grown_h;
+            l = grown_l;
+        }
+    }
+    try {
+        auto scratch = MakeBcScratch(device, *allocator, w, h, l);
+        if (texel_bytes(w, h, l) <= BC_SCRATCH_BUDGET) {
+            bc_scratch = scratch;
+        }
+        return scratch;
+    } catch (const vk::Exception& exception) {
+        if (!bc_scratch_failed_logged) {
+            bc_scratch_failed_logged = true;
+            LOG_ERROR(Render_Vulkan, "[nvn] BC stand-in scratch {}x{}x{} failed: {}", w, h, l,
+                      exception.what());
+        }
+        return nullptr;
+    }
+}
+
 UntileGpu* Context::Impl::Untile() {
     if (!untile_gpu && untile_gpu_future.valid()) {
         if (untile_gpu_future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
@@ -397,6 +462,9 @@ Context::Impl::~Impl() {
     if (untile_gpu_future.valid()) {
         untile_gpu_future.wait();
     }
+    if (bc_encoder_future.valid()) {
+        bc_encoder_future.wait();
+    }
     {
         std::scoped_lock lock{submit_mutex};
         void(device.GetLogical().WaitIdle());
@@ -463,6 +531,7 @@ Context::Impl::~Impl() {
     final_fsr.reset();
     upscaler_fsr.reset();
     mirror_merge_stats = {}; // allocator-owned, like the pool buffers above
+    bc_scratch.reset();
     allocator.reset();
     command_buffer_allocations.clear();
     command_pool.reset();
@@ -1582,7 +1651,7 @@ std::string Context::DescribeState() const {
     text += fmt::format(
         " mem(storages new/reuse/evict={}/{}/{} uploads={} MB={} cpu check/change={}/{} "
         "hash_ms={} hash_MB={} (compressed {} dynamic {}) decode_ms={} decode_MB={} alias_xfer={} "
-        "alias_seen={} virt={} astc gpu/fallback={}/{} untile gpu/direct/fallback={}/{}/{} "
+        "alias_seen={} virt={} astc gpu/fallback/bc={}/{}/{} untile gpu/direct/fallback={}/{}/{} "
         "untile_gpu_MB={} storage_cache(MB/superseded_evicted)={}/{})",
         s.storages_created.load(), s.storages_reused.load(), s.storages_evicted.load(),
         s.uploads.load(), s.upload_bytes.load() >> 20, s.cpu_checks.load(), s.cpu_changes.load(),
@@ -1590,7 +1659,8 @@ std::string Context::DescribeState() const {
         s.hash_bytes_compressed.load() >> 20, s.hash_bytes_dynamic.load() >> 20,
         s.decode_ns.load() / 1'000'000, s.decode_bytes.load() >> 20, s.alias_transfers.load(),
         s.alias_overlaps_seen.load(), s.virtual_maps.load(), s.astc_gpu_uploads.load(),
-        s.astc_cpu_fallbacks.load(), s.untile_gpu_uploads.load(), s.untile_gpu_direct.load(),
+        s.astc_cpu_fallbacks.load(), s.astc_bc_encodes.load(), s.untile_gpu_uploads.load(),
+        s.untile_gpu_direct.load(),
         s.untile_cpu_fallbacks.load(), s.untile_gpu_bytes.load() >> 20,
         s.storage_cache_bytes.load() >> 20, s.storages_superseded_evicted.load());
     if (const LineGuardStats& g = *impl->line_guard_stats;

@@ -64,6 +64,7 @@ add_executable(tests
     input_common/calibration_configuration_job.cpp
     common/vtx_hle_settings.cpp
     nvn/ampere_exec.cpp
+    nvn/astc_bc.cpp
     nvn/astc_gpu.cpp
     nvn/backing_log.cpp
     nvn/barrier_track.cpp

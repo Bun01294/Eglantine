@@ -34,8 +34,10 @@ constexpr Reason NotYet = Reason::NotYetSupported;
 //   gpu_clock                 timestamp_mode.cpp (guest GPU clock divisor)
 //   max_anisotropy            nvn_sampler_aniso.h: the replay's VkSamplers get the setting by the
 //                             emulated sampler's rule (TSCEntry::MaxAnisotropy)
+//   astc_recompression        the replay holds its ASTC stand-ins as BC1/BC3 by it (nvn_context.cpp
+//                             astc_standin, nvn_format.h ToBcStandin)
 // (the first six rows are the HleSettingsPresent work, feat/hle-settings-present c1e152562a)
-constexpr std::array<Entry, 21> UNAPPLIED{{
+constexpr std::array<Entry, 20> UNAPPLIED{{
     // GPU command processor and its synchronisation (dma_pusher, fence_manager, maxwell_3d,
     // query_cache, rasterizer, gpu_thread).
     {"gpu_accuracy", Emulated},
@@ -54,7 +56,6 @@ constexpr std::array<Entry, 21> UNAPPLIED{{
     {"barrier_feedback_loops", Emulated},
     {"fix_bloom_effects", Emulated},
     {"accelerate_astc", Emulated},
-    {"astc_recompression", Emulated}, // renderer_vulkan.cpp pins it to Uncompressed on VTX-HLE
     {"gpu_unswizzle_enabled", Emulated},
     {"gpu_unswizzle_texture_size", Emulated},
     {"gpu_unswizzle_stream_size", Emulated},

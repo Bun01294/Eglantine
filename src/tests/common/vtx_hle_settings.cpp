@@ -34,7 +34,7 @@ TEST_CASE("VTX-HLE settings: the list holds the emulated GPU's own settings", "[
     for (const std::string_view key :
          {"gpu_accuracy", "dma_accuracy", "gpu_fence_behavior", "sync_memory_operations",
           "enable_compute_pipelines", "barrier_feedback_loops", "fix_bloom_effects",
-          "accelerate_astc", "astc_recompression", "gpu_unswizzle_enabled",
+          "accelerate_astc", "gpu_unswizzle_enabled",
           "gpu_unswizzle_texture_size", "gpu_unswizzle_stream_size", "gpu_unswizzle_chunk_size",
           "sample_shading_fraction", "vertex_input_dynamic_state",
           "skip_cpu_inner_invalidation"}) {
@@ -55,7 +55,7 @@ TEST_CASE("VTX-HLE settings: settings with a reader on the HLE path are never li
           "use_asynchronous_shaders", "dyna_state", "use_reactive_flushing",
           "enable_buffer_history", "vram_usage_mode", "use_docked_mode",
           "scaling_filter", "fsr_sharpening_slider", "use_vsync",
-          "max_anisotropy", "resolution_setup", "graphics_path",
+          "max_anisotropy", "astc_recompression", "resolution_setup", "graphics_path",
           "nvn_in_pass_queries", "nvn_pipeline_library", "nvn_sync_diet"}) {
         INFO(key);
         REQUIRE(Find(key) == nullptr);

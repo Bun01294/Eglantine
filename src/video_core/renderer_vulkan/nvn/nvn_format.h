@@ -6,6 +6,7 @@
 #include <optional>
 
 #include "common/common_types.h"
+#include "common/settings_enums.h"
 #include "video_core/surface.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -29,6 +30,10 @@ struct HostFormat {
     /// it uploads the texture (nvn_upload.cpp); nothing else can read or write the texture's guest
     /// bytes through the image (a texture-to-buffer copy would have to re-encode).
     bool needs_transcode{};
+    /// An ASTC stand-in held as BC1/BC3 (`format`) instead of RGBA8 (AstcStandin): the replay
+    /// decodes the blocks to RGBA8 in a scratch image and re-encodes them (nvn_bc_encode.h). Set
+    /// per storage by the texture creation (ToBcStandin), never by ResolveHostFormat.
+    bool bc_standin{};
     bool depth{};
     bool stencil{};
     /// Depth/stencil whose host texel layout is not the guest's (D24S8, D32S8): copies between
@@ -59,5 +64,26 @@ struct HostFormat {
 
 /// NVNformat -> PixelFormat -> `MaxwellToVK::SurfaceFormat`. Returns nullopt when unsupported.
 [[nodiscard]] std::optional<HostFormat> ResolveHostFormat(const Device& device, s32 nvn_format);
+
+/// What an ASTC stand-in holds on a device without ASTC: the decoded RGBA8 texels, or those
+/// re-encoded to BC1 / BC3 (an eighth / a quarter of the RGBA8 memory).
+enum class AstcStandin : u8 { Rgba8, Bc1, Bc3 };
+
+/// `EDEN_NX2_NVN_ASTC_STANDIN` (`rgba8`, `bc1`, `bc3`; null or anything else: not set) over
+/// the astc_recompression setting.
+[[nodiscard]] AstcStandin ChooseAstcStandin(const char* environment,
+                                            Settings::AstcRecompression setting);
+
+[[nodiscard]] const char* AstcStandinName(AstcStandin standin);
+
+/// `host` (an RGBA8 ASTC stand-in) held as `standin`'s BC format, with the sRGB-ness of the ASTC
+/// format; `host` unchanged when it is no ASTC stand-in or `standin` is Rgba8.
+[[nodiscard]] HostFormat ToBcStandin(const HostFormat& host, AstcStandin standin);
+
+/// Bytes per 4x4 block of a BC stand-in (8 for BC1, 16 for BC3), 0 for any other format.
+[[nodiscard]] u32 BcStandinBlockBytes(const HostFormat& host);
+
+/// Whether `format` can view a BC stand-in of format `standin` (the same BC format, sRGB or not).
+[[nodiscard]] bool ViewsBcStandin(VkFormat format, VkFormat standin);
 
 } // namespace Vulkan::Nvn

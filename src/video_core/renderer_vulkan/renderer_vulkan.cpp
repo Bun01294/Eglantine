@@ -219,10 +219,11 @@ try
                 LOG_INFO(Render_Vulkan, "[nvn] Vulkan replay context created");
                 // Shader logging mode of the replay (EDEN_NX2_SHADER_LOG=1, video_core/shader_log.h).
                 VideoCommon::ShaderLog::Start();
-                // The replay decodes ASTC itself into RGBA8 and has no BC recompression, but
+                // The replay decodes ASTC itself into RGBA8 stand-ins and re-encodes them to BC
+                // per storage (Nvn::ToBcStandin, reading the saved setting directly), but
                 // MaxwellToVK::SurfaceFormat (shared with the emulated path) picks its host
-                // format from this setting: a saved Bc1/Bc3 would give the decoded texels a BC
-                // image. The setting is greyed out for VTX-HLE; its saved value stays untouched.
+                // format from this setting: a saved Bc1/Bc3 would give every decoded stand-in a
+                // BC image. Its saved value stays untouched.
                 Settings::SetAstcRecompressionOverride(Settings::AstcRecompression::Uncompressed);
                 if (const auto gaps = Nvn::SettingsNotApplied(Nvn::CurrentPresentSettings());
                     !gaps.empty()) {

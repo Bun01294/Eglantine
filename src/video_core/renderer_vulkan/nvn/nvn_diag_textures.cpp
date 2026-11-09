@@ -418,6 +418,7 @@ void Complete(const Readback& readback, std::span<const u8> pixels) {
         VideoCommon::BufferImageCopy copy{};
         copy.image_subresource.num_layers = 1;
         copy.image_extent = {readback.width, readback.height, 1};
+        copy.buffer_row_length = (readback.width + 3) / 4 * 4; // DecompressBCn steps rows by it
         VideoCommon::DecompressBCn(pixels, decoded, copy, readback.pixel_format);
         pixels = decoded;
         format = bytes == 1   ? VK_FORMAT_R8_UNORM

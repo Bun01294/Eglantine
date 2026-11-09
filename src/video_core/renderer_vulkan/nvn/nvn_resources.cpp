@@ -694,6 +694,10 @@ std::shared_ptr<Texture> Context::Impl::BuildTexture(const VC::TextureDesc& d) {
         if (d.view.set_format) {
             if (const auto host = ResolveHostFormat(device, d.view.format)) {
                 texture->host = *host;
+                // An ASTC view of a BC stand-in reads it as that BC format (its own sRGB-ness).
+                if (texture->storage && texture->storage->host.bc_standin) {
+                    texture->host = ToBcStandin(*host, astc_standin);
+                }
             }
         }
         return texture;
@@ -766,6 +770,9 @@ std::shared_ptr<Texture> Context::Impl::BuildTexture(const VC::TextureDesc& d) {
     };
     if (const auto cached = storage_cache.find(key); cached != storage_cache.end()) {
         texture->storage = cached->second;
+        if (texture->storage->host.bc_standin) {
+            texture->host = texture->storage->host; // the key holds the format: the same stand-in
+        }
         // The bytes under a re-created texture may have been rewritten since the last upload.
         if (texture->storage->origin == StorageOrigin::Cpu) {
             texture->storage->force_check = true;
@@ -878,6 +885,28 @@ std::shared_ptr<Texture> Context::Impl::BuildTexture(const VC::TextureDesc& d) {
                      d.width, d.height, storage->layers, storage->levels, d.format, d.flags,
                      layout.size / 1048576.0, d.pool_serial, begin, reason);
         }
+    }
+
+    // ASTC stand-ins held as BC (astc_standin): sampled 2D images only. Nothing renders into or
+    // stores to an ASTC texture; tile-backed sparse storages (their tiles upload as RGBA8
+    // texels), 3D and multisampled ones stay RGBA8.
+    if (astc_standin != AstcStandin::Rgba8 && host->needs_transcode &&
+        VideoCore::Surface::IsPixelFormatASTC(host->pixel_format) &&
+        storage->type == VK_IMAGE_TYPE_2D && storage->samples == VK_SAMPLE_COUNT_1_BIT &&
+        !storage->sparse) {
+        storage->host = ToBcStandin(*host, astc_standin);
+        texture->host = storage->host;
+        storage->astc_gpu = false;
+        storage->usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                         VK_IMAGE_USAGE_SAMPLED_BIT;
+        storage->create_flags &= ~VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+        const u32 block_bytes = BcStandinBlockBytes(storage->host);
+        u64 bytes = 0;
+        for (u32 level = 0; level < storage->levels; ++level) {
+            bytes += BcBlocksSize((std::max)(storage->extent.width >> level, 1u),
+                                  (std::max)(storage->extent.height >> level, 1u), 1, block_bytes);
+        }
+        storage->vram_bytes = bytes * storage->layers;
     }
 
     // Overlap census: other storages over the same bytes (no data moves yet; that happens when one
