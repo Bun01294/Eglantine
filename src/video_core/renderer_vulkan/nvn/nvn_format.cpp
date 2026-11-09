@@ -261,16 +261,21 @@ const char* AstcStandinName(AstcStandin standin) {
     }
 }
 
-SmartBc ParseSmartBc(AstcStandin standin, const char* smart, const char* bc1, const char* bc45,
-                     const char* refine) {
+SmartBc ParseSmartBc(AstcStandin standin, bool setting, const char* smart, const char* bc1,
+                     const char* bc45, const char* refine) {
     const auto on = [](const char* value) {
         return value == nullptr || std::string_view{value} != "0";
     };
+    // The refined endpoints (+1.9 dB for 1.8x the encode time) are opt-in: BC_REFINE=1.
+    const auto on_if_named = [](const char* value) {
+        return value != nullptr && std::string_view{value} != "0";
+    };
     SmartBc result{};
-    result.enabled = standin == AstcStandin::Bc3 && on(smart);
+    result.enabled = standin == AstcStandin::Bc3 &&
+                     (smart == nullptr ? setting : std::string_view{smart} != "0");
     result.bc1 = result.enabled && on(bc1);
     result.bc45 = result.enabled && on(bc45);
-    result.refine = result.enabled && on(refine);
+    result.refine = result.enabled && on_if_named(refine);
     return result;
 }
 

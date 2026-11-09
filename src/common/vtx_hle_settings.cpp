@@ -36,6 +36,8 @@ constexpr Reason NotYet = Reason::NotYetSupported;
 //                             emulated sampler's rule (TSCEntry::MaxAnisotropy)
 //   astc_recompression        the replay holds its ASTC stand-ins as BC1/BC3 by it (nvn_context.cpp
 //                             astc_standin, nvn_format.h ToBcStandin)
+//   nvn_smart_bc              the per-texture BC format choice of those stand-ins (nvn_context.cpp
+//                             ParseSmartBc; EDEN_NX2_NVN_SMART_BC overrides it)
 // (the first six rows are the HleSettingsPresent work, feat/hle-settings-present c1e152562a)
 constexpr std::array<Entry, 20> UNAPPLIED{{
     // GPU command processor and its synchronisation (dma_pusher, fence_manager, maxwell_3d,

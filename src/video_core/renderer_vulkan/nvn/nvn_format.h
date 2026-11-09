@@ -95,8 +95,10 @@ struct SmartBc {
 
 /// The smart selection for stand-in kind `standin` from the four switches above (null: not set;
 /// `0` turns one off). Only the BC3 kind enables it; `0` in `smart` disables every part.
-[[nodiscard]] SmartBc ParseSmartBc(AstcStandin standin, const char* smart, const char* bc1,
-                                   const char* bc45, const char* refine);
+/// `setting` is Settings::values.nvn_smart_bc (the GUI row); each env switch overrides: "0" off,
+/// "1" on, null: the setting (the first one) or the part's own default (the others).
+[[nodiscard]] SmartBc ParseSmartBc(AstcStandin standin, bool setting, const char* smart,
+                                   const char* bc1, const char* bc45, const char* refine);
 
 /// Startup log form of `smart`: "off" or the parts that are on.
 [[nodiscard]] std::string SmartBcName(const SmartBc& smart);

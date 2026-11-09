@@ -625,6 +625,12 @@ struct Values {
                                                                   "astc_recompression",
                                                                   Category::RendererAdvanced};
 
+    // VTX-HLE only: with the BC3 stand-in kind, hold each ASTC texture in the BC format its
+    // channels need (BC4 luminance, BC5 luminance+alpha, BC1 opaque colour, BC3 the rest) instead
+    // of BC3 everywhere. EDEN_NX2_NVN_SMART_BC overrides it; the parts have their own env switches.
+    SwitchableSetting<bool> nvn_smart_bc{linkage, true, "nvn_smart_bc",
+                                         Category::RendererAdvanced};
+
 
     SwitchableSetting<bool> sync_memory_operations{linkage,
                                                    false,

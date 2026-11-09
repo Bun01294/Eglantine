@@ -1579,23 +1579,31 @@ TEST_CASE("NVN smart BC: IsOpaque answers as before", "[nvn]") {
 }
 
 TEST_CASE("NVN smart BC: switches, formats and views", "[nvn]") {
-    // On by default with BC3 only; `0` turns a part (or everything) off.
-    const SmartBc on = ParseSmartBc(AstcStandin::Bc3, nullptr, nullptr, nullptr, nullptr);
-    REQUIRE((on.enabled && on.bc1 && on.bc45 && on.refine));
+    // On by default with BC3 only (the nvn_smart_bc setting); the refined endpoints are opt-in
+    // (BC_REFINE=1); `0` turns a part (or everything) off.
+    const SmartBc on = ParseSmartBc(AstcStandin::Bc3, true, nullptr, nullptr, nullptr, nullptr);
+    REQUIRE((on.enabled && on.bc1 && on.bc45 && !on.refine));
+    const SmartBc setting_off =
+        ParseSmartBc(AstcStandin::Bc3, false, nullptr, nullptr, nullptr, nullptr);
+    REQUIRE_FALSE((setting_off.enabled || setting_off.bc1 || setting_off.bc45));
     for (const AstcStandin other : {AstcStandin::Rgba8, AstcStandin::Bc1, AstcStandin::Bc7}) {
-        const SmartBc off = ParseSmartBc(other, nullptr, nullptr, nullptr, nullptr);
+        const SmartBc off = ParseSmartBc(other, true, nullptr, nullptr, nullptr, nullptr);
         REQUIRE_FALSE((off.enabled || off.bc1 || off.bc45 || off.refine));
     }
-    const SmartBc all_off = ParseSmartBc(AstcStandin::Bc3, "0", "1", "1", "1");
+    // The env switch overrides the setting either way.
+    REQUIRE_FALSE(ParseSmartBc(AstcStandin::Bc3, true, "0", nullptr, nullptr, nullptr).enabled);
+    REQUIRE(ParseSmartBc(AstcStandin::Bc3, false, "1", nullptr, nullptr, nullptr).enabled);
+    const SmartBc all_off = ParseSmartBc(AstcStandin::Bc3, true, "0", "1", "1", "1");
     REQUIRE_FALSE((all_off.enabled || all_off.bc1 || all_off.bc45 || all_off.refine));
     REQUIRE(SmartBcName(all_off) == "off");
-    const SmartBc no_bc1 = ParseSmartBc(AstcStandin::Bc3, "1", "0", nullptr, nullptr);
-    REQUIRE((no_bc1.enabled && !no_bc1.bc1 && no_bc1.bc45 && no_bc1.refine));
-    const SmartBc no_bc45 = ParseSmartBc(AstcStandin::Bc3, nullptr, nullptr, "0", nullptr);
+    const SmartBc no_bc1 = ParseSmartBc(AstcStandin::Bc3, true, "1", "0", nullptr, nullptr);
+    REQUIRE((no_bc1.enabled && !no_bc1.bc1 && no_bc1.bc45 && !no_bc1.refine));
+    const SmartBc no_bc45 = ParseSmartBc(AstcStandin::Bc3, true, nullptr, nullptr, "0", nullptr);
     REQUIRE((no_bc45.bc1 && !no_bc45.bc45));
-    const SmartBc no_refine = ParseSmartBc(AstcStandin::Bc3, nullptr, nullptr, nullptr, "0");
-    REQUIRE((no_refine.bc1 && no_refine.bc45 && !no_refine.refine));
-    REQUIRE(SmartBcName(on) == "on (BC1, BC4/BC5, refined endpoints)");
+    const SmartBc refined = ParseSmartBc(AstcStandin::Bc3, true, nullptr, nullptr, nullptr, "1");
+    REQUIRE((refined.bc1 && refined.bc45 && refined.refine));
+    REQUIRE(SmartBcName(on) == "on (BC1, BC4/BC5)");
+    REQUIRE(SmartBcName(refined) == "on (BC1, BC4/BC5, refined endpoints)");
 
     // Class -> stand-in, UNORM and sRGB, under each switch.
     using C = Channels;

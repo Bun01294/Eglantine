@@ -56,7 +56,7 @@ TEST_CASE("VTX-HLE settings: settings with a reader on the HLE path are never li
           "enable_buffer_history", "vram_usage_mode", "use_docked_mode",
           "scaling_filter", "fsr_sharpening_slider", "use_vsync",
           "max_anisotropy", "astc_recompression", "resolution_setup", "graphics_path",
-          "nvn_in_pass_queries", "nvn_pipeline_library", "nvn_sync_diet"}) {
+          "nvn_in_pass_queries", "nvn_pipeline_library", "nvn_sync_diet", "nvn_smart_bc"}) {
         INFO(key);
         REQUIRE(Find(key) == nullptr);
     }

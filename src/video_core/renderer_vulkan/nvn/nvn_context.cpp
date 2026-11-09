@@ -263,7 +263,8 @@ Context::Impl::Impl(const Device& device_, std::mutex& submit_mutex_,
                            ? AstcStandin::Bc3
                            : chosen;
         bc7_quality = ParseBc7Quality(std::getenv("EDEN_NX2_NVN_BC7_QUALITY"));
-        smart_bc = ParseSmartBc(astc_standin, std::getenv("EDEN_NX2_NVN_SMART_BC"),
+        smart_bc = ParseSmartBc(astc_standin, Settings::values.nvn_smart_bc.GetValue(),
+                                std::getenv("EDEN_NX2_NVN_SMART_BC"),
                                 std::getenv("EDEN_NX2_NVN_SMART_BC1"),
                                 std::getenv("EDEN_NX2_NVN_SMART_BC45"),
                                 std::getenv("EDEN_NX2_NVN_BC_REFINE"));
