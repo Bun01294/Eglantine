@@ -671,7 +671,7 @@ void PollFor(const ToolState& state, std::chrono::milliseconds timeout, Done&& d
 }
 
 json NvnDraws(ToolState& state, const json& params) {
-    const size_t limit = Param<size_t>(params, "limit", 40, 1, 200);
+    const size_t limit = Param<size_t>(params, "limit", 40, 1, 2000);
     const u32 presents = Param<u32>(params, "arm_presents", 600, 1, 100000);
     std::optional<u64> filter;
     if (const std::string text = params.value("hash", std::string{}); !text.empty()) {
