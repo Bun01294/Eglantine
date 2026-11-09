@@ -263,12 +263,24 @@ Context::Impl::Impl(const Device& device_, std::mutex& submit_mutex_,
                            ? AstcStandin::Bc3
                            : chosen;
         bc7_quality = ParseBc7Quality(std::getenv("EDEN_NX2_NVN_BC7_QUALITY"));
-        LOG_INFO(Render_Vulkan, "[nvn] ASTC stand-ins: {}{}{}", AstcStandinName(astc_standin),
+        smart_bc = ParseSmartBc(astc_standin, std::getenv("EDEN_NX2_NVN_SMART_BC"),
+                                std::getenv("EDEN_NX2_NVN_SMART_BC1"),
+                                std::getenv("EDEN_NX2_NVN_SMART_BC45"),
+                                std::getenv("EDEN_NX2_NVN_BC_REFINE"));
+        const bool bc45_unsupported = smart_bc.bc45 && !BcGpuEncoder::SupportsBc45(device);
+        smart_bc.bc45 = smart_bc.bc45 && !bc45_unsupported;
+        LOG_INFO(Render_Vulkan, "[nvn] ASTC stand-ins: {}{}{}{}", AstcStandinName(astc_standin),
                  astc_standin == AstcStandin::Bc7 ? fmt::format(" (quality {})", bc7_quality)
                                                   : std::string{},
                  chosen == astc_standin ? ""
                  : encodable            ? " (the device cannot hold BC7)"
-                                        : " (the device cannot run the BC encoder)");
+                                        : " (the device cannot run the BC encoder)",
+                 astc_standin == AstcStandin::Bc3
+                     ? fmt::format(", smart BC {}{} (EDEN_NX2_NVN_SMART_BC, _SMART_BC1, "
+                                   "_SMART_BC45, _BC_REFINE)",
+                                   SmartBcName(smart_bc),
+                                   bc45_unsupported ? "; the device cannot hold BC4/BC5" : "")
+                     : std::string{});
         if (astc_standin != AstcStandin::Rgba8) {
             const bool bc7 = astc_standin == AstcStandin::Bc7;
             bc_encoder_future = std::async(std::launch::async, [this, bc7] {
@@ -465,6 +477,25 @@ void Context::Impl::LogBcTimeWindow(u64 present) {
                  bc_window_first_present, present, uploads, bytes >> 20,
                  static_cast<double>(gpu_ns) / 1e6, static_cast<double>(max_ns) / 1e6,
                  untimed != 0 ? fmt::format(", {} more untimed", untimed) : std::string{});
+    }
+    std::array<u64, 5> classes{};
+    u64 classified = 0;
+    for (size_t i = 0; i < classes.size(); ++i) {
+        classes[i] = smart_window.classes[i].exchange(0, std::memory_order_relaxed);
+        classified += classes[i];
+    }
+    const u64 scan_bytes = smart_window.scan_bytes.exchange(0, std::memory_order_relaxed);
+    const u64 scan_ns = smart_window.scan_ns.exchange(0, std::memory_order_relaxed);
+    const u64 refits = smart_window.refits.exchange(0, std::memory_order_relaxed);
+    const u64 pinned = smart_window.pinned.exchange(0, std::memory_order_relaxed);
+    if (classified + refits + pinned != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "[nvn] smart BC scans in presents {}-{}: {} (L {}, LA {}, RGB {}, RGBA {}, all "
+                 "zero {}), {:.1f} MiB of ASTC in {:.2f} ms; {} re-classified to BC3, {} kept at "
+                 "BC3 by copies",
+                 bc_window_first_present, present, classified, classes[0], classes[1], classes[2],
+                 classes[3], classes[4], static_cast<double>(scan_bytes) / 1048576.0,
+                 static_cast<double>(scan_ns) / 1e6, refits, pinned);
     }
     bc_window_first_present = present + 1;
 }

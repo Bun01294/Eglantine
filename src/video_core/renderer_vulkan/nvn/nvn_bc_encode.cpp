@@ -20,10 +20,13 @@ struct PushConstants {
     u32 blocks_y;
     u32 width;
     u32 height;
-    u32 bc3;
+    u32 mode; ///< BcBlocks, | MODE_REFINE
     u32 out_offset; ///< in 8-byte units
 };
 static_assert(sizeof(PushConstants) == 24);
+
+/// bc_encoder.comp's REFINE bit of `mode`.
+constexpr u32 MODE_REFINE = 16;
 
 constexpr u32 BINDING_SOURCE = 0;
 constexpr u32 BINDING_OUTPUT = 1;
@@ -60,6 +63,27 @@ u32 ParseBc7Quality(const char* text) {
     return BC7_QUALITY_DEFAULT;
 }
 
+BcBlocks BcBlocksOf(AstcStandin standin, bool opaque) {
+    switch (standin) {
+    case AstcStandin::Bc1:
+        return opaque ? BcBlocks::Bc1Opaque : BcBlocks::Bc1;
+    case AstcStandin::Bc4:
+        return BcBlocks::Bc4;
+    case AstcStandin::Bc5:
+        return BcBlocks::Bc5;
+    default:
+        return BcBlocks::Bc3;
+    }
+}
+
+bool BcGpuEncoder::SupportsBc45(const Device& device) {
+    constexpr VkFormatFeatureFlags BC_FEATURES =
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    return Supported(device) &&
+           device.IsFormatSupported(VK_FORMAT_BC4_UNORM_BLOCK, BC_FEATURES, FormatType::Optimal) &&
+           device.IsFormatSupported(VK_FORMAT_BC5_UNORM_BLOCK, BC_FEATURES, FormatType::Optimal);
+}
+
 bool BcGpuEncoder::SupportsBc7(const Device& device) {
     constexpr VkFormatFeatureFlags BC_FEATURES =
         VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
@@ -82,7 +106,8 @@ bool BcGpuEncoder::Supported(const Device& device) {
            device.IsFormatSupported(VK_FORMAT_BC3_UNORM_BLOCK, BC_FEATURES, FormatType::Optimal);
 }
 
-BcGpuEncoder::BcGpuEncoder(const Device& device_, bool bc7) : device{device_} {
+BcGpuEncoder::BcGpuEncoder(const Device& device_, bool bc7, std::span<const u32> bc_code)
+    : device{device_} {
     const vk::Device& logical = device.GetLogical();
     const std::array<VkDescriptorSetLayoutBinding, 2> bindings{{
         {
@@ -121,7 +146,8 @@ BcGpuEncoder::BcGpuEncoder(const Device& device_, bool bc7) : device{device_} {
         .pushConstantRangeCount = 1,
         .pPushConstantRanges = &push_range,
     });
-    const std::span<const u32> code = BC_ENCODER_COMP_SPV;
+    const std::span<const u32> code =
+        bc_code.empty() ? std::span<const u32>{BC_ENCODER_COMP_SPV} : bc_code;
     module = logical.CreateShaderModule({
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
         .pNext = nullptr,
@@ -304,7 +330,8 @@ void BcGpuEncoder::RecordBc7(vk::CommandBuffer cmd, VkImageView source, u32 widt
 }
 
 void BcGpuEncoder::Record(vk::CommandBuffer cmd, VkImageView source, u32 width, u32 height,
-                          u32 layers, bool bc3, VkBuffer output, u64 output_size) const {
+                          u32 layers, BcBlocks blocks, bool refine, VkBuffer output,
+                          u64 output_size) const {
     const VkDescriptorImageInfo image_info{
         .sampler = VK_NULL_HANDLE,
         .imageView = source,
@@ -346,7 +373,7 @@ void BcGpuEncoder::Record(vk::CommandBuffer cmd, VkImageView source, u32 width, 
         .blocks_y = (height + 3) / 4,
         .width = width,
         .height = height,
-        .bc3 = bc3 ? 1u : 0u,
+        .mode = static_cast<u32>(blocks) | (refine ? MODE_REFINE : 0u),
         .out_offset = 0,
     };
     cmd.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);

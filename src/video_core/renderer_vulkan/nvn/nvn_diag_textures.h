@@ -57,6 +57,9 @@ struct Readback {
     /// The host image holds BCn blocks (the device samples them natively): `pixel_format` decodes.
     bool bcn{false};
     VideoCore::Surface::PixelFormat pixel_format{};
+    /// A BC4 / BC5 ASTC stand-in: its R / RG decode is (L) / (L, A), saved as (L, L, L, 1) /
+    /// (L, L, L, A) as the game sees it.
+    bool luminance{false};
 };
 
 /// Replay thread, at the start of a draw while the texture budget is active: claims one unit.

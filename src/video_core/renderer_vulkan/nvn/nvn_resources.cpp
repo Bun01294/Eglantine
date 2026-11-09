@@ -701,7 +701,19 @@ std::shared_ptr<Texture> Context::Impl::BuildTexture(const VC::TextureDesc& d) {
                 texture->host = *host;
                 // An ASTC view of a BC stand-in reads it as that BC format (its own sRGB-ness).
                 if (texture->storage && texture->storage->host.bc_standin) {
-                    texture->host = ToBcStandin(*host, astc_standin);
+                    Storage& s = *texture->storage;
+                    texture->host = ToBcStandin(*host, BcStandinOf(s.host));
+                    // BC4/BC5 have no sRGB form: a smart stand-in with an sRGB view takes BC1/BC3
+                    // as an sRGB texture would. One that is BC4/BC5 already changes at an upload
+                    // made at once (RefitStandin); until then the view has no format (ViewKeyOf).
+                    if (s.smart_standin && !s.standin_srgb_view &&
+                        VideoCore::Surface::IsPixelFormatSRGB(host->pixel_format)) {
+                        s.standin_srgb_view = true;
+                        const AstcStandin kind = BcStandinOf(s.host);
+                        if (kind == AstcStandin::Bc4 || kind == AstcStandin::Bc5) {
+                            s.force_upload = true;
+                        }
+                    }
                 }
             }
         }
@@ -899,19 +911,15 @@ std::shared_ptr<Texture> Context::Impl::BuildTexture(const VC::TextureDesc& d) {
         VideoCore::Surface::IsPixelFormatASTC(host->pixel_format) &&
         storage->type == VK_IMAGE_TYPE_2D && storage->samples == VK_SAMPLE_COUNT_1_BIT &&
         !storage->sparse) {
-        storage->host = ToBcStandin(*host, astc_standin);
-        texture->host = storage->host;
         storage->astc_gpu = false;
         storage->usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                          VK_IMAGE_USAGE_SAMPLED_BIT;
         storage->create_flags &= ~VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
-        const u32 block_bytes = BcStandinBlockBytes(storage->host);
-        u64 bytes = 0;
-        for (u32 level = 0; level < storage->levels; ++level) {
-            bytes += BcBlocksSize((std::max)(storage->extent.width >> level, 1u),
-                                  (std::max)(storage->extent.height >> level, 1u), 1, block_bytes);
-        }
-        storage->vram_bytes = bytes * storage->layers;
+        // Smart selection: BC3 until EnsureImage reads the guest bytes (ChooseSmartStandin).
+        storage->smart_standin = smart_bc.enabled;
+        storage->host = *host;
+        SetStandin(*storage, astc_standin);
+        texture->host = storage->host;
     }
 
     // Overlap census: other storages over the same bytes (no data moves yet; that happens when one

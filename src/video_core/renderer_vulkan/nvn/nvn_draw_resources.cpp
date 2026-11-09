@@ -497,6 +497,20 @@ VkImageView DrawResources::GetView(const Texture& texture, const ViewKey& key) {
     }
 }
 
+std::vector<vk::ImageView> DrawResources::TakeStorageViews(const Storage& storage) {
+    std::vector<vk::ImageView> taken;
+    for (auto& [serial, views] : texture_views) {
+        if (views.storage.get() != &storage) {
+            continue;
+        }
+        for (auto& [key, view] : views.views) {
+            taken.push_back(std::move(view));
+        }
+        views.views.clear();
+    }
+    return taken;
+}
+
 std::shared_ptr<TextureViews> DrawResources::TakeViews(u64 serial) {
     const auto it = texture_views.find(serial);
     if (it == texture_views.end()) {

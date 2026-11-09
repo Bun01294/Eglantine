@@ -317,6 +317,22 @@ struct Storage : std::enable_shared_from_this<Storage> {
     /// The image has STORAGE usage and extended usage so that `AstcGpuDecoder` can write its
     /// levels (ASTC stand-ins only). Whether it is used is decided per upload.
     bool astc_gpu{false};
+    /// A BC stand-in of the smart selection (nvn_format.h SmartBc): its format is chosen when the
+    /// image is created (EnsureImage classifies the guest's ASTC bytes; BC3 until then), and each
+    /// later whole upload classifies its bytes again (Recorder::RefitStandin).
+    bool smart_standin{false};
+    /// Kept at BC3 for good: a copy or partial upload into or out of it, or a re-upload whose
+    /// bytes did not fit the format chosen first. Nothing classifies it again.
+    bool standin_pinned{false};
+    /// The bytes classified when the image was created were all zero (not loaded yet): it stays
+    /// BC3 until a whole upload brings blocks, whose class then chooses the format.
+    bool standin_empty{false};
+    /// Classified by EnsureImage and not uploaded since: the first upload reads the same bytes.
+    bool standin_fresh{false};
+    /// An sRGB texture view of it exists: no BC4/BC5 (luminance to BC1, luminance+alpha to BC3).
+    bool standin_srgb_view{false};
+    /// The class the format was chosen for (Rgba when kept at BC3).
+    Tegra::Texture::ASTC::Channels standin_class{Tegra::Texture::ASTC::Channels::Rgba};
     /// Tile-granular backing of a large sparse texture in a virtual pool (nvn_sparse.h): the image
     /// is a sparse residency image bound per mapped tile, and the whole-storage upload and
     /// change-check paths do not apply. Null for ordinary storages.
@@ -1245,6 +1261,30 @@ struct Context::Impl {
     [[nodiscard]] std::shared_ptr<BcScratch> AcquireBcScratch(u32 width, u32 height, u32 layers);
     /// EDEN_NX2_NVN_BC7_QUALITY (nvn_bc_encode.h) for BC7 stand-ins.
     u32 bc7_quality{BC7_QUALITY_DEFAULT};
+    /// The smart BC stand-in selection (EDEN_NX2_NVN_SMART_BC*, nvn_format.h SmartBc).
+    SmartBc smart_bc{};
+    /// Smart stand-ins: classifications by Tegra::Texture::ASTC::Channels (index 4: all-zero
+    /// bytes), the guest bytes they scanned and the time it took, stand-ins recreated as BC3
+    /// because new bytes did not fit (RefitStandin) or pinned there by a copy, and the same for
+    /// the window ProcessPresent logs.
+    struct SmartBcCounts {
+        std::array<std::atomic<u64>, 5> classes{};
+        std::atomic<u64> scan_bytes{};
+        std::atomic<u64> scan_ns{};
+        std::atomic<u64> refits{};
+        std::atomic<u64> pinned{};
+    };
+    SmartBcCounts smart_total;
+    SmartBcCounts smart_window;
+    /// Classifies `size` guest bytes of smart stand-in `s` (counted, timed); `empty` when all
+    /// were zero.
+    Tegra::Texture::ASTC::Channels ClassifyStandin(const Storage& s, const u8* data, u64 size,
+                                                   bool& empty);
+    /// Chooses the format of smart stand-in `s` from the guest bytes under it before its image is
+    /// created (EnsureImage); BC3 when they cannot be read.
+    void ChooseSmartStandin(Storage& s);
+    /// Stand-in `s` (no image) as `standin`, its memory estimate updated.
+    void SetStandin(Storage& s, AstcStandin standin);
     /// GPU time of the BC stand-in uploads (BcUploadTimes, timestamps per submission): false when
     /// the graphics queue has no timestamps. CompleteBcTimes (completion thread) logs the uploads
     /// of BC_TIMED_LOG_BYTES or more and adds every one to the window ProcessPresent logs.

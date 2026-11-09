@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "video_core/renderer_vulkan/nvn/nvn_format.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan {
@@ -27,10 +28,24 @@ inline constexpr u32 BC7_QUALITY_DEFAULT = 1;
 /// `EDEN_NX2_NVN_BC7_QUALITY` (`0`..`BC7_QUALITY_MAX`; null or anything else: the default).
 [[nodiscard]] u32 ParseBc7Quality(const char* text);
 
-/// Compresses RGBA8 texels to BC1 or BC3 blocks on the GPU (the emulated path's `bc_encoder.comp`,
-/// the shader its `BcEncoderPass` runs), or to BC7 (`bc7_encoder.comp`, ported from DirectXTex),
-/// for ASTC stand-ins held as BC (`HostFormat::bc_standin`). The replay records the dispatches
-/// into its own command buffers with push descriptors, as `AstcGpuDecoder` does.
+/// The blocks `bc_encoder.comp` writes (its push constant `mode`; the emulated path uses Bc1 and
+/// Bc3 only).
+enum class BcBlocks : u32 {
+    Bc1 = 0,       ///< punch-through for blocks with a texel below alpha 0.5
+    Bc3 = 1,
+    Bc4 = 2,       ///< red
+    Bc5 = 3,       ///< red, and alpha as green (a luminance+alpha stand-in's L and A)
+    Bc1Opaque = 4, ///< four-colour mode in every block
+};
+
+/// The encoder blocks of a stand-in of kind `standin` (Bc1, Bc3, Bc4, Bc5; not Bc7). `opaque`:
+/// the texture is known opaque (a smart BC1 stand-in), its BC1 blocks never punch through.
+[[nodiscard]] BcBlocks BcBlocksOf(AstcStandin standin, bool opaque);
+
+/// Compresses RGBA8 texels to BC1, BC3, BC4 or BC5 blocks on the GPU (the emulated path's
+/// `bc_encoder.comp`, the shader its `BcEncoderPass` runs), or to BC7 (`bc7_encoder.comp`, ported
+/// from DirectXTex), for ASTC stand-ins held as BC (`HostFormat::bc_standin`). The replay records
+/// the dispatches into its own command buffers with push descriptors, as `AstcGpuDecoder` does.
 class BcGpuEncoder {
 public:
     /// Format of the storage views the encoder reads (and the ASTC decoder writes).
@@ -44,15 +59,22 @@ public:
     /// BC7 encoder's three descriptors.
     [[nodiscard]] static bool SupportsBc7(const Device& device);
 
-    /// `bc7`: also build the BC7 pipelines (RecordBc7).
-    explicit BcGpuEncoder(const Device& device, bool bc7 = false);
+    /// True when, beyond Supported, the device can sample and copy into BC4 and BC5 images.
+    [[nodiscard]] static bool SupportsBc45(const Device& device);
+
+    /// `bc7`: also build the BC7 pipelines (RecordBc7). `bc_code`: SPIR-V of another build's
+    /// bc_encoder.comp instead of this one's (tests compare their blocks).
+    explicit BcGpuEncoder(const Device& device, bool bc7 = false,
+                          std::span<const u32> bc_code = {});
     ~BcGpuEncoder();
 
     /// Records one dispatch into `cmd` (outside a render pass): the first `layers` layers of
     /// `source` (a 2D array storage view in GENERAL layout), `width` x `height` texels each, become
-    /// blocks row-major, layer after layer, from the start of `output` (`output_size` bytes).
+    /// `blocks` row-major, layer after layer, from the start of `output` (`output_size` bytes).
+    /// `refine`: refined colour endpoints for the BC1/BC3 colour blocks (the stand-ins of the
+    /// smart selection; never more error per block than without).
     void Record(vk::CommandBuffer cmd, VkImageView source, u32 width, u32 height, u32 layers,
-                bool bc3, VkBuffer output, u64 output_size) const;
+                BcBlocks blocks, bool refine, VkBuffer output, u64 output_size) const;
 
     /// Record for BC7 blocks: the passes `quality` asks for (BC7_QUALITY_MAX), the best mode of
     /// each block kept in `modes` (8 bytes per block, BcScratch::modes) between them.

@@ -6,7 +6,9 @@
 // dm/gfx/nvn/nvn_tex.c.
 
 #include <array>
+#include <string>
 #include <string_view>
+#include <utility>
 
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/nvn/nvn_format.h"
@@ -250,8 +252,73 @@ const char* AstcStandinName(AstcStandin standin) {
         return "BC3";
     case AstcStandin::Bc7:
         return "BC7";
+    case AstcStandin::Bc4:
+        return "BC4";
+    case AstcStandin::Bc5:
+        return "BC5";
     default:
         return "RGBA8";
+    }
+}
+
+SmartBc ParseSmartBc(AstcStandin standin, const char* smart, const char* bc1, const char* bc45,
+                     const char* refine) {
+    const auto on = [](const char* value) {
+        return value == nullptr || std::string_view{value} != "0";
+    };
+    SmartBc result{};
+    result.enabled = standin == AstcStandin::Bc3 && on(smart);
+    result.bc1 = result.enabled && on(bc1);
+    result.bc45 = result.enabled && on(bc45);
+    result.refine = result.enabled && on(refine);
+    return result;
+}
+
+std::string SmartBcName(const SmartBc& smart) {
+    if (!smart.enabled) {
+        return "off";
+    }
+    std::string parts;
+    for (const auto& [part, name] : {std::pair{smart.bc1, "BC1"}, std::pair{smart.bc45, "BC4/BC5"},
+                                     std::pair{smart.refine, "refined endpoints"}}) {
+        if (part) {
+            parts += parts.empty() ? name : std::string{", "} + name;
+        }
+    }
+    return parts.empty() ? std::string{"on (BC3 only)"} : "on (" + parts + ")";
+}
+
+AstcStandin SmartStandinFor(Tegra::Texture::ASTC::Channels channels, bool srgb,
+                            const SmartBc& smart) {
+    using Tegra::Texture::ASTC::Channels;
+    if (!smart.enabled) {
+        return AstcStandin::Bc3;
+    }
+    switch (channels) {
+    case Channels::Luminance:
+        return smart.bc45 && !srgb ? AstcStandin::Bc4
+               : smart.bc1         ? AstcStandin::Bc1
+                                   : AstcStandin::Bc3;
+    case Channels::LuminanceAlpha:
+        return smart.bc45 && !srgb ? AstcStandin::Bc5 : AstcStandin::Bc3;
+    case Channels::Rgb:
+        return smart.bc1 ? AstcStandin::Bc1 : AstcStandin::Bc3;
+    default:
+        return AstcStandin::Bc3;
+    }
+}
+
+bool StandinHolds(AstcStandin standin, Tegra::Texture::ASTC::Channels channels) {
+    using Tegra::Texture::ASTC::Channels;
+    switch (standin) {
+    case AstcStandin::Bc1:
+        return channels == Channels::Luminance || channels == Channels::Rgb;
+    case AstcStandin::Bc4:
+        return channels == Channels::Luminance;
+    case AstcStandin::Bc5:
+        return channels == Channels::Luminance || channels == Channels::LuminanceAlpha;
+    default:
+        return true;
     }
 }
 
@@ -268,6 +335,12 @@ HostFormat ToBcStandin(const HostFormat& host, AstcStandin standin) {
         break;
     case AstcStandin::Bc7:
         result.format = srgb ? VK_FORMAT_BC7_SRGB_BLOCK : VK_FORMAT_BC7_UNORM_BLOCK;
+        break;
+    case AstcStandin::Bc4:
+        result.format = srgb ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK : VK_FORMAT_BC4_UNORM_BLOCK;
+        break;
+    case AstcStandin::Bc5:
+        result.format = srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC5_UNORM_BLOCK;
         break;
     default:
         result.format = srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
@@ -295,6 +368,10 @@ AstcStandin BcStandinOf(const HostFormat& host) {
     case VK_FORMAT_BC7_UNORM_BLOCK:
     case VK_FORMAT_BC7_SRGB_BLOCK:
         return AstcStandin::Bc7;
+    case VK_FORMAT_BC4_UNORM_BLOCK:
+        return AstcStandin::Bc4;
+    case VK_FORMAT_BC5_UNORM_BLOCK:
+        return AstcStandin::Bc5;
     default:
         return AstcStandin::Rgba8;
     }
@@ -303,8 +380,10 @@ AstcStandin BcStandinOf(const HostFormat& host) {
 u32 BcStandinBlockBytes(const HostFormat& host) {
     switch (BcStandinOf(host)) {
     case AstcStandin::Bc1:
+    case AstcStandin::Bc4:
         return 8;
     case AstcStandin::Bc3:
+    case AstcStandin::Bc5:
     case AstcStandin::Bc7:
         return 16;
     default:
@@ -322,8 +401,60 @@ bool ViewsBcStandin(VkFormat format, VkFormat standin) {
     const auto bc7 = [](VkFormat f) {
         return f == VK_FORMAT_BC7_UNORM_BLOCK || f == VK_FORMAT_BC7_SRGB_BLOCK;
     };
+    const auto same = [&](VkFormat f) {
+        return f == standin &&
+               (f == VK_FORMAT_BC4_UNORM_BLOCK || f == VK_FORMAT_BC5_UNORM_BLOCK);
+    };
     return (bc1(format) && bc1(standin)) || (bc3(format) && bc3(standin)) ||
-           (bc7(format) && bc7(standin));
+           (bc7(format) && bc7(standin)) || same(format);
+}
+
+VkFormat StandinViewFormat(const HostFormat& texture, const HostFormat& storage) {
+    const AstcStandin kind = BcStandinOf(storage);
+    const bool srgb = VideoCore::Surface::IsPixelFormatSRGB(texture.pixel_format);
+    switch (kind) {
+    case AstcStandin::Bc1:
+        return srgb ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+    case AstcStandin::Bc3:
+        return srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
+    case AstcStandin::Bc7:
+        return srgb ? VK_FORMAT_BC7_SRGB_BLOCK : VK_FORMAT_BC7_UNORM_BLOCK;
+    case AstcStandin::Bc4:
+    case AstcStandin::Bc5:
+        return srgb ? VK_FORMAT_UNDEFINED : storage.format;
+    default:
+        return storage.format;
+    }
+}
+
+std::array<VkComponentSwizzle, 4> ComposeStandinSwizzle(
+    const std::array<VkComponentSwizzle, 4>& guest, AstcStandin standin) {
+    if (standin != AstcStandin::Bc4 && standin != AstcStandin::Bc5) {
+        return guest;
+    }
+    // What each RGBA8 channel of the decoded (L, L, L, A) is in the BC image.
+    const VkComponentSwizzle alpha =
+        standin == AstcStandin::Bc4 ? VK_COMPONENT_SWIZZLE_ONE : VK_COMPONENT_SWIZZLE_G;
+    std::array<VkComponentSwizzle, 4> result{};
+    for (size_t c = 0; c < 4; ++c) {
+        switch (guest[c]) {
+        case VK_COMPONENT_SWIZZLE_R:
+        case VK_COMPONENT_SWIZZLE_G:
+        case VK_COMPONENT_SWIZZLE_B:
+            result[c] = VK_COMPONENT_SWIZZLE_R;
+            break;
+        case VK_COMPONENT_SWIZZLE_A:
+            result[c] = alpha;
+            break;
+        case VK_COMPONENT_SWIZZLE_IDENTITY:
+            result[c] = c == 3 ? alpha : VK_COMPONENT_SWIZZLE_R;
+            break;
+        default:
+            result[c] = guest[c]; // ZERO, ONE
+            break;
+        }
+    }
+    return result;
 }
 
 VkFormat SameSizeUintFormat(u32 bytes) {
