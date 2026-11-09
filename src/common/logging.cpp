@@ -421,6 +421,12 @@ void Filter::ParseFilterString(std::string_view filter_view) {
 // Constructor shall NOT depend upon Settings() or whatever
 // it's ran at global static ctor() time... so BE CAREFUL MFER!
 static std::optional<Common::Log::Impl> logging_instance{};
+/// See SetExternalSink. Loaded once per message that passes the filter; nullptr when unset.
+static std::atomic<Common::Log::ExternalSink> external_sink{nullptr};
+
+void SetExternalSink(ExternalSink sink) {
+    external_sink.store(sink, std::memory_order_release);
+}
 
 void Initialize() {
     if (logging_instance) {
@@ -499,6 +505,7 @@ void FmtLogMessageImpl(Class log_class, Level log_level, const char* filename, u
             .function = function,
             .line_num = line_num,
         };
+        const auto sink = external_sink.load(std::memory_order_acquire);
         if (result.size <= sizeof(buffer) - 1) {
             buffer[(std::min)(result.size, sizeof(buffer) - 1)] = '\0';
             e.message = buffer;
@@ -507,6 +514,7 @@ void FmtLogMessageImpl(Class log_class, Level log_level, const char* filename, u
                 backend.Write(e);
                 if (flush) backend.Flush();
             });
+            if (sink) sink(GetLogClassName(log_class), log_level, {e.message, e.message_len});
         } else {
             std::string s = fmt::vformat(format, args);
             e.message = s.c_str();
@@ -515,6 +523,7 @@ void FmtLogMessageImpl(Class log_class, Level log_level, const char* filename, u
                 backend.Write(e);
                 if (flush) backend.Flush();
             });
+            if (sink) sink(GetLogClassName(log_class), log_level, s);
         }
     }
 }

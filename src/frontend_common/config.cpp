@@ -914,6 +914,14 @@ void Config::ReadSettingGeneric(Settings::BasicSetting* const setting) {
     const std::string key = AdjustKey(setting->GetLabel());
     const std::string default_value(setting->DefaultToString());
 
+    if (setting->Id() == Settings::values.mcp_token.Id()) {
+        // Read as stored, ignoring the \default flag: a token in the file must never be dropped
+        // (the server would then run without authentication), and the path adjustments of the
+        // default read would change it.
+        setting->LoadString(ReadStringSetting(key));
+        return;
+    }
+
     bool use_global = true;
     if (setting->Switchable() && !global) {
         use_global = ReadBooleanSetting(std::string(key).append("\\use_global"), std::make_optional(true));
@@ -950,7 +958,12 @@ void Config::WriteSettingGeneric(const Settings::BasicSetting* const setting) {
     } else if (global) {
         WriteBooleanSetting(std::string(key).append("\\default"),
                             setting->ToString() == setting->DefaultToString());
-        WriteStringSetting(key, setting->ToString());
+        if (setting->Id() == Settings::values.mcp_token.Id()) {
+            // Stored as is: the path adjustments of WriteStringSetting would change a token.
+            WritePreparedSetting(key, setting->ToString(), std::nullopt, std::nullopt);
+        } else {
+            WriteStringSetting(key, setting->ToString());
+        }
     }
 }
 

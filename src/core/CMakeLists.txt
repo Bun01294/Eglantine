@@ -46,6 +46,7 @@ add_library(core STATIC
     debugger/gdbstub.h
     debugger/gdbstub_arch.cpp
     debugger/gdbstub_arch.h
+    debugger/mapped_range_hook.h
     debugger/nx2_debug_server.cpp
     debugger/nx2_debug_server.h
     debugger/nx2_debug_tools.cpp

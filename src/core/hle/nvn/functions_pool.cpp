@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -14,6 +15,7 @@
 #include "common/boot_counter.h"
 #include "common/logging.h"
 #include "core/core.h"
+#include "core/debugger/mapped_range_hook.h"
 #include "core/hle/nvn/config.h"
 #include "core/hle/nvn/hle_call.h"
 #include "core/hle/nvn/hle_runtime.h"
@@ -327,10 +329,20 @@ void nvnPoolSetDebugLabel(Call& c) {
 namespace {
 
 /// EDEN_NX2_DIAG_INVALIDATE=1 (measurement only): one log line per Flush/InvalidateMappedRange,
-/// with the first 16 raw words the CPU sees at the range start and where the GPU stands.
+/// with the first raw words the CPU sees at the range start and where the GPU stands.
 bool DiagMappedRanges() {
     static const bool on = SwitchOn("EDEN_NX2_DIAG_INVALIDATE");
     return on;
+}
+
+/// EDEN_NX2_DIAG_INVALIDATE_WORDS=<n>: how many words those lines show (default 16, at most 64).
+size_t DiagMappedRangeWords() {
+    static const size_t count = [] {
+        const char* text = std::getenv("EDEN_NX2_DIAG_INVALIDATE_WORDS");
+        const unsigned long n = text != nullptr ? std::strtoul(text, nullptr, 10) : 0;
+        return n == 0 ? size_t{16} : static_cast<size_t>((std::min)(n, 64UL));
+    }();
+    return count;
 }
 
 void LogMappedRange(Call& c, const char* what, u64 address, u64 size, const std::string& note) {
@@ -341,8 +353,8 @@ void LogMappedRange(Call& c, const char* what, u64 address, u64 size, const std:
     if (logged.fetch_add(1, std::memory_order_relaxed) >= 200000) {
         return;
     }
-    std::array<u32, 16> words{};
-    const u64 bytes = (std::min<u64>)(size, sizeof(words));
+    std::array<u32, 64> words{};
+    const u64 bytes = (std::min<u64>)(size, DiagMappedRangeWords() * sizeof(u32));
     c.mem.Read(address, words.data(), bytes);
     std::string hex;
     for (u64 i = 0; i < bytes / 4; ++i) {
@@ -429,6 +441,9 @@ void InvalidateMappedRange(Call& c, u64 address, u64 size) {
     }
     if (DiagMappedRanges()) {
         LogMappedRange(c, "invalidate", address, size, note);
+    }
+    if (const auto hook = Core::Trace::g_invalidate_hook.load(std::memory_order_acquire)) {
+        hook(address, size);
     }
 }
 

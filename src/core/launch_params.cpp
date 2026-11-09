@@ -20,6 +20,17 @@
 #endif
 
 namespace Core {
+
+/// Parses a whole decimal TCP port (1-65535); nullopt for anything else.
+static std::optional<u16> ParsePort(const char* text) {
+    char* end = nullptr;
+    const unsigned long port = std::strtoul(text, &end, 10);
+    if (end == text || *end != '\0' || port == 0 || port > 65535) {
+        return std::nullopt;
+    }
+    return static_cast<u16>(port);
+}
+
 LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wchar_t *argv_w[]) noexcept {
     LaunchParams p{};
 
@@ -39,6 +50,9 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
         {"null-render", no_argument, 0, 'n'},
         {"singlecore", no_argument, 0, 's'},
         {"filter", no_argument, 0, 'x'},
+        {"mcp", no_argument, 0, 'M'},
+        {"mcp-port", required_argument, 0, 'P'},
+        {"mcp-allow-writes", no_argument, 0, 'W'},
         {"pack-nup", required_argument, 0, 'N'},
         {"unpack-nup", required_argument, 0, 'U'},
         {"edit-nup", required_argument, 0, 'E'},
@@ -72,6 +86,21 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
                 break;
             case 'g':
                 p.filepath = std::string(optarg);
+                break;
+            case 'M':
+                p.mcp_enable = true;
+                break;
+            case 'P':
+                p.mcp_enable = true;
+                if (const auto port = ParsePort(optarg)) {
+                    p.mcp_port = *port;
+                } else {
+                    LOG_ERROR(Frontend, "Invalid --mcp-port '{}', using the configured port",
+                              optarg);
+                }
+                break;
+            case 'W':
+                p.mcp_allow_writes = true;
                 break;
             case 'N':
                 p.pack_nup_source = std::string(optarg);
@@ -241,6 +270,9 @@ void ApplyLaunchParams(LaunchParams const& lp) noexcept {
             "-u, --user            Select a specific user profile from 0 to 7\n"
             "-d, --debug           Run the GDB stub on a port from 1 to 65535\n"
             "-v, --version         Output version information and exit\n"
+            "--mcp                 Start the built-in MCP server (loopback only)\n"
+            "--mcp-port <port>     MCP server port (default 6544), implies --mcp\n"
+            "--mcp-allow-writes    Let MCP clients send input and write memory\n"
             "--pack-nup <dump> [<out.nup>]"
             " Pack a loose dump with all its updates and DLC into a NUP file and exit\n"
             "--unpack-nup <file.nup> [<out_dir>]"

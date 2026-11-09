@@ -63,13 +63,17 @@ does not have:
   post-processing) on the replay's frames: the replay presents with its plain blit. These settings
   are greyed out while VTX-HLE is selected.
 - HDR output.
-- FUKKO's performance HUD, GPU command capture, native shader registry and MCP tools.
+- FUKKO's performance HUD, GPU command capture and native shader registry. The MCP server is
+  ported separately with a subset of its tools (see [`tools/mcp/README.md`](../tools/mcp/README.md)).
 
 ## Credits
 
 - VTX-HLE by Vortex727 (https://github.com/Vortex727/FUKKO). FUKKO by Vortex727
   (https://github.com/Vortex727/FUKKO). See [NOTICE](NOTICE), which has to stay with any copy of
   this code.
+- MCP server from FUKKO by Vortex727 (https://github.com/Vortex727/FUKKO), originally written by
+  quixomatic (`src/mcp`, `src/yuzu/mcp_host_qt.*`, `src/yuzu_cmd/mcp_host_cli.*`, `tools/mcp`).
+  The same [NOTICE](NOTICE) applies to it.
 - ShiftX2 fixes by Duck912: the uniform snapshot at submit that fixes Ocarina of Time's vertex
   explosions, the CPU-written-page uniform snapshot, keeping stale GPU contents off textures the
   CPU rewrote, the overlap source rule, raw global memory helpers kept as calls, and presenting
