@@ -596,7 +596,59 @@ their render-target aliases, other holders: retired textures and views waiting f
 submission, submissions in flight, bound targets; idle GPU-written; idle rebuildable), the bytes
 per origin and the Resolution setting's twins (outside the cache's count); the fourth the render
 targets by presents since their last use (all, held by live textures, idle GPU-written), the
-evictions by rule and the device excess at the last pass.
+evictions by rule and the device excess at the last pass; the fifth splits the ones live textures
+hold by who keeps those textures (below).
+
+### Memory line, texture holders, synthetic lists, strict device-local memory
+
+**`[nvn] memory:`** (every heartbeat, 10 s; `EDEN_NX2_NVN_MEMORY_LOG=0` turns it off). Recorder
+part: the lists at synthetic command memory (count, MiB, the byte cap and how many it and the
+65,536 count cap dropped), the finalized textures that only lists keep (synthetic or guest command
+memory) or that wait for their submissions, the re-initialised textures still alive and
+`reinitialized_objects`. Replay part (`Sink::DescribeMemory`): process private bytes, private
+working set and shared commit; every Vulkan heap (device or host) with the driver's budget and the
+process's usage (VK_EXT_memory_budget) and the replay allocator's blocks and allocations in it (the
+host heaps' usage is the Vulkan memory that sits in system RAM); the spills: allocations that asked
+for device-local memory (images, DeviceLocal and Stream buffers) and got a memory type without
+DEVICE_LOCAL, count and MiB per kind (storage images, pool buffers, shadows, mirrors, arenas,
+staging, other; cumulative, `MemoryAllocator::TrackSpills`); the strict mode's counters; the
+texture storages (and their scaled twins) by their strongest holder; the storage cache; the
+imported chunks (kept until the context goes); pipelines and lowered programs (never evicted).
+
+**Texture holders.** The heartbeat asks the recorder (`Recorder::PublishTextureHolders`) for every
+texture the game no longer names and why it lives: *re-initialised* (the game initialized its
+object again without a finalize: nothing will finalize the old one, so it is never destroyed;
+this round only counts them), *synthetic lists* / *guest lists* (finalized, a recorded list
+references it; a guest list wins), *retiring* (finalized, waiting for its submissions or an open
+recording). View objects go with their texture. The report reaches the replay in order
+(`Sink::NoteTextureHolders`); a storage several textures use is held by the strongest of them
+(game, retiring, guest lists, synthetic lists, re-initialised). The memory line shows the previous
+heartbeat's report; the census's fifth line splits the render targets held by live textures by it
+per presents since use.
+
+**Synthetic command lists** (`EDEN_NX2_NVN_SYNTH_LIST_MIB`, default 0: no byte cap). The game's
+command memory callback is never invoked (`callbacks_skipped`): a recording that runs out continues
+in synthetic memory (`0x7E00...`), and one that starts there gets a synthetic handle. A list in the
+game's memory dies when the game records over its bytes or finalizes the pool; a synthetic one has
+no such event, so only the 65,536 count cap (least recently used) ever drops it, and it keeps the
+textures it references alive. With the byte cap, the least recently submitted or called synthetic
+lists go while they are over it, their references released, but only ones no submission or call
+used for 600 presents and that no other list calls (`List::callees`, counted per entry). A
+submission copies the words it runs and retains its own references, so dropping a list never
+affects work in flight. It is still not safe by construction, hence off by default: the game holds
+the handle (an opaque value it may keep anywhere) and can submit or call it again at any time,
+and nothing it does tells the recorder it will not; the real driver would have placed the list
+in memory the callback supplied, whose lifetime only the game knows. A dropped list submitted
+again is skipped (`unknown_call_handle`, logged). Use it as an A/B with the memory line and the
+census showing what the synthetic lists hold.
+
+**Strict device-local memory** (`EDEN_NX2_TRY_VMA_DEVICE_STRICT=1`, candidate, default off). VMA's
+default for "prefer device, within budget" takes a host memory type once the device heap is at its
+budget, and the allocation stays there. Strict: the replay's images and DeviceLocal buffers require
+DEVICE_LOCAL; over the budget they are made in device-local memory anyway (the driver pages;
+`over budget` counter, logged sparsely) and a storage trim pass runs at the next present; host
+memory only when no device-local type can hold one (`host fallbacks`, every one logged). Stream
+buffers keep their host fallback.
 
 ## Records
 

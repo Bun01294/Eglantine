@@ -85,7 +85,47 @@ namespace {
         }
         return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     }
+
+    /// Strict mode's over-budget allocations: the first ones and then every 256th are logged.
+    [[nodiscard]] bool LogStrictFallback(std::atomic<u64>& counter) {
+        const u64 n = counter.load(std::memory_order_relaxed);
+        return n <= 32 || (n & 0xFF) == 0;
+    }
 } // namespace
+
+const char* AllocationKindName(AllocationKind kind) {
+    switch (kind) {
+    case AllocationKind::Other:
+        return "other";
+    case AllocationKind::StorageImage:
+        return "storage_images";
+    case AllocationKind::PoolBuffer:
+        return "pool_buffers";
+    case AllocationKind::Shadow:
+        return "shadows";
+    case AllocationKind::Mirror:
+        return "mirrors";
+    case AllocationKind::Arena:
+        return "arenas";
+    case AllocationKind::Staging:
+        return "staging";
+    case AllocationKind::Count:
+        break;
+    }
+    return "?";
+}
+
+bool CountSpill(AllocationSpills& spills, AllocationKind kind, bool wanted_device_local,
+                VkMemoryPropertyFlags flags, u64 size) {
+    const size_t index = static_cast<size_t>(kind);
+    if (!wanted_device_local || (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 ||
+        index >= AllocationSpills::KINDS) {
+        return false;
+    }
+    spills.count[index].fetch_add(1, std::memory_order_relaxed);
+    spills.bytes[index].fetch_add(size, std::memory_order_relaxed);
+    return true;
+}
 
 //MemoryCommit is now VMA-backed
 MemoryCommit::MemoryCommit(VmaAllocator alloc, VmaAllocation a,
@@ -209,7 +249,8 @@ MemoryAllocator::MemoryAllocator(const Device &device_, VmaAllocator allocator_)
 
 MemoryAllocator::~MemoryAllocator() = default;
 
-vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated) const
+vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated,
+                                       AllocationKind kind) const
 {
     const VmaAllocationCreateInfo alloc_ci = {
             // Best fit: images freed by the thousand leave holes in the blocks, which new ones
@@ -219,7 +260,9 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
                      (dedicated ? VmaAllocationCreateFlags{VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT}
                                : VmaAllocationCreateFlags{0}),
             .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-            .requiredFlags = 0,
+            // Strict: no silent fallback to a host memory type within the budget.
+            .requiredFlags = device_strict ? VkMemoryPropertyFlags{VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT}
+                                           : VkMemoryPropertyFlags{0},
             .preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
             .memoryTypeBits = 0,
             .pool = VK_NULL_HANDLE,
@@ -252,6 +295,18 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
         VmaAllocationCreateInfo relaxed = alloc_ci;
         relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
         result = vmaCreateImage(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
+        if (result == VK_SUCCESS && device_strict && spills != nullptr) {
+            spills->over_budget_count.fetch_add(1, std::memory_order_relaxed);
+            spills->over_budget_bytes.fetch_add(alloc_info.size, std::memory_order_relaxed);
+            if (LogStrictFallback(spills->over_budget_count)) {
+                LOG_WARNING(Render_Vulkan,
+                            "[vma strict] {} image {}x{}x{} ({} MiB) placed in device-local "
+                            "memory over the budget (#{})",
+                            AllocationKindName(kind), ci.extent.width, ci.extent.height,
+                            ci.extent.depth, alloc_info.size >> 20,
+                            spills->over_budget_count.load(std::memory_order_relaxed));
+            }
+        }
     }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         // Still out of device memory: a real image in host memory (slow, but valid) beats one
@@ -259,10 +314,22 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
         VmaAllocationCreateInfo host = alloc_ci;
         host.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
         host.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+        host.requiredFlags = 0;
         host.preferredFlags = 0;
         result = vmaCreateImage(allocator, &ci, &host, &handle, &allocation, &alloc_info);
+        if (result == VK_SUCCESS && device_strict && spills != nullptr) {
+            // The last resort of strict mode: every one is logged.
+            spills->host_fallback_count.fetch_add(1, std::memory_order_relaxed);
+            spills->host_fallback_bytes.fetch_add(alloc_info.size, std::memory_order_relaxed);
+            LOG_WARNING(Render_Vulkan,
+                        "[vma strict] {} image {}x{}x{} ({} MiB): no device-local memory left, "
+                        "placed in host memory (#{})",
+                        AllocationKindName(kind), ci.extent.width, ci.extent.height,
+                        ci.extent.depth, alloc_info.size >> 20,
+                        spills->host_fallback_count.load(std::memory_order_relaxed));
+        }
         static u32 host_logged{};
-        if (result == VK_SUCCESS && host_logged++ < 16) {
+        if (result == VK_SUCCESS && !device_strict && host_logged++ < 16) {
             LOG_WARNING(Render_Vulkan,
                         "Image {}x{}x{} ({} levels, {} layers, format {}) is out of device memory; "
                         "placed in host memory",
@@ -292,6 +359,12 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
                      ci.arrayLayers, static_cast<u32>(ci.format), static_cast<int>(result));
     }
     vk::Check(result);
+
+    if (spills != nullptr) {
+        VkMemoryPropertyFlags property_flags{};
+        vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
+        CountSpill(*spills, kind, true, property_flags, alloc_info.size);
+    }
 
     // Log GPU memory allocation for images
     if (GPU::Logging::IsActive() &&
@@ -408,14 +481,23 @@ bool MemoryAllocator::CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, M
 }
 
 vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage) const {
+    return CreateBuffer(ci, usage, AllocationKind::Other);
+}
+
+vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
+                                         AllocationKind kind) const {
     // MESA will do memcpy() if not marked as host cached, so just force mark it for most buffers
     auto const anv_flags = (usage == MemoryUsage::Stream
         && device.GetDriverID() == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA)
         ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0;
+    // Strict: a DeviceLocal buffer gets no silent fallback to a host memory type within the
+    // budget (Stream buffers fall back to host memory by design).
+    const bool strict = device_strict && usage == MemoryUsage::DeviceLocal;
     const VmaAllocationCreateInfo alloc_ci = {
         .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | MemoryUsageVmaFlags(usage),
         .usage = MemoryUsageVma(usage),
-        .requiredFlags = 0,
+        .requiredFlags = strict ? VkMemoryPropertyFlags{VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT}
+                                : VkMemoryPropertyFlags{0},
         .preferredFlags = MemoryUsagePreferredVmaFlags(usage) | anv_flags,
         .memoryTypeBits = usage == MemoryUsage::Stream ? 0u : valid_memory_types,
         .pool = VK_NULL_HANDLE,
@@ -429,9 +511,49 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     VkMemoryPropertyFlags property_flags{};
 
     if (!CreateBufferInSeparatePool(ci, usage, alloc_ci, handle, allocation, alloc_info)) {
-        vk::Check(vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));
+        VkResult result = vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation,
+                                          &alloc_info);
+        if (result != VK_SUCCESS && strict) {
+            // Over the budget: device-local anyway, the driver pages.
+            VmaAllocationCreateInfo relaxed = alloc_ci;
+            relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+            result = vmaCreateBuffer(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
+            if (result == VK_SUCCESS && spills != nullptr) {
+                spills->over_budget_count.fetch_add(1, std::memory_order_relaxed);
+                spills->over_budget_bytes.fetch_add(alloc_info.size, std::memory_order_relaxed);
+                if (LogStrictFallback(spills->over_budget_count)) {
+                    LOG_WARNING(Render_Vulkan,
+                                "[vma strict] {} buffer ({} MiB) placed in device-local memory "
+                                "over the budget (#{})",
+                                AllocationKindName(kind), alloc_info.size >> 20,
+                                spills->over_budget_count.load(std::memory_order_relaxed));
+                }
+            }
+            if (result != VK_SUCCESS) {
+                // No device-local memory type can hold it: host memory, the last resort.
+                VmaAllocationCreateInfo host = relaxed;
+                host.requiredFlags = 0;
+                result = vmaCreateBuffer(allocator, &ci, &host, &handle, &allocation, &alloc_info);
+                if (result == VK_SUCCESS && spills != nullptr) {
+                    spills->host_fallback_count.fetch_add(1, std::memory_order_relaxed);
+                    spills->host_fallback_bytes.fetch_add(alloc_info.size,
+                                                          std::memory_order_relaxed);
+                    LOG_WARNING(Render_Vulkan,
+                                "[vma strict] {} buffer ({} MiB): no device-local memory left, "
+                                "placed in host memory (#{})",
+                                AllocationKindName(kind), alloc_info.size >> 20,
+                                spills->host_fallback_count.load(std::memory_order_relaxed));
+                }
+            }
+        }
+        vk::Check(result);
     }
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
+    if (spills != nullptr) {
+        CountSpill(*spills, kind,
+                   usage == MemoryUsage::DeviceLocal || usage == MemoryUsage::Stream,
+                   property_flags, alloc_info.size);
+    }
 
     // Log GPU memory allocation for buffers
     if (GPU::Logging::IsActive() &&

@@ -13,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -445,12 +446,14 @@ struct Rig {
 
     explicit Rig(HeadlessVulkan& vulkan, bool allow_import, u32 texture_pool_flags = POOL_CPU_CACHED,
                  std::optional<u64> storage_cache_budget = {},
-                 std::optional<u64> trim_age_presents = {}, std::optional<bool> trim_legacy = {})
+                 std::optional<u64> trim_age_presents = {}, std::optional<bool> trim_legacy = {},
+                 std::optional<bool> vma_device_strict = {})
         : context(*vulkan.device, vulkan.submit_mutex, nullptr,
                   {.allow_host_import = allow_import,
                    .storage_cache_budget_bytes = storage_cache_budget,
                    .storage_trim_age_presents = trim_age_presents,
-                   .storage_trim_legacy = trim_legacy}) {
+                   .storage_trim_legacy = trim_legacy,
+                   .vma_device_strict = vma_device_strict}) {
         texture_bytes = memory.Add(TEXTURE_POOL_VA, 4_MiB);
         readback = memory.Add(BUFFER_POOL_VA, 1_MiB);
         context.SetGuestMemory(&memory);
@@ -1423,4 +1426,59 @@ TEST_CASE("nvn memory: compressed textures upload and copy without unsupported o
         WARN("[nvn] ASTC decoded on upload: " << stats.decode_bytes << " bytes in "
                                               << stats.decode_ns / 1000 << " us");
     }
+}
+
+TEST_CASE("nvn memory: spills count device-local requests placed in host memory types", "[nvn]") {
+    Vulkan::AllocationSpills spills;
+    using Vulkan::AllocationKind;
+    // Device-local as asked, or host memory asked for: nothing spilled.
+    CHECK_FALSE(Vulkan::CountSpill(spills, AllocationKind::PoolBuffer, true,
+                                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 1_MiB));
+    CHECK_FALSE(Vulkan::CountSpill(spills, AllocationKind::Staging, false,
+                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, 1_MiB));
+    // Device-local asked for, a host-visible system memory type taken.
+    CHECK(Vulkan::CountSpill(spills, AllocationKind::StorageImage, true,
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                             3_MiB));
+    CHECK(Vulkan::CountSpill(spills, AllocationKind::StorageImage, true, 0, 1_MiB));
+    const auto index = [](AllocationKind kind) { return static_cast<size_t>(kind); };
+    CHECK(spills.count[index(AllocationKind::StorageImage)].load() == 2);
+    CHECK(spills.bytes[index(AllocationKind::StorageImage)].load() == 4_MiB);
+    CHECK(spills.count[index(AllocationKind::PoolBuffer)].load() == 0);
+    CHECK(spills.count[index(AllocationKind::Staging)].load() == 0);
+    CHECK(std::string{Vulkan::AllocationKindName(AllocationKind::Shadow)} == "shadows");
+}
+
+TEST_CASE("nvn memory: the memory line splits storages by the recorder's holder report", "[nvn]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    const bool strict = GENERATE(false, true);
+    constexpr u32 SIZE = 32;
+    Rig rig{*vulkan, true, POOL_CPU_CACHED, {}, {}, {}, strict};
+    rig.context.CreateTexture(MakeTexture(10, Rig::TEXTURE_POOL, 0, NVN_FORMAT_RGBA8, SIZE, SIZE));
+    rig.context.CreateTexture(
+        MakeTexture(11, Rig::TEXTURE_POOL, 0x40000, NVN_FORMAT_RGBA8, SIZE, SIZE));
+    std::vector<u64> list;
+    Push(list, VC::Op::ClearTexture, ClearColor(10, SIZE, SIZE, 1.0f, 0.0f, 0.0f, 1.0f), 0xF);
+    Push(list, VC::Op::ClearTexture, ClearColor(11, SIZE, SIZE, 0.0f, 1.0f, 0.0f, 1.0f), 0xF);
+    Run(rig.context, rig.seq, std::move(list));
+
+    VC::TextureHolderReport report;
+    report.serials = {{11, VC::TextureHolder::Reinitialized}};
+    rig.context.NoteTextureHolders(std::move(report));
+    Run(rig.context, rig.seq, {}); // ordered after the report
+
+    const std::string line = rig.context.DescribeMemory();
+    INFO(line);
+    CHECK(line.find("game 0 (1)") != std::string::npos);
+    CHECK(line.find("re-initialised 0 (1)") != std::string::npos);
+    CHECK(line.find("synthetic lists 0 (0)") != std::string::npos);
+    CHECK(line.find(strict ? "strict on" : "strict off") != std::string::npos);
+    CHECK(line.find("heaps budget/usage") != std::string::npos);
+    CHECK(line.find("storage_images 0/0") != std::string::npos);
+    const Nvn::ContextStats stats = rig.context.Stats();
+    REQUIRE(stats.ops_failed == 0);
 }

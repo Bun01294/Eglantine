@@ -15,6 +15,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -302,11 +303,21 @@ struct List {
     std::vector<u64> words;
     std::vector<u64> refs; ///< sorted, unique serials referenced by the records
     std::vector<Action> actions;
+    std::vector<u64> callees; ///< sorted, unique synthetic handles its CallList records call
 };
+
+/// Host memory a list takes.
+[[nodiscard]] inline u64 ListBytes(const List& list) {
+    return sizeof(List) + list.words.size() * sizeof(u64) + list.refs.size() * sizeof(u64) +
+           list.actions.size() * sizeof(Action) + list.callees.size() * sizeof(u64);
+}
 
 struct ListEntry {
     u64 end = 0; ///< end of the first command memory piece
     u64 stamp = 0; ///< synthetic lists: position in Impl::synthetic_lru (last submit/insert)
+    u64 bytes = 0; ///< ListBytes
+    u64 last_used_present = 0; ///< presents at the insert or the last submit/call
+    u32 callers = 0; ///< synthetic lists: lists whose CallList records call this one
     std::shared_ptr<const List> list;
 };
 
@@ -392,6 +403,9 @@ struct AtomicStats {
     std::atomic<u64> retired_objects{};
     std::atomic<u64> synthetic_evictions{};
     std::atomic<u64> finalized_pool_lists{};
+    std::atomic<u64> synthetic_lists{};
+    std::atomic<u64> synthetic_list_bytes{};
+    std::atomic<u64> synthetic_cap_evictions{};
 };
 
 struct Recorder::Impl {
@@ -455,6 +469,12 @@ struct Recorder::Impl {
     // Object retirement
     std::mutex retire_mutex;
     std::vector<u64> retire_list;
+    /// Textures whose guest object was initialized again while they were alive (under
+    /// retire_mutex). Nothing finalizes them, so they are never destroyed; the ones finalized
+    /// through a copy of the object, or gone, are pruned.
+    std::vector<u64> reinitialized_textures;
+    size_t reinitialized_prune_at = 4096;
+    void PruneReinitializedLocked();
     std::mutex destroy_mutex;
     std::vector<u64> destroy_queue;
 
@@ -465,6 +485,20 @@ struct Recorder::Impl {
     /// the cap is reached.
     std::map<u64, u64> synthetic_lru;
     u64 lru_clock = 0;
+    u64 synthetic_count = 0;
+    u64 synthetic_bytes = 0;
+    /// SetSyntheticListCap (0: no byte cap).
+    u64 synthetic_cap_bytes = 0;
+    u64 synthetic_idle_presents = DEFAULT_SYNTHETIC_LIST_IDLE_PRESENTS;
+    /// Requires lists_mutex: removes the entry (its LRU slot, byte count and the caller counts of
+    /// its callees) and moves its list to `removed`, whose references the caller releases.
+    std::map<u64, ListEntry>::iterator EraseListLocked(
+        std::map<u64, ListEntry>::iterator it, std::vector<std::shared_ptr<const List>>& removed);
+    /// Requires lists_mutex: counts `list` as a caller of its callees (or no longer).
+    void NoteCalleesLocked(const List& list, bool add);
+    /// Requires lists_mutex: drops idle, uncalled synthetic lists, least recently used first,
+    /// until they are within synthetic_cap_bytes.
+    void EvictSyntheticOverCapLocked(std::vector<std::shared_ptr<const List>>& removed);
 
     // Anonymous samplers created for RegisterSamplerParams, deduplicated by parameters.
     std::mutex anonymous_sampler_mutex;
@@ -603,6 +637,13 @@ T* Recorder::Impl::Create(Slab<T>& slab, ObjectKind kind, u64 va, bool count_rei
         old.kind == static_cast<u32>(kind) && slab.Get(old.serial)) {
         // The old object stays alive for the records that retained it (and for copies of it).
         ++stats.reinitialized_objects;
+        if constexpr (std::is_same_v<T, TextureObject>) {
+            std::lock_guard lock{retire_mutex};
+            reinitialized_textures.push_back(old.serial);
+            if (reinitialized_textures.size() >= reinitialized_prune_at) {
+                PruneReinitializedLocked();
+            }
+        }
     }
     T* object = slab.Allocate();
     if (!object) {

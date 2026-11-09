@@ -62,7 +62,7 @@ bool IsLayered(TexTarget target) {
 } // Anonymous namespace
 
 vk::Buffer Context::Impl::CreateHostBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
-                                           MemoryUsage usage_hint) const {
+                                           MemoryUsage usage_hint, AllocationKind kind) const {
     return allocator->CreateBuffer(
         VkBufferCreateInfo{
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -74,7 +74,7 @@ vk::Buffer Context::Impl::CreateHostBuffer(VkDeviceSize size, VkBufferUsageFlags
             .queueFamilyIndexCount = 0,
             .pQueueFamilyIndices = nullptr,
         },
-        usage_hint);
+        usage_hint, kind);
 }
 
 const u8* Context::Impl::GuestPointer(u64 address, u64 size) const {
@@ -318,6 +318,8 @@ VkResult Context::Impl::ImportPoolBuffer(Pool& pool, u8* host, std::string& erro
         }
         chunk = std::move(imported);
         import_chunks.push_back(chunk);
+        import_chunks_live.fetch_add(1, std::memory_order_relaxed);
+        import_chunks_live_bytes.fetch_add(high - low, std::memory_order_relaxed);
     }
     const VkResult result = importer->CreateBufferInChunk(
         *chunk, static_cast<u64>(host - chunk->host), size, pool_usage,
@@ -486,7 +488,8 @@ void Context::Impl::BackPoolLocked(Pool& pool_ref) {
                             static_cast<int>(import_result));
             }
             t = Clock::now();
-            pool->buffer = CreateHostBuffer(desc.size, pool_usage, MemoryUsage::DeviceLocal);
+            pool->buffer = CreateHostBuffer(desc.size, pool_usage, MemoryUsage::DeviceLocal,
+                                            AllocationKind::PoolBuffer);
             ns_buffer = since(t);
             path = "mirror";
             pool->backing = Pool::Backing::Mirror;
@@ -514,7 +517,8 @@ void Context::Impl::BackPoolLocked(Pool& pool_ref) {
             return;
         }
         const auto t = Clock::now();
-        pool->buffer = CreateHostBuffer(desc.size, pool_usage, MemoryUsage::DeviceLocal);
+        pool->buffer = CreateHostBuffer(desc.size, pool_usage, MemoryUsage::DeviceLocal,
+                                        AllocationKind::PoolBuffer);
         ns_buffer = since(t);
         path = "device-local";
         pool->backing = Pool::Backing::DeviceLocal;
@@ -565,7 +569,8 @@ bool Context::Impl::UploadPoolRanges(std::span<const PoolUpload> ranges, bool in
     const u64 staging_size = (std::clamp)(total, u64{4096}, STAGING_SIZE);
     try {
         vk::Buffer staging =
-            CreateHostBuffer(staging_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, MemoryUsage::Upload);
+            CreateHostBuffer(staging_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, MemoryUsage::Upload,
+                             AllocationKind::Staging);
         u8* const mapped = staging.Mapped().data();
         struct Copy {
             VkBuffer destination;
@@ -1353,7 +1358,8 @@ std::shared_ptr<RawTableBuffer> Context::Impl::UploadRawTable(
             MemoryUsage::DeviceLocal);
         table->address = device.GetLogical().GetBufferDeviceAddress(*table->buffer);
         vk::Buffer staging =
-            CreateHostBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, MemoryUsage::Upload);
+            CreateHostBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, MemoryUsage::Upload,
+                             AllocationKind::Staging);
         std::memcpy(staging.Mapped().data(), entries.data(), bytes);
         staging.Flush();
         ImmediateSubmit([&](vk::CommandBuffer cmd) {

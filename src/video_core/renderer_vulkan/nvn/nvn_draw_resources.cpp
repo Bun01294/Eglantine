@@ -647,7 +647,8 @@ std::shared_ptr<ArenaChunk> DrawResources::AcquireArena(u64 min_size) {
     }
     auto chunk = std::make_shared<ArenaChunk>();
     chunk->size = (std::max)(min_size, ARENA_CHUNK_SIZE);
-    chunk->buffer = impl.CreateHostBuffer(chunk->size, ARENA_USAGE, MemoryUsage::Upload);
+    chunk->buffer = impl.CreateHostBuffer(chunk->size, ARENA_USAGE, MemoryUsage::Upload,
+                                          AllocationKind::Arena);
     chunk->pointer = chunk->buffer.Mapped().data();
     return chunk;
 }
@@ -680,7 +681,8 @@ std::shared_ptr<ShadowChunk> DrawResources::AcquireShadow(u64 min_size) {
     // their allocation (AppendVertexStageTasks).
     chunk->size = ((std::max)(min_size, SHADOW_CHUNK_SIZE) + 255) / 256 * 256;
     try {
-        chunk->buffer = impl.CreateHostBuffer(chunk->size, SHADOW_USAGE, MemoryUsage::DeviceLocal);
+        chunk->buffer = impl.CreateHostBuffer(chunk->size, SHADOW_USAGE, MemoryUsage::DeviceLocal,
+                                              AllocationKind::Shadow);
     } catch (const vk::Exception& exception) {
         LOG_ERROR(Render_Vulkan, "[nvn] storage shadow memory ({} bytes) failed: {}", chunk->size,
                   exception.what());
@@ -893,7 +895,8 @@ VkBuffer DrawResources::ProgramConstants(const PipelineBase& pipeline, u32 stage
     }
     const auto& words = pipeline.stages[stage].program_constants;
     const u64 size = (std::max<u64>)(words ? words->size() * sizeof(u32) : 0, 256);
-    buffer = impl.CreateHostBuffer((size + 255) / 256 * 256, ARENA_USAGE, MemoryUsage::Upload);
+    buffer = impl.CreateHostBuffer((size + 255) / 256 * 256, ARENA_USAGE, MemoryUsage::Upload,
+                                   AllocationKind::Arena);
     std::span<u8> mapped = buffer.Mapped();
     std::memset(mapped.data(), 0, mapped.size());
     if (words && !words->empty()) {

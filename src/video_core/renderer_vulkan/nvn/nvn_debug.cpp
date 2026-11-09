@@ -129,6 +129,7 @@ Config Read() {
     config.storage_budget_bytes = EnvNumber("EDEN_NX2_NVN_STORAGE_BUDGET_MIB", 0) << 20;
     config.trim_age_presents = EnvNumber("EDEN_NX2_NVN_TRIM_AGE_PRESENTS", 300);
     config.trim_legacy = EnvFlag("EDEN_NX2_NVN_TRIM_LEGACY");
+    config.try_vma_device_strict = EnvFlag("EDEN_NX2_TRY_VMA_DEVICE_STRICT");
     config.try_storage_vram = EnvFlag("EDEN_NX2_TRY_STORAGE_VRAM", true);
     config.try_storage_vram_max_bytes =
         EnvNumber("EDEN_NX2_TRY_STORAGE_VRAM_MAX_MIB", 64) << 20;

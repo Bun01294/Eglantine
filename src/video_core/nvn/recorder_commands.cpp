@@ -282,6 +282,24 @@ u64 Recorder::EndRecording(u64 cmd_va) {
     }
     impl->ReleaseRefs(extra);
     list->refs.erase(std::unique(list->refs.begin(), list->refs.end()), list->refs.end());
+    // The synthetic lists it calls: the byte cap keeps them while this list exists.
+    for (size_t i = 0; i < list->words.size();) {
+        const auto* header = reinterpret_cast<const RecordHeader*>(&list->words[i]);
+        const size_t count = header->size / 8;
+        if (count == 0 || i + count > list->words.size()) {
+            break;
+        }
+        if (header->op == static_cast<u16>(Op::CallList)) {
+            const u64 callee = RecordPayload<CallListPayload>(header)->handle;
+            if (callee >= SYNTHETIC_BASE) {
+                list->callees.push_back(callee);
+            }
+        }
+        i += count;
+    }
+    std::sort(list->callees.begin(), list->callees.end());
+    list->callees.erase(std::unique(list->callees.begin(), list->callees.end()),
+                        list->callees.end());
 
     const u64 handle = cb->begin;
     std::vector<std::pair<u64, u64>> ranges = std::move(cb->pieces);

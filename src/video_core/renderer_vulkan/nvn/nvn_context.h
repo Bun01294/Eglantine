@@ -161,6 +161,9 @@ struct ContextOptions {
     std::optional<u64> storage_trim_age_presents{};
     /// The trim of before the age and device budget rules. Unset: EDEN_NX2_NVN_TRIM_LEGACY.
     std::optional<bool> storage_trim_legacy{};
+    /// Device-local allocations require device-local memory (MemoryAllocator::TrackSpills).
+    /// Unset: EDEN_NX2_TRY_VMA_DEVICE_STRICT.
+    std::optional<bool> vma_device_strict{};
     /// Runs on the replay thread after every queue submission. The renderer's context sets it to
     /// feed TurboMode (Force maximum clocks): that thread keeps the GPU at full clocks only while
     /// submissions keep coming, and the replay's submissions do not go through the scheduler.
@@ -342,6 +345,8 @@ public:
     [[nodiscard]] ContextStats Stats() const;
     void CollectStats(std::vector<VideoCommon::Nvn::SinkStat>& out) const override;
     [[nodiscard]] std::string DescribeState() const override;
+    [[nodiscard]] std::string DescribeMemory() const override;
+    void NoteTextureHolders(VideoCommon::Nvn::TextureHolderReport&& report) override;
 
     /// Implementation detail, defined in nvn_impl.h.
     struct Impl;

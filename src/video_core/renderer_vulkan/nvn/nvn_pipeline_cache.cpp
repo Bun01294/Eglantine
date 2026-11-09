@@ -636,6 +636,19 @@ PipelineCacheStats PipelineCache::Impl::Stats() const {
     stats.gpl_optimized = stat_gpl_optimized;
     stats.gpl_shader_sets_warmed = stat_gpl_warmed;
     stats.programs_prepared = stat_prepared;
+    {
+        std::scoped_lock lock{pipeline_mutex};
+        for (const auto& [key, pipelines] : graphics) {
+            stats.graphics_pipelines += pipelines.size();
+        }
+        for (const auto& [key, pipelines] : compute) {
+            stats.compute_pipelines += pipelines.size();
+        }
+    }
+    {
+        std::scoped_lock lock{lowered_mutex};
+        stats.lowered_programs = lowered.size();
+    }
     return stats;
 }
 

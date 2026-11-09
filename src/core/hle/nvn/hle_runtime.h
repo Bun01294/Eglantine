@@ -196,6 +196,8 @@ private:
     WaitHook wait_hook;
     std::jthread heartbeat;
     void HeartbeatLoop(std::stop_token token);
+    /// EDEN_NX2_NVN_SYNTH_LIST_MIB as given to the Recorder (0: no cap), for the memory line.
+    std::atomic<u64> synth_list_cap_mib{0};
 
     /// Guest threads asleep in WaitUntil. Guarded by the kernel scheduler lock.
     std::vector<Kernel::KThread*> waiters;

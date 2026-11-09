@@ -515,9 +515,14 @@ struct CmdEventCpu {
     VC::EventCpuChange change;
     u32 value;
 };
+/// The recorder's report of who keeps textures alive (Sink::NoteTextureHolders).
+struct CmdTextureHolders {
+    VC::TextureHolderReport report;
+};
 using Command = std::variant<CmdCreatePool, CmdCreateTexture, CmdCreateSampler, CmdCreateProgram,
                              CmdDestroy, CmdSubmit, CmdPresent, CmdSetTitle, CmdMapVirtual,
-                             CmdCpuWrite, CmdTextureWritten, CmdFlushTexture, CmdEventCpu>;
+                             CmdCpuWrite, CmdTextureWritten, CmdFlushTexture, CmdEventCpu,
+                             CmdTextureHolders>;
 
 struct QueueState {
     vk::Semaphore timeline;
@@ -605,6 +610,10 @@ struct Context::Impl {
     std::unique_ptr<PresentTarget> present_target;
     ContextOptions options;
     VmaAllocator vma{};
+    /// What `allocator` placed outside device-local memory (`[nvn] memory:` line).
+    AllocationSpills spills;
+    /// EDEN_NX2_TRY_VMA_DEVICE_STRICT (MemoryAllocator::TrackSpills).
+    bool vma_device_strict{false};
     std::unique_ptr<MemoryAllocator> allocator;
     std::shared_ptr<::Vulkan::FSR> upscaler_fsr;
     std::unique_ptr<::Vulkan::FSR> final_fsr;
@@ -789,8 +798,8 @@ struct Context::Impl {
     std::atomic<const char*> replay_stage{"starting"};
     std::atomic<u64> replay_seq{0};
     /// Per command kind (variant index): count and total nanoseconds in Dispatch.
-    std::array<std::atomic<u64>, 13> command_count{};
-    std::array<std::atomic<u64>, 13> command_ns{};
+    std::array<std::atomic<u64>, 14> command_count{};
+    std::array<std::atomic<u64>, 14> command_ns{};
     /// CreatePoolNow phase totals in nanoseconds: pointer lookup, host import, buffer creation.
     std::atomic<u64> pool_ns_pointer{0};
     std::atomic<u64> pool_ns_import{0};
@@ -816,6 +825,9 @@ struct Context::Impl {
     std::atomic<u64> chunk_imports{0};
     std::atomic<u64> chunk_import_ns{0};
     std::atomic<u64> chunk_import_bytes{0};
+    /// The chunks in `import_chunks` (kept until the context goes) and their bytes.
+    std::atomic<u64> import_chunks_live{0};
+    std::atomic<u64> import_chunks_live_bytes{0};
     std::atomic<u64> pools_in_chunks{0};
     std::atomic<u64> pool_import_fallbacks{0};
     /// EDEN_NX2_FRAME_CAPTURE directory (empty: off). Every 120th present is saved as
@@ -1016,6 +1028,21 @@ struct Context::Impl {
     u64 trim_age_presents{DEFAULT_STORAGE_TRIM_AGE_PRESENTS};
     /// Device usage over the device budget at the last pass (0: within it, or not reported).
     u64 trim_device_excess{0};
+    /// Strict mode's over-budget allocations seen by the last pass: a new one brings the next
+    /// pass at a present forward.
+    u64 trim_seen_over_budget{0};
+    /// Who keeps the textures the game no longer names alive (Sink::NoteTextureHolders, the
+    /// recorder's last report), by serial; absent: the game's own texture. Replay thread only.
+    std::unordered_map<u64, VC::TextureHolder> texture_holders;
+    u64 texture_holders_present{0}; ///< present count when the report arrived
+    /// Storages (and their scaled twins) by their strongest holder at the last report, for the
+    /// `[nvn] memory:` line: count and bytes per VC::TextureHolder.
+    std::array<std::atomic<u64>, VC::TEXTURE_HOLDER_KINDS> holder_storages{};
+    std::array<std::atomic<u64>, VC::TEXTURE_HOLDER_KINDS> holder_storage_bytes{};
+    std::atomic<bool> holder_report_seen{false};
+    /// The strongest holder of each storage a texture (or a render-target alias) references.
+    [[nodiscard]] std::unordered_map<const Storage*, VC::TextureHolder> StorageHolders() const;
+    void NoteTextureHoldersNow(VC::TextureHolderReport& report);
     /// Device memory pages of the sparse storages (created with the first one) and the virtual
     /// pools that hold one. Replay thread (the pool is shared with the threads releasing storages).
     std::shared_ptr<SparsePagePool> sparse_pages;
@@ -1296,7 +1323,8 @@ struct Context::Impl {
     /// Pool range lookup: the pool containing [address, address + size) and the offset in it.
     bool ResolveBuffer(u64 address, u64 size, Pool*& pool, u64& offset) const;
     [[nodiscard]] vk::Buffer CreateHostBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
-                                              MemoryUsage usage_hint) const;
+                                              MemoryUsage usage_hint,
+                                              AllocationKind kind = AllocationKind::Other) const;
     /// Records and runs one-time commands on the graphics queue, waiting for them.
     void ImmediateSubmit(const std::function<void(vk::CommandBuffer)>& record);
     /// Host pointer for [address, address + size) when it is one contiguous mapping, else null.

@@ -182,4 +182,16 @@ std::string SinkGate::DescribeState() const {
     return target != nullptr ? target->DescribeState() : std::string{};
 }
 
+std::string SinkGate::DescribeMemory() const {
+    std::shared_lock lock{mutex};
+    return target != nullptr ? target->DescribeMemory() : std::string{};
+}
+
+void SinkGate::NoteTextureHolders(TextureHolderReport&& report) {
+    std::shared_lock lock{mutex};
+    if (target != nullptr) {
+        target->NoteTextureHolders(std::move(report));
+    }
+}
+
 } // namespace VideoCommon::Nvn

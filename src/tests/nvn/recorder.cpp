@@ -105,6 +105,9 @@ public:
     void NotifyEventCpu(u64 address, EventCpuChange change, u32 value) override {
         event_cpu.push_back({address, change, value});
     }
+    void NoteTextureHolders(TextureHolderReport&& report) override {
+        holders = std::move(report);
+    }
 
     /// The GPU finished everything up to `seq`: callbacks arrive once per seq, in order.
     void Complete(u64 seq) {
@@ -125,6 +128,7 @@ public:
     std::vector<Submission> submissions;
     std::vector<PresentRequest> presents;
     std::vector<EventCpuNote> event_cpu;
+    TextureHolderReport holders;
 };
 
 std::vector<Op> Ops(const std::vector<u64>& list) {
@@ -655,6 +659,119 @@ TEST_CASE("nvn recorder: command memory callbacks are never invoked", "[nvn]") {
     const u64 synthetic_handle = f.recorder.EndRecording(Obj(5));
     CHECK(synthetic_handle >= (1ULL << 62));
     CHECK(f.recorder.QueueSubmitCommands(Fixture::QUEUE, std::array{synthetic_handle}) == 2);
+}
+
+namespace {
+
+/// Records a list on a command buffer without command memory: it lands at a synthetic address.
+u64 RecordSynthetic(Fixture& f, u64 cmd_va, const std::function<void()>& commands) {
+    f.recorder.BeginRecording(cmd_va);
+    commands();
+    return f.recorder.EndRecording(cmd_va);
+}
+
+bool Destroyed(const Fixture& f, u64 serial) {
+    return std::find(f.sink.destroyed.begin(), f.sink.destroyed.end(), serial) !=
+           f.sink.destroyed.end();
+}
+
+} // namespace
+
+TEST_CASE("nvn recorder: synthetic lists are kept without a cap and dropped beyond it", "[nvn]") {
+    Fixture f;
+    constexpr u64 SYNTH_CMD = Obj(5);
+    REQUIRE(f.recorder.CommandBufferInitialize(SYNTH_CMD));
+    REQUIRE(f.recorder.TextureInitialize(Obj(10), MakeTextureDesc(), Fixture::POOL, 0x8000));
+    const u64 serial = f.sink.textures.at(0).serial;
+    f.memory.Put<u64>(SCRATCH, Obj(10));
+    const u64 handle = RecordSynthetic(f, SYNTH_CMD, [&] {
+        f.recorder.SetRenderTargets(SYNTH_CMD, 1, SCRATCH, 0, 0, 0);
+    });
+    REQUIRE(handle >= (1ULL << 62));
+    RecorderStats stats = f.recorder.Stats();
+    CHECK(stats.synthetic_lists == 1);
+    CHECK(stats.synthetic_list_bytes > 0);
+
+    // The game finalizes the texture: only the synthetic list keeps it.
+    f.recorder.TextureFinalize(Obj(10));
+    f.sink.Complete(f.recorder.LastSeq());
+    f.recorder.FlushDestroys();
+    CHECK_FALSE(Destroyed(f, serial));
+    TextureHolderCounts counts = f.recorder.PublishTextureHolders();
+    CHECK(counts.synthetic_lists == 1);
+    CHECK(counts.guest_lists == 0);
+    REQUIRE(f.sink.holders.serials.size() == 1);
+    CHECK(f.sink.holders.serials[0] == std::pair{serial, TextureHolder::SyntheticList});
+
+    // A cap that lists used in the last presents are exempt from drops nothing yet.
+    f.recorder.SetSyntheticListCap(1, DEFAULT_SYNTHETIC_LIST_IDLE_PRESENTS);
+    CHECK(f.recorder.Stats().synthetic_lists == 1);
+    REQUIRE(f.recorder.QueueSubmitCommands(Fixture::QUEUE, std::array{handle}) != 0);
+
+    // Idle long enough (no idle requirement here): dropped, its reference released.
+    f.recorder.SetSyntheticListCap(1, 0);
+    stats = f.recorder.Stats();
+    CHECK(stats.synthetic_lists == 0);
+    CHECK(stats.synthetic_list_bytes == 0);
+    CHECK(stats.synthetic_cap_evictions == 1);
+    f.sink.Complete(f.recorder.LastSeq());
+    f.recorder.FlushDestroys();
+    CHECK(Destroyed(f, serial));
+    counts = f.recorder.PublishTextureHolders();
+    CHECK(counts.synthetic_lists == 0);
+    CHECK(f.sink.holders.serials.empty());
+}
+
+TEST_CASE("nvn recorder: the synthetic list cap keeps lists another list calls", "[nvn]") {
+    Fixture f;
+    constexpr u64 SYNTH_CMD = Obj(5);
+    REQUIRE(f.recorder.CommandBufferInitialize(SYNTH_CMD));
+    const u64 child = RecordSynthetic(f, SYNTH_CMD, [&] {
+        f.recorder.ClearDepthStencil(SYNTH_CMD, 1.0f, 1, 0, 0);
+    });
+    REQUIRE(child >= (1ULL << 62));
+    const u64 parent = f.Record(0, [&] { f.recorder.CallCommands(Fixture::CMD, std::array{child}); });
+
+    f.recorder.SetSyntheticListCap(1, 0);
+    CHECK(f.recorder.Stats().synthetic_lists == 1);
+    REQUIRE(f.recorder.QueueSubmitCommands(Fixture::QUEUE, std::array{parent}) != 0);
+    CHECK(Ops(f.sink.submissions.back().lists.at(0)) == std::vector<Op>{Op::ClearDepthStencil});
+
+    // The game records over its list: nothing calls the child any more, the next insert drops it.
+    f.Record(0, [&] { f.recorder.ClearDepthStencil(Fixture::CMD, 1.0f, 1, 0, 0); });
+    CHECK(f.recorder.Stats().synthetic_lists == 0);
+    CHECK(f.recorder.Stats().synthetic_cap_evictions == 1);
+}
+
+TEST_CASE("nvn recorder: the holder report names re-initialised and list-held textures", "[nvn]") {
+    Fixture f;
+    // Initialized twice without a finalize: the first object is never destroyed.
+    REQUIRE(f.recorder.TextureInitialize(Obj(10), MakeTextureDesc(), Fixture::POOL, 0x8000));
+    REQUIRE(f.recorder.TextureInitialize(Obj(10), MakeTextureDesc(), Fixture::POOL, 0x8000));
+    const u64 orphan = f.sink.textures.at(0).serial;
+    // Finalized while a list in the game's command memory references it.
+    REQUIRE(f.recorder.TextureInitialize(Obj(11), MakeTextureDesc(), Fixture::POOL, 0x10000));
+    const u64 listed = f.sink.textures.at(2).serial;
+    f.memory.Put<u64>(SCRATCH, Obj(11));
+    f.Record(0, [&] { f.recorder.SetRenderTargets(Fixture::CMD, 1, SCRATCH, 0, 0, 0); });
+    f.recorder.TextureFinalize(Obj(11));
+
+    const TextureHolderCounts counts = f.recorder.PublishTextureHolders();
+    CHECK(counts.reinitialized == 1);
+    CHECK(counts.guest_lists == 1);
+    CHECK(counts.synthetic_lists == 0);
+    std::vector<std::pair<u64, TextureHolder>> expected{{orphan, TextureHolder::Reinitialized},
+                                                        {listed, TextureHolder::GuestList}};
+    std::sort(expected.begin(), expected.end());
+    CHECK(f.sink.holders.serials == expected);
+
+    // Finalized through a copy of the old object: an ordinary retirement, no longer re-initialised.
+    f.memory.Put(Obj(12), GuestTag{GUEST_TAG_MAGIC, static_cast<u32>(ObjectKind::Texture), orphan});
+    f.recorder.TextureFinalize(Obj(12));
+    f.sink.Complete(f.recorder.LastSeq());
+    f.recorder.FlushDestroys();
+    CHECK(Destroyed(f, orphan));
+    CHECK(f.recorder.PublishTextureHolders().reinitialized == 0);
 }
 
 TEST_CASE("nvn recorder: deferred handles are read at submit", "[nvn]") {

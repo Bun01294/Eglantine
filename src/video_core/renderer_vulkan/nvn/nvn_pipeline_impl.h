@@ -627,13 +627,13 @@ struct PipelineCache::Impl {
     std::mutex reject_mutex;
     std::unordered_map<u64, std::string> rejected_stages; ///< stage hash -> row reason
 
-    std::mutex lowered_mutex;
+    mutable std::mutex lowered_mutex;
     std::unordered_map<u64, LoweredEntry> lowered;
 
     std::mutex render_pass_mutex;
     std::unordered_map<RenderPassKey, vk::RenderPass, RenderPassKeyHash> render_passes;
 
-    std::mutex pipeline_mutex;
+    mutable std::mutex pipeline_mutex;
     std::unordered_map<GraphicsKey, std::vector<std::shared_ptr<GraphicsPipeline>>,
                        GraphicsKeyHash, GraphicsKeyEqual>
         graphics;

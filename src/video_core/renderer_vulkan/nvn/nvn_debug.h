@@ -179,6 +179,10 @@ struct Config {
     u64 trim_age_presents{300};
     /// EDEN_NX2_NVN_TRIM_LEGACY=1: the storage cache trim without the age and device budget rules.
     bool trim_legacy{false};
+    /// EDEN_NX2_TRY_VMA_DEVICE_STRICT=1 (candidate): the replay's device-local images and buffers
+    /// require device-local memory; over the budget they are made there anyway (the driver
+    /// pages) and host memory is the last resort (MemoryAllocator::TrackSpills).
+    bool try_vma_device_strict{false};
     /// EDEN_NX2_TRY_STORAGE_VRAM=0 opts out of mirroring bounded imported storage pools and
     /// redirecting raw-table aliases into the same copy, with full-pool raw write tracking.
     bool try_storage_vram{true};

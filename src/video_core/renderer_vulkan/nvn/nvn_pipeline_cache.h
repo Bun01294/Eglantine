@@ -448,6 +448,9 @@ struct PipelineCacheStats {
     u64 gpl_optimized{};       ///< whole compiles published in place of a fast-linked pipeline
     u64 gpl_shader_sets_warmed{}; ///< GPL path: shader sets whose library parts the preload compiled
     u64 programs_prepared{};   ///< program stages lowered when the game created the program
+    u64 graphics_pipelines{};  ///< pipelines held now (never evicted)
+    u64 compute_pipelines{};
+    u64 lowered_programs{};    ///< lowered stage programs held now (never evicted)
 };
 
 /// Thread-safety: see the file comment.

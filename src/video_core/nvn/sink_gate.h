@@ -56,6 +56,8 @@ public:
     void NotifyTextureWritten(u64 texture_serial) override;
     bool FlushTextureToGuest(u64 texture_serial) override;
     [[nodiscard]] std::string DescribeState() const override;
+    [[nodiscard]] std::string DescribeMemory() const override;
+    void NoteTextureHolders(TextureHolderReport&& report) override;
 
 private:
     mutable std::shared_mutex mutex;

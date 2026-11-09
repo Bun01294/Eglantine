@@ -48,7 +48,22 @@ struct RecorderStats {
     u64 retired_objects;         ///< objects passed to Sink::Destroy
     u64 synthetic_evictions;     ///< synthetic lists dropped to stay under the cap (least recently used)
     u64 finalized_pool_lists;    ///< lists dropped because their memory pool was finalized
+    u64 synthetic_lists;         ///< recorded lists at synthetic command memory held now
+    u64 synthetic_list_bytes;    ///< ... and the host memory they take (words, references, actions)
+    u64 synthetic_cap_evictions; ///< synthetic lists dropped by the byte cap (SetSyntheticListCap)
 };
+
+/// Textures (not view objects) by who keeps them alive, at a PublishTextureHolders call; the
+/// game's own live textures are not counted.
+struct TextureHolderCounts {
+    u64 retiring{};       ///< finalized, waiting for submissions or an open recording
+    u64 guest_lists{};    ///< finalized, a list in the game's command memory references it
+    u64 synthetic_lists{}; ///< finalized, only lists at synthetic command memory reference it
+    u64 reinitialized{};  ///< initialized again without a finalize: never destroyed
+};
+
+/// Synthetic lists unused for fewer presents than this are never dropped by the byte cap.
+inline constexpr u64 DEFAULT_SYNTHETIC_LIST_IDLE_PRESENTS = 600;
 
 struct PoolInfo {
     u64 serial;
@@ -116,6 +131,15 @@ public:
     /// default; set before the first submission.
     void SetUniformSnapshot(UniformSnapshotMode mode);
     [[nodiscard]] bool UniformSnapshotEnabled() const;
+    /// EDEN_NX2_NVN_SYNTH_LIST_MIB: byte cap of the lists recorded at synthetic command memory (0,
+    /// the default: none). Beyond it the least recently used ones that no submission or call used
+    /// for `idle_presents` presents and that no other list calls are dropped, with their
+    /// references. Not safe by construction: the game holds the handle of such a list and could
+    /// submit it again later (DESIGN.md "Synthetic command lists").
+    void SetSyntheticListCap(u64 bytes, u64 idle_presents = DEFAULT_SYNTHETIC_LIST_IDLE_PRESENTS);
+    /// Diagnostics: tells the sink which textures the game no longer names are still alive and
+    /// why (Sink::NoteTextureHolders) and returns the counts. Any thread; walks every list.
+    TextureHolderCounts PublishTextureHolders();
 
     // ---- Device / queue -------------------------------------------------------------------
     bool DeviceInitialize(u64 device_va);

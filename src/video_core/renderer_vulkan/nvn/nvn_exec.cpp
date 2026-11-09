@@ -1106,7 +1106,7 @@ StagingRange Recorder::AllocStaging(u64 size, u64 alignment) {
         // Storage use: the GPU untile reads tiled bytes from staging (UploadUntileOnGpu).
         vk::Buffer chunk = impl.CreateHostBuffer(
             chunk_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            MemoryUsage::Upload);
+            MemoryUsage::Upload, AllocationKind::Staging);
         chunk_pointer = chunk.Mapped().data();
         flight.staging.push_back(std::move(chunk));
         chunk_used = 0;

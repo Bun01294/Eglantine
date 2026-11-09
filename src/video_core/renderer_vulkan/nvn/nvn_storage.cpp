@@ -271,7 +271,7 @@ bool Context::Impl::EnsureImage(Storage& s) {
             s.contents_valid = false;
             s.origin = StorageOrigin::None;
         }
-        s.image = allocator->CreateImage(image_info);
+        s.image = allocator->CreateImage(image_info, false, AllocationKind::StorageImage);
     } catch (const vk::Exception& exception) {
         s.image_failed = true;
         stats.textures_failed.fetch_add(1, std::memory_order_relaxed);
@@ -890,10 +890,14 @@ void Context::Impl::TrimStorageCache(bool at_present) {
             return;
         }
     } else if (at_present) {
-        // The periodic pass: textures died, storages aged, the device budget moved.
-        if (presents < trim_next_present) {
+        // The periodic pass: textures died, storages aged, the device budget moved. Strict
+        // device-local allocations over the budget (EDEN_NX2_TRY_VMA_DEVICE_STRICT) bring it
+        // forward: the driver pages until the cache sheds what it can rebuild.
+        const u64 strict_over_budget = spills.over_budget_count.load(std::memory_order_relaxed);
+        if (presents < trim_next_present && strict_over_budget == trim_seen_over_budget) {
             return;
         }
+        trim_seen_over_budget = strict_over_budget;
     } else if ((!over_budget && trim_device_excess == 0) ||
                (storage_cache_bytes < trim_floor_bytes && presents < trim_next_present)) {
         return;
@@ -1049,6 +1053,59 @@ void Context::Impl::TrimStorageCache(bool at_present) {
     stats.storage_cache_bytes.store(storage_cache_bytes, std::memory_order_relaxed);
 }
 
+std::unordered_map<const Storage*, VC::TextureHolder> Context::Impl::StorageHolders() const {
+    std::unordered_map<const Storage*, VC::TextureHolder> holders;
+    const auto holder_of = [&](u64 serial) {
+        const auto it = texture_holders.find(serial);
+        return it != texture_holders.end() ? it->second : VC::TextureHolder::Game;
+    };
+    const auto note = [&](const Storage* storage, VC::TextureHolder holder) {
+        const auto [it, inserted] = holders.try_emplace(storage, holder);
+        if (!inserted && holder > it->second) {
+            it->second = holder;
+        }
+    };
+    for (const auto& [serial, texture] : textures) {
+        if (texture && texture->storage) {
+            note(texture->storage.get(), holder_of(serial));
+        }
+    }
+    // A render-target alias goes with the texture it was made for.
+    for (const auto& [key, texture] : target_aliases) {
+        if (texture && texture->storage) {
+            note(texture->storage.get(), holder_of(std::get<0>(key)));
+        }
+    }
+    return holders;
+}
+
+void Context::Impl::NoteTextureHoldersNow(VC::TextureHolderReport& report) {
+    texture_holders.clear();
+    texture_holders.reserve(report.serials.size());
+    for (const auto& [serial, holder] : report.serials) {
+        texture_holders.emplace(serial, holder);
+    }
+    texture_holders_present = stats.presents.load(std::memory_order_relaxed);
+    std::array<u64, VC::TEXTURE_HOLDER_KINDS> count{};
+    std::array<u64, VC::TEXTURE_HOLDER_KINDS> bytes{};
+    for (const auto& [storage, holder] : StorageHolders()) {
+        if (!storage->image) {
+            continue;
+        }
+        const size_t i = static_cast<size_t>(holder);
+        ++count[i];
+        bytes[i] += storage->vram_bytes;
+        if (storage->scaled && storage->scaled->image) {
+            bytes[i] += storage->scaled->vram_bytes;
+        }
+    }
+    for (size_t i = 0; i < VC::TEXTURE_HOLDER_KINDS; ++i) {
+        holder_storages[i].store(count[i], std::memory_order_relaxed);
+        holder_storage_bytes[i].store(bytes[i], std::memory_order_relaxed);
+    }
+    holder_report_seen.store(true, std::memory_order_release);
+}
+
 void Context::Impl::LogStorageCensus() {
     std::unordered_set<const Storage*> seen;
     struct Kind {
@@ -1161,6 +1218,11 @@ void Context::Impl::LogStorageCensus() {
         std::array<Kind, 4> target_age{};
         std::array<Kind, 4> live_target_age{};
         std::array<Kind, 4> idle_gpu_target_age{};
+        // The render targets textures hold, by the strongest holder of their storage (the
+        // recorder's last report: the game's texture, one waiting for its submissions, one only
+        // recorded lists keep, one the game re-initialised without a finalize).
+        const std::unordered_map<const Storage*, VC::TextureHolder> holders = StorageHolders();
+        std::array<std::array<Kind, 4>, VC::TEXTURE_HOLDER_KINDS> holder_target_age{};
         const u64 presents = stats.presents.load(std::memory_order_relaxed);
         const auto age_bucket = [&](const Storage& s) {
             const u64 age = presents > s.last_used_present ? presents - s.last_used_present : 0;
@@ -1203,6 +1265,11 @@ void Context::Impl::LogStorageCensus() {
             count(target_age[bucket], s);
             if (live.contains(&s)) {
                 count(live_target_age[bucket], s);
+                const auto holder = holders.find(&s);
+                count(holder_target_age[static_cast<size_t>(
+                          holder != holders.end() ? holder->second : VC::TextureHolder::Game)]
+                                       [bucket],
+                      s);
             } else if (idle && s.origin == StorageOrigin::Gpu) {
                 count(idle_gpu_target_age[bucket], s);
             }
@@ -1231,6 +1298,20 @@ void Context::Impl::LogStorageCensus() {
                  stats.storages_pressure_evicted.load(std::memory_order_relaxed),
                  mib(trim_device_excess),
                  stats.storage_trim_pressure_passes.load(std::memory_order_relaxed));
+        const auto by_holder = [&](VC::TextureHolder holder) {
+            return ages(holder_target_age[static_cast<size_t>(holder)]);
+        };
+        LOG_INFO(Render_Vulkan,
+                 "[nvn] storage census: render targets held by textures, by holder ({}), MiB "
+                 "(count): game textures: {}; retiring: {}; guest lists: {}; synthetic lists: {}; "
+                 "re-initialised: {}",
+                 holder_report_seen.load(std::memory_order_relaxed)
+                     ? fmt::format("recorder report of present {}", texture_holders_present)
+                     : std::string{"no recorder report: all counted as game textures"},
+                 by_holder(VC::TextureHolder::Game), by_holder(VC::TextureHolder::Retiring),
+                 by_holder(VC::TextureHolder::GuestList),
+                 by_holder(VC::TextureHolder::SyntheticList),
+                 by_holder(VC::TextureHolder::Reinitialized));
     }
     for (size_t i = 0; i < top; ++i) {
         const Storage& s = *largest[i];

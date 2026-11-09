@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common/common_types.h"
@@ -215,6 +216,22 @@ struct GpuWriteState {
     u32 wait_limit_ms{};
 };
 
+/// Why a texture object the sink still has is alive (Sink::NoteTextureHolders, diagnostics only).
+/// In order of strength: a storage several textures reference is held by the strongest of them.
+enum class TextureHolder : u8 {
+    Reinitialized = 0, ///< the game initialized its object again without a finalize: never destroyed
+    SyntheticList = 1, ///< finalized; recorded lists at synthetic command memory reference it
+    GuestList = 2,     ///< finalized; a list in the game's command memory references it
+    Retiring = 3,      ///< finalized; waits for its submissions (or an open recording)
+    Game = 4,          ///< the game's own live texture (not listed in a report)
+};
+inline constexpr size_t TEXTURE_HOLDER_KINDS = 5;
+
+/// Every texture and view object serial whose holder is not TextureHolder::Game, sorted.
+struct TextureHolderReport {
+    std::vector<std::pair<u64, TextureHolder>> serials;
+};
+
 /// Implemented by the Vulkan backend. Every call except Wait and SetCompletionCallback is made
 /// from one thread at a time, in global order.
 class Sink {
@@ -336,6 +353,17 @@ public:
     /// One line describing what the replay is doing right now (diagnostics: stuck work).
     [[nodiscard]] virtual std::string DescribeState() const {
         return {};
+    }
+
+    /// The memory the replay holds, for the `[nvn] memory:` status line. Any thread.
+    [[nodiscard]] virtual std::string DescribeMemory() const {
+        return {};
+    }
+
+    /// The recorder's view of who keeps textures alive (diagnostics: the storage census and the
+    /// memory line split the textures' storages by it). Ordered with Submit.
+    virtual void NoteTextureHolders(TextureHolderReport&& report) {
+        static_cast<void>(report);
     }
 };
 

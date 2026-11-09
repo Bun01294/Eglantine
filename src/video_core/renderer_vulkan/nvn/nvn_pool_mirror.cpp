@@ -262,7 +262,8 @@ PoolMirror* Context::Impl::VramMirror(Pool& pool, bool create, bool storage) {
     }
     auto mirror = std::make_unique<PoolMirror>();
     try {
-        mirror->buffer = CreateHostBuffer(pool.size, pool_usage, MemoryUsage::DeviceLocal);
+        mirror->buffer = CreateHostBuffer(pool.size, pool_usage, MemoryUsage::DeviceLocal,
+                                          AllocationKind::Mirror);
     } catch (const vk::Exception& exception) {
         memory->Untrack(track_id);
         LOG_WARNING(Render_Vulkan, "[nvn] pool {:#x} ({:#x} bytes): VRAM mirror allocation failed: {}",

@@ -199,6 +199,12 @@ Context::Impl::Impl(const Device& device_, std::mutex& submit_mutex_,
     }
     vma = device.CreateThreadSafeAllocator();
     allocator = std::make_unique<MemoryAllocator>(device, vma);
+    vma_device_strict = options.vma_device_strict.value_or(Debug::Get().try_vma_device_strict);
+    allocator->TrackSpills(&spills, vma_device_strict);
+    if (vma_device_strict) {
+        LOG_INFO(Render_Vulkan, "[nvn] device-local allocations: strict (EDEN_NX2_TRY_VMA_DEVICE_STRICT), "
+                                "over the budget they stay device-local, host memory last");
+    }
     importer.emplace(device, vma);
     if (device.IsBufferDeviceAddressSupported() && device.IsShaderInt64Supported()) {
         pool_usage = POOL_BUFFER_USAGE_ADDRESSABLE;
@@ -660,6 +666,9 @@ void Context::Impl::Dispatch(Command& command) {
         }
         void operator()(CmdFlushTexture& c) const {
             impl.FlushTextureNow(c);
+        }
+        void operator()(CmdTextureHolders& c) const {
+            impl.NoteTextureHoldersNow(c.report);
         }
     };
     const auto begin = std::chrono::steady_clock::now();
@@ -1533,6 +1542,118 @@ void Context::SetScreenshotRequests(VideoCore::RendererSettings& settings) {
     impl->screenshot_requests.store(&settings, std::memory_order_release);
 }
 
+void Context::NoteTextureHolders(VC::TextureHolderReport&& report) {
+    impl->Enqueue(CmdTextureHolders{std::move(report)}, nullptr);
+}
+
+std::string Context::DescribeMemory() const {
+    const auto mib = [](u64 bytes) { return bytes >> 20; };
+    std::string text;
+    {
+        // Private bytes: the commit charge of the process (host memory Vulkan allocations count,
+        // device-local ones do not); the private working set: what of it is resident.
+        u64 private_bytes = 0;
+        u64 private_ws = 0;
+        u64 shared_commit = 0;
+#ifdef _WIN32
+        // PROCESS_MEMORY_COUNTERS_EX2 (Windows 10 21H1+, newer than the SDK target the build
+        // selects), declared here with its layout.
+        struct CountersEx2 {
+            DWORD cb;
+            DWORD PageFaultCount;
+            SIZE_T PeakWorkingSetSize;
+            SIZE_T WorkingSetSize;
+            SIZE_T QuotaPeakPagedPoolUsage;
+            SIZE_T QuotaPagedPoolUsage;
+            SIZE_T QuotaPeakNonPagedPoolUsage;
+            SIZE_T QuotaNonPagedPoolUsage;
+            SIZE_T PagefileUsage;
+            SIZE_T PeakPagefileUsage;
+            SIZE_T PrivateUsage;
+            SIZE_T PrivateWorkingSetSize;
+            ULONG64 SharedCommitUsage;
+        };
+        CountersEx2 counters{};
+        if (GetProcessMemoryInfo(GetCurrentProcess(),
+                                 reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                                 sizeof(counters))) {
+            private_bytes = counters.PrivateUsage;
+            private_ws = counters.PrivateWorkingSetSize;
+            shared_commit = counters.SharedCommitUsage;
+        } else {
+            PROCESS_MEMORY_COUNTERS_EX older{};
+            if (GetProcessMemoryInfo(GetCurrentProcess(),
+                                     reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&older),
+                                     sizeof(older))) {
+                private_bytes = older.PrivateUsage;
+            }
+        }
+#endif
+        text += fmt::format("process private {} MiB, private working set {} MiB, shared commit "
+                            "{} MiB",
+                            mib(private_bytes), mib(private_ws), mib(shared_commit));
+    }
+    {
+        // Every heap: the driver's budget and the process's usage (VK_EXT_memory_budget), and
+        // the blocks and allocations of the replay's own allocator in it.
+        const VkPhysicalDeviceMemoryProperties* properties{};
+        vmaGetMemoryProperties(impl->vma, &properties);
+        std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
+        vmaGetHeapBudgets(impl->vma, budgets.data());
+        text += "; heaps budget/usage, replay blocks/allocations MiB:";
+        for (u32 heap = 0; heap < properties->memoryHeapCount; ++heap) {
+            const bool device_local =
+                (properties->memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
+            const VmaBudget& b = budgets[heap];
+            text += fmt::format(" #{} {} {}/{}, {}/{};", heap, device_local ? "device" : "host",
+                                mib(b.budget), mib(b.usage), mib(b.statistics.blockBytes),
+                                mib(b.statistics.allocationBytes));
+        }
+    }
+    {
+        const AllocationSpills& s = impl->spills;
+        text += " spilled to host types n/MiB:";
+        for (size_t kind = 0; kind < AllocationSpills::KINDS; ++kind) {
+            text += fmt::format(" {} {}/{}", AllocationKindName(static_cast<AllocationKind>(kind)),
+                                s.count[kind].load(std::memory_order_relaxed),
+                                mib(s.bytes[kind].load(std::memory_order_relaxed)));
+        }
+        text += fmt::format("; strict {}: over budget {}/{}, host fallbacks {}/{}",
+                            impl->vma_device_strict ? "on" : "off",
+                            s.over_budget_count.load(std::memory_order_relaxed),
+                            mib(s.over_budget_bytes.load(std::memory_order_relaxed)),
+                            s.host_fallback_count.load(std::memory_order_relaxed),
+                            mib(s.host_fallback_bytes.load(std::memory_order_relaxed)));
+    }
+    if (impl->holder_report_seen.load(std::memory_order_acquire)) {
+        // From the recorder's previous report (one status line old).
+        const auto holder = [&](VC::TextureHolder kind) {
+            const size_t i = static_cast<size_t>(kind);
+            return fmt::format("{} ({})", mib(impl->holder_storage_bytes[i].load()),
+                               impl->holder_storages[i].load());
+        };
+        text += fmt::format("; texture storages by strongest holder MiB (count): game {}, "
+                            "retiring {}, guest lists {}, synthetic lists {}, re-initialised {}",
+                            holder(VC::TextureHolder::Game), holder(VC::TextureHolder::Retiring),
+                            holder(VC::TextureHolder::GuestList),
+                            holder(VC::TextureHolder::SyntheticList),
+                            holder(VC::TextureHolder::Reinitialized));
+    }
+    text += fmt::format("; storage cache {} MiB; import chunks {} ({} MiB)",
+                        mib(impl->stats.storage_cache_bytes.load(std::memory_order_relaxed)),
+                        impl->import_chunks_live.load(std::memory_order_relaxed),
+                        mib(impl->import_chunks_live_bytes.load(std::memory_order_relaxed)));
+    if (impl->draw_resources) {
+        std::scoped_lock lock{impl->draw_resources->cache_mutex};
+        if (const auto& cache = impl->draw_resources->cache_instance) {
+            const PipelineCacheStats p = cache->Stats();
+            text += fmt::format("; pipelines graphics {} compute {}, lowered programs {}",
+                                p.graphics_pipelines, p.compute_pipelines, p.lowered_programs);
+        }
+    }
+    return text;
+}
+
 std::string Context::DescribeState() const {
     std::string text = fmt::format("replay stage={} seq={} completed={}",
                                    impl->replay_stage.load(), impl->replay_seq.load(),
@@ -1552,7 +1673,7 @@ std::string Context::DescribeState() const {
     static constexpr const char* names[] = {"pool",    "texture", "sampler",  "program",
                                             "destroy", "submit",  "present",  "title",
                                             "mapvirt", "cpuwrite", "texwrit", "flushtex",
-                                            "eventcpu"};
+                                            "eventcpu", "holders"};
     text += fmt::format(" pool_ms(pointer/import/buffer)={}/{}/{} pool_MB={}",
                         impl->pool_ns_pointer.load() / 1'000'000,
                         impl->pool_ns_import.load() / 1'000'000,

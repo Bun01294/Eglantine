@@ -407,12 +407,77 @@ std::shared_ptr<const List> Recorder::Impl::FindList(u64 handle) {
     if (it == lists.end()) {
         return nullptr;
     }
+    it->second.last_used_present = stats.presents.load(std::memory_order_relaxed);
     if (handle >= SYNTHETIC_BASE) {
         synthetic_lru.erase(it->second.stamp);
         it->second.stamp = ++lru_clock;
         synthetic_lru.emplace(it->second.stamp, handle);
     }
     return it->second.list;
+}
+
+void Recorder::Impl::NoteCalleesLocked(const List& list, bool add) {
+    for (const u64 callee : list.callees) {
+        const auto it = lists.find(callee);
+        if (it == lists.end()) {
+            continue;
+        }
+        if (add) {
+            ++it->second.callers;
+        } else if (it->second.callers != 0) {
+            --it->second.callers;
+        }
+    }
+}
+
+std::map<u64, ListEntry>::iterator Recorder::Impl::EraseListLocked(
+    std::map<u64, ListEntry>::iterator it, std::vector<std::shared_ptr<const List>>& removed) {
+    if (it->first >= SYNTHETIC_BASE) {
+        synthetic_lru.erase(it->second.stamp);
+        synthetic_count -= (std::min<u64>)(synthetic_count, 1);
+        synthetic_bytes -= (std::min)(synthetic_bytes, it->second.bytes);
+        stats.synthetic_lists.store(synthetic_count, std::memory_order_relaxed);
+        stats.synthetic_list_bytes.store(synthetic_bytes, std::memory_order_relaxed);
+    }
+    if (it->second.list) {
+        NoteCalleesLocked(*it->second.list, false);
+    }
+    removed.push_back(std::move(it->second.list));
+    return lists.erase(it);
+}
+
+void Recorder::Impl::EvictSyntheticOverCapLocked(std::vector<std::shared_ptr<const List>>& removed) {
+    if (synthetic_cap_bytes == 0) {
+        return;
+    }
+    // Lists other lists call stay (the caller may be submitted again); after this many of them
+    // the pass gives up until the next insert.
+    constexpr size_t MAX_SKIPPED = 1024;
+    const u64 presents = stats.presents.load(std::memory_order_relaxed);
+    size_t skipped = 0;
+    auto it = synthetic_lru.begin();
+    while (it != synthetic_lru.end() && synthetic_bytes > synthetic_cap_bytes) {
+        const auto victim = lists.find(it->second);
+        if (victim == lists.end()) {
+            it = synthetic_lru.erase(it);
+            continue;
+        }
+        const ListEntry& entry = victim->second;
+        if (presents - (std::min)(presents, entry.last_used_present) < synthetic_idle_presents) {
+            break; // the rest of the order was used later
+        }
+        if (entry.callers != 0) {
+            if (++skipped > MAX_SKIPPED) {
+                break;
+            }
+            ++it;
+            continue;
+        }
+        const auto next = std::next(it);
+        EraseListLocked(victim, removed);
+        ++stats.synthetic_cap_evictions;
+        it = next;
+    }
 }
 
 void Recorder::Impl::InsertList(u64 handle, const std::vector<std::pair<u64, u64>>& ranges,
@@ -427,41 +492,44 @@ void Recorder::Impl::InsertList(u64 handle, const std::vector<std::pair<u64, u64
             if (it != lists.begin()) {
                 const auto previous = std::prev(it);
                 if (previous->second.end > low) {
-                    if (previous->first >= SYNTHETIC_BASE) {
-                        synthetic_lru.erase(previous->second.stamp);
-                    }
-                    removed.push_back(std::move(previous->second.list));
-                    lists.erase(previous);
+                    EraseListLocked(previous, removed);
                 }
             }
             while (it != lists.end() && it->first < high) {
-                if (it->first >= SYNTHETIC_BASE) {
-                    synthetic_lru.erase(it->second.stamp);
-                }
-                removed.push_back(std::move(it->second.list));
-                it = lists.erase(it);
+                it = EraseListLocked(it, removed);
             }
         }
-        ListEntry& entry = lists[handle];
-        if (handle >= SYNTHETIC_BASE) {
-            synthetic_lru.erase(entry.stamp);
+        if (const auto existing = lists.find(handle); existing != lists.end()) {
+            EraseListLocked(existing, removed);
         }
-        entry = ListEntry{ranges.front().second, 0, std::move(list)};
+        const List& inserted = *list;
+        ListEntry& entry = lists[handle];
+        entry.end = ranges.front().second;
+        entry.bytes = ListBytes(inserted);
+        entry.last_used_present = stats.presents.load(std::memory_order_relaxed);
+        entry.list = std::move(list);
+        NoteCalleesLocked(inserted, true);
         if (handle >= SYNTHETIC_BASE) {
             entry.stamp = ++lru_clock;
             synthetic_lru.emplace(entry.stamp, handle);
+            ++synthetic_count;
+            synthetic_bytes += entry.bytes;
+            stats.synthetic_lists.store(synthetic_count, std::memory_order_relaxed);
+            stats.synthetic_list_bytes.store(synthetic_bytes, std::memory_order_relaxed);
             while (synthetic_lru.size() > MAX_SYNTHETIC_LISTS) {
                 // Evict the list that was submitted (or recorded) least recently, not the oldest.
                 const auto oldest = synthetic_lru.begin();
                 const auto victim = lists.find(oldest->second);
                 if (victim != lists.end()) {
-                    removed.push_back(std::move(victim->second.list));
-                    lists.erase(victim);
+                    EraseListLocked(victim, removed);
                     ++stats.synthetic_evictions;
+                } else {
+                    synthetic_lru.erase(oldest);
                 }
-                synthetic_lru.erase(oldest);
             }
         }
+        // After any insert: a list recorded over may have been the last caller of one.
+        EvictSyntheticOverCapLocked(removed);
     }
     if (removed.empty()) {
         return;
@@ -750,8 +818,121 @@ RecorderStats Recorder::Stats() const {
         s.reinitialized_objects.load(), s.submissions.load(),       s.presents.load(),
         s.lists_submitted.load(),    s.records_recorded.load(),     s.records_dropped.load(),
         s.completion_actions.load(), s.retired_objects.load(), s.synthetic_evictions.load(),
-        s.finalized_pool_lists.load(),
+        s.finalized_pool_lists.load(), s.synthetic_lists.load(), s.synthetic_list_bytes.load(),
+        s.synthetic_cap_evictions.load(),
     };
+}
+
+void Recorder::SetSyntheticListCap(u64 bytes, u64 idle_presents) {
+    std::vector<std::shared_ptr<const List>> removed;
+    {
+        std::lock_guard lock{impl->lists_mutex};
+        impl->synthetic_cap_bytes = bytes;
+        impl->synthetic_idle_presents = idle_presents;
+        impl->EvictSyntheticOverCapLocked(removed);
+    }
+    for (const auto& list : removed) {
+        if (list) {
+            impl->ReleaseRefs(list->refs);
+        }
+    }
+    impl->RunRetire();
+}
+
+void Recorder::Impl::PruneReinitializedLocked() {
+    // Gone (retired), or finalized through a copy of the object: the retirement covers those.
+    std::erase_if(reinitialized_textures, [this](u64 serial) {
+        const TextureObject* texture = textures.Get(serial);
+        return texture == nullptr || texture->finalized;
+    });
+    std::sort(reinitialized_textures.begin(), reinitialized_textures.end());
+    reinitialized_textures.erase(
+        std::unique(reinitialized_textures.begin(), reinitialized_textures.end()),
+        reinitialized_textures.end());
+    reinitialized_prune_at = (std::max<size_t>)(4096, reinitialized_textures.size() * 2);
+}
+
+TextureHolderCounts Recorder::PublishTextureHolders() {
+    Impl& s = *impl;
+    // Lists are immutable: take them under the lock and read them outside it.
+    std::vector<std::pair<bool, std::shared_ptr<const List>>> lists;
+    {
+        std::lock_guard lock{s.lists_mutex};
+        lists.reserve(s.lists.size());
+        for (const auto& [handle, entry] : s.lists) {
+            if (entry.list) {
+                lists.emplace_back(handle >= SYNTHETIC_BASE, entry.list);
+            }
+        }
+    }
+    // Textures the game finalized that are not destroyed yet, and the re-initialised ones.
+    std::unordered_map<u64, TextureHolder> holders;
+    {
+        std::lock_guard lock{s.retire_mutex};
+        for (const u64 serial : s.retire_list) {
+            if (SerialKind(serial) != ObjectKind::Texture) {
+                continue;
+            }
+            const TextureObject* texture = s.textures.Get(serial);
+            if (texture != nullptr && texture->desc.view_of == 0) {
+                holders.emplace(serial, TextureHolder::Retiring);
+            }
+        }
+        s.PruneReinitializedLocked();
+        for (const u64 serial : s.reinitialized_textures) {
+            holders.emplace(serial, TextureHolder::Reinitialized);
+        }
+    }
+    // A finalized texture a list references lives as long as that list: a list in the game's
+    // command memory dies when the game records over it, a synthetic one only by eviction.
+    std::unordered_map<u64, u8> referenced; // serial -> 1 guest list, 2 synthetic list
+    for (const auto& [synthetic, list] : lists) {
+        for (const u64 ref : list->refs) {
+            const auto it = holders.find(ref);
+            if (it != holders.end() && it->second == TextureHolder::Retiring) {
+                u8& bits = referenced[ref];
+                bits = static_cast<u8>(bits | (synthetic ? 2 : 1));
+            }
+        }
+    }
+    for (const auto& [serial, bits] : referenced) {
+        holders[serial] = (bits & 1) != 0 ? TextureHolder::GuestList : TextureHolder::SyntheticList;
+    }
+    TextureHolderCounts counts;
+    for (const auto& [serial, holder] : holders) {
+        switch (holder) {
+        case TextureHolder::Retiring:
+            ++counts.retiring;
+            break;
+        case TextureHolder::GuestList:
+            ++counts.guest_lists;
+            break;
+        case TextureHolder::SyntheticList:
+            ++counts.synthetic_lists;
+            break;
+        case TextureHolder::Reinitialized:
+            ++counts.reinitialized;
+            break;
+        case TextureHolder::Game:
+            break;
+        }
+    }
+    std::lock_guard lock{s.sink_mutex};
+    // The view objects go with their texture (sink_mutex guards TextureObject::views).
+    TextureHolderReport report;
+    report.serials.reserve(holders.size());
+    for (const auto& [serial, holder] : holders) {
+        report.serials.emplace_back(serial, holder);
+        if (const TextureObject* texture = s.textures.Get(serial)) {
+            for (const auto& view : texture->views) {
+                report.serials.emplace_back(view.second, holder);
+            }
+        }
+    }
+    std::sort(report.serials.begin(), report.serials.end());
+    s.FlushDestroysLocked();
+    s.sink.NoteTextureHolders(std::move(report));
+    return counts;
 }
 
 // ---- Device / queue --------------------------------------------------------------------------------------
@@ -1079,8 +1260,7 @@ void Recorder::MemoryPoolFinalize(u64 pool_va) {
         std::lock_guard lock{impl->lists_mutex};
         auto it = impl->lists.lower_bound(low);
         while (it != impl->lists.end() && it->first < high) {
-            removed.push_back(std::move(it->second.list));
-            it = impl->lists.erase(it);
+            it = impl->EraseListLocked(it, removed);
         }
     }
     impl->stats.finalized_pool_lists += removed.size();

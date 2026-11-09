@@ -245,6 +245,21 @@ bool Runtime::EnsureRecorder(Core::System& system) {
                  forced ? fmt::format("EDEN_NX2_NVN_UBO_SNAPSHOT={}", value)
                         : std::string{on ? "Ocarina of Time" : "default"});
     }
+    {
+        // Byte cap of the lists recorded at synthetic command memory: off unless set (dropping
+        // one is not provably safe, the game holds its handle).
+        const char* const value = std::getenv("EDEN_NX2_NVN_SYNTH_LIST_MIB");
+        const u64 mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
+        synth_list_cap_mib.store(mib);
+        if (mib != 0) {
+            recorder->SetSyntheticListCap(mib << 20);
+            LOG_INFO(Core,
+                     "[nvn] synthetic command lists: byte cap {} MiB (EDEN_NX2_NVN_SYNTH_LIST_MIB), "
+                     "least recently used ones idle for {} presents and called by no list are "
+                     "dropped",
+                     mib, VideoCommon::Nvn::DEFAULT_SYNTHETIC_LIST_IDLE_PRESENTS);
+        }
+    }
     // Legacy-mode report timestamps are the GPU emulation path's own (`GPU::GetTicks()`); real
     // reports and nvnDeviceGetCurrentTimestampInNanoseconds run on the guest's global clock.
     VideoCommon::Nvn::SetLegacyTickSource([&system] { return system.GPU().GetTicks(); });
@@ -339,6 +354,9 @@ void Runtime::Release() {
 void Runtime::HeartbeatLoop(std::stop_token token) {
     // A status line every 10 s: what the recorder and the replay have done, and what is waiting.
     u64 last_presents = ~0ull;
+    // EDEN_NX2_NVN_MEMORY_LOG=0 turns the `[nvn] memory:` line off.
+    const char* const memory_log_value = std::getenv("EDEN_NX2_NVN_MEMORY_LOG");
+    const bool memory_log = memory_log_value == nullptr || std::strcmp(memory_log_value, "0") != 0;
     // What the previous status line saw: per heartbeat (per boot), never carried into the next one.
     std::map<std::string, std::pair<u64, u64>> last_waits;
     std::map<std::string, u64> last_calls;
@@ -422,6 +440,23 @@ void Runtime::HeartbeatLoop(std::stop_token token) {
         }
         if (gate != nullptr) {
             LOG_INFO(Core, "[nvn] {}", gate->DescribeState());
+        }
+        if (memory_log) {
+            // Where the memory is: the recorder's lists and the textures only they (or a
+            // re-initialised object) keep, then the replay's heaps, spills and holders.
+            const VideoCommon::Nvn::TextureHolderCounts holders = recorder->PublishTextureHolders();
+            LOG_INFO(Core,
+                     "[nvn] memory: synthetic lists {} ({} MiB, cap {}, dropped by cap {} by "
+                     "count {}); finalized textures alive for synthetic lists {}, guest lists "
+                     "{}, retiring {}; re-initialised textures alive {} (reinitialized_objects "
+                     "{}); {}",
+                     s.synthetic_lists, s.synthetic_list_bytes >> 20,
+                     synth_list_cap_mib.load() != 0
+                         ? fmt::format("{} MiB", synth_list_cap_mib.load())
+                         : std::string{"none"},
+                     s.synthetic_cap_evictions, s.synthetic_evictions, holders.synthetic_lists,
+                     holders.guest_lists, holders.retiring, holders.reinitialized,
+                     s.reinitialized_objects, gate != nullptr ? gate->DescribeMemory() : "");
         }
         last_presents = presents.load();
     }
