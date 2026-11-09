@@ -3,12 +3,11 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string_view>
 
 namespace HostShaders {
 
-constexpr std::string_view @CONTENTS_NAME@ = {
-@CONTENTS@
-};
+constexpr std::string_view @CONTENTS_NAME @ = {@CONTENTS @};
 
 } // namespace HostShaders

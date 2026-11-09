@@ -12,8 +12,8 @@
 #include "common/boot_counter.h"
 #include "common/diag_request.h"
 #include "common/logging.h"
-#include "video_core/nvn/state_layouts.h"
 #include "shader_recompiler/stage.h"
+#include "video_core/nvn/state_layouts.h"
 #include "video_core/nvn/timestamp_mode.h"
 #include "video_core/nvn_draw_probe.h"
 #include "video_core/renderer_vulkan/nvn/nvn_barrier.h"
@@ -47,8 +47,9 @@ u32 Mip(u32 size, u32 level) {
 
 template <typename Prefix, typename Element>
 std::span<const Element> Array(const VC::RecordHeader* header, const Prefix* prefix, u32 count) {
-    const u32 available = (header->size - static_cast<u32>(sizeof(VC::RecordHeader) + sizeof(Prefix))) /
-                          static_cast<u32>(sizeof(Element));
+    const u32 available =
+        (header->size - static_cast<u32>(sizeof(VC::RecordHeader) + sizeof(Prefix))) /
+        static_cast<u32>(sizeof(Element));
     return {VC::TrailingArray<Element>(prefix), (std::min)(count, available)};
 }
 
@@ -69,7 +70,7 @@ bool DrawContext::OpKeepsPass(VC::Op op) noexcept {
     case Op::CallList:
     case Op::FenceSync:
     case Op::SignalEvent:
-        return true; // record nothing on the command buffer
+        return true;             // record nothing on the command buffer
     case Op::SetRenderTargets:   // ends the pass itself, when it binds other targets
     case Op::Barrier:            // ends the pass itself, when the pass wrote through shaders
     case Op::SetRenderCondition: // the recorder ends the pass when a predicate must be computed
@@ -198,7 +199,8 @@ bool DrawContext::Handle(const VC::RecordHeader* header) {
     case Op::SetViewports:
         if (fits(sizeof(VC::SetViewportsPayload))) {
             const auto* p = VC::RecordPayload<VC::SetViewportsPayload>(header);
-            const auto values = Array<VC::SetViewportsPayload, VC::ViewportRect>(header, p, p->count);
+            const auto values =
+                Array<VC::SetViewportsPayload, VC::ViewportRect>(header, p, p->count);
             for (u32 i = 0; i < values.size() && p->first + i < MAX_VIEWPORTS; ++i) {
                 viewports[p->first + i] = values[i];
                 viewports_set |= 1u << (p->first + i);
@@ -220,7 +222,8 @@ bool DrawContext::Handle(const VC::RecordHeader* header) {
     case Op::SetDepthRanges:
         if (fits(sizeof(VC::SetDepthRangesPayload))) {
             const auto* p = VC::RecordPayload<VC::SetDepthRangesPayload>(header);
-            const auto values = Array<VC::SetDepthRangesPayload, VC::DepthRange>(header, p, p->count);
+            const auto values =
+                Array<VC::SetDepthRangesPayload, VC::DepthRange>(header, p, p->count);
             for (u32 i = 0; i < values.size() && p->first + i < MAX_VIEWPORTS; ++i) {
                 depth_ranges[p->first + i] = values[i];
             }
@@ -467,7 +470,8 @@ void DrawContext::BindState(const VC::RecordHeader* header) {
     const u8* bytes = reinterpret_cast<const u8*>(p + 1);
     const u32 available = header->size - static_cast<u32>(sizeof(VC::RecordHeader) + sizeof(*p));
     if (p->kind >= 6 || p->size != VC::STATE_OBJECT_SIZES[p->kind] || available < p->size) {
-        host->HostFailed("BindState", fmt::format("bad state object (kind {}, size {})", p->kind, p->size));
+        host->HostFailed("BindState",
+                         fmt::format("bad state object (kind {}, size {})", p->kind, p->size));
         return;
     }
     switch (static_cast<VC::StateKind>(p->kind)) {
@@ -511,7 +515,8 @@ void DrawContext::BindVertexAttribs(const VC::RecordHeader* header) {
 
 void DrawContext::BindVertexStreams(const VC::RecordHeader* header) {
     const auto* p = VC::RecordPayload<VC::BindVertexStreamsPayload>(header);
-    const auto values = Array<VC::BindVertexStreamsPayload, VC::VertexStreamState>(header, p, p->count);
+    const auto values =
+        Array<VC::BindVertexStreamsPayload, VC::VertexStreamState>(header, p, p->count);
     fixed.stream_stride.fill(0);
     fixed.stream_divisor.fill(0);
     for (u32 i = 0; i < values.size() && i < MAX_VERTEX_STREAMS; ++i) {
@@ -782,8 +787,9 @@ AttachmentFormat FormatOf(const Device& device, const TargetBinding& target) {
     result.format = host.format;
     result.attachable = host.attachable;
     result.depth_or_stencil = host.depth || host.stencil;
-    result.aspect = (host.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : 0u) |
-                    (host.stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
+    result.aspect =
+        (host.depth ? static_cast<VkImageAspectFlags>(VK_IMAGE_ASPECT_DEPTH_BIT) : 0u) |
+        (host.stencil ? static_cast<VkImageAspectFlags>(VK_IMAGE_ASPECT_STENCIL_BIT) : 0u);
     if (result.aspect == 0) {
         result.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     }
@@ -976,9 +982,10 @@ bool DrawContext::BeginPass() {
         made = made && (!depth_target.native || impl.EnsureImage(*depth_target.texture->storage));
         if (!made) {
             RevertTargetScale();
-            LOG_WARNING(Render_Vulkan,
-                        "[nvn] resolution scale: a scaled render target image could not be created; "
-                        "this target set draws at the guest size");
+            LOG_WARNING(
+                Render_Vulkan,
+                "[nvn] resolution scale: a scaled render target image could not be created; "
+                "this target set draws at the guest size");
         }
     }
     RenderPassKey key{};
@@ -1009,7 +1016,8 @@ bool DrawContext::BeginPass() {
             const Storage& guest = *target.native->storage;
             const u32 level = target.ref.texture.level;
             native_extent.width = (std::min)(native_extent.width, Mip(guest.extent.width, level));
-            native_extent.height = (std::min)(native_extent.height, Mip(guest.extent.height, level));
+            native_extent.height =
+                (std::min)(native_extent.height, Mip(guest.extent.height, level));
         } else {
             native_extent.width = (std::min)(native_extent.width, shape.extent.width);
             native_extent.height = (std::min)(native_extent.height, shape.extent.height);
@@ -1063,8 +1071,8 @@ bool DrawContext::BeginPass() {
         // A render target is written before it is read in nearly every case: its stale guest bytes
         // are not uploaded (this also creates the lazy image).
         if (!host->HostEnsureContents(*attachment.storage, true)) {
-            host->HostFailed("SetRenderTargets",
-                             fmt::format("no image for render target {:#x}", attachment.texture->serial));
+            host->HostFailed("SetRenderTargets", fmt::format("no image for render target {:#x}",
+                                                             attachment.texture->serial));
             return false;
         }
         transition_scratch.emplace_back(attachment.storage,
@@ -1193,10 +1201,9 @@ void DrawContext::EndPass(BreakCause cause) {
     render_target_epoch.OnPassEnd(cause == BreakCause::FeedbackCopy);
     // Staged vertex copies serve later passes of the command buffer only across breaks that cannot
     // change pool memory (nvn_vertex_stage.h); ops recorded outside a pass end here too.
-    if (!staged_vertex.empty() &&
-        !StagedVertexSurvives(cause, pass_open && pass_shader_writes,
-                              pass_open && host->HostReportsPending(),
-                              Debug::Get().try_stage_span)) {
+    if (!staged_vertex.empty() && !StagedVertexSurvives(cause, pass_open && pass_shader_writes,
+                                                        pass_open && host->HostReportsPending(),
+                                                        Debug::Get().try_stage_span)) {
         staged_vertex.clear();
         stage_covered_end = nullptr;
     }
@@ -1289,7 +1296,8 @@ void DrawContext::FlushInlineUpdates() {
     host->HostMarkWritten();
     host->HostFlushBarrier();
     const auto overlaps = [](const BufferRef& a, const BufferRef& b) {
-        return a.buffer == b.buffer && a.offset < b.offset + b.range && b.offset < a.offset + a.range;
+        return a.buffer == b.buffer && a.offset < b.offset + b.range &&
+               b.offset < a.offset + a.range;
     };
     copied.clear();
     for (size_t i = 0; i < inline_updates.size(); ++i) {
@@ -1368,10 +1376,11 @@ void DrawContext::StageVertexRanges() {
     // The scan stops at a render target change too: the ranges of a later pass are staged by that
     // pass (this pass ends there unless the targets stay the same). With try_stage_span it goes on
     // past target changes: the copies survive them (StagedVertexSurvives), so one gather serves the
-    // small passes of the window, and the passes inside an already scanned window do not scan again.
+    // small passes of the window, and the passes inside an already scanned window do not scan
+    // again.
     const std::span<const u64> ahead = host->HostRecordsAhead();
-    if (debug.try_stage_span && stage_covered_end != nullptr && ahead.data() >= stage_covered_begin &&
-        ahead.data() < stage_covered_end) {
+    if (debug.try_stage_span && stage_covered_end != nullptr &&
+        ahead.data() >= stage_covered_begin && ahead.data() < stage_covered_end) {
         return;
     }
     const IndexStageFilter indices{.enabled = debug.index_stage,
@@ -1435,8 +1444,8 @@ void DrawContext::StageVertexRanges() {
         }
         if (pool->pending.load(std::memory_order_acquire) ||
             pool->backing != Pool::Backing::Imported) {
-            outcome(range, pool->backing != Pool::Backing::Imported ? VtxCov::Device
-                                                                     : VtxCov::Pending);
+            outcome(range,
+                    pool->backing != Pool::Backing::Imported ? VtxCov::Device : VtxCov::Pending);
             continue;
         }
         // A live storage shadow holds newer bytes than the pool; a draw that reads them ends the
@@ -1466,13 +1475,12 @@ void DrawContext::StageVertexRanges() {
                 mirror_copies.push_back({pool, begin, end});
                 mirror_copy_bytes += end - begin;
             }
-            staged_vertex.insert_or_assign(range.address,
-                                           StagedRange{.size = range.size,
-                                                       .buffer = *mirror->buffer,
-                                                       .offset = offset,
-                                                       .pool = pool,
-                                                       .pool_offset = offset,
-                                                       .mirror = true});
+            staged_vertex.insert_or_assign(range.address, StagedRange{.size = range.size,
+                                                                      .buffer = *mirror->buffer,
+                                                                      .offset = offset,
+                                                                      .pool = pool,
+                                                                      .pool_offset = offset,
+                                                                      .mirror = true});
             impl.stats.vram_bindings.fetch_add(1, std::memory_order_relaxed);
             impl.stats.vram_vertex_ranges.fetch_add(1, std::memory_order_relaxed);
             outcome(range, VtxCov::Mirror);
@@ -1563,8 +1571,13 @@ void DrawContext::StageVertexRanges() {
             const VkBufferCopy& region = stage_copies[end].region;
             high = (std::max)(high, region.srcOffset + region.size);
         }
-        StageRun run{.begin = i, .end = end, .shader = false, .window_base = 0, .window_range = 0,
-                     .first_task = 0, .task_count = 0};
+        StageRun run{.begin = i,
+                     .end = end,
+                     .shader = false,
+                     .window_base = 0,
+                     .window_range = 0,
+                     .first_task = 0,
+                     .task_count = 0};
         if (gpu) {
             const u64 alignment = gpu->SourceAlignment();
             const u64 base = first.region.srcOffset / alignment * alignment;
@@ -1907,7 +1920,7 @@ std::shared_ptr<GraphicsPipeline> DrawContext::ResolvePipeline(u32 mode, u32 ele
     // pipeline stages. Whatever else is bound (a vertex program left over from an earlier
     // draw, a mesh program bound next to a vertex one) is not part of the pipeline.
     const bool mesh = mode == MESH_DRAW_MODE;
-    constexpr u32 VERTEX_STAGE_MASK = 0x1f;  // vertex, fragment, geometry, tess control, tess eval
+    constexpr u32 VERTEX_STAGE_MASK = 0x1f; // vertex, fragment, geometry, tess control, tess eval
     constexpr u32 MESH_STAGE_MASK = 1u << STAGE_TASK | 1u << STAGE_MESH | 1u << 1;
     const u32 stage_mask = mesh ? MESH_STAGE_MASK : VERTEX_STAGE_MASK;
     // The state words are set again by nearly every draw: look for an earlier draw with the same
@@ -2039,7 +2052,8 @@ void DrawContext::ApplyDynamicState(const GraphicsPipeline& active) {
                 const VC::ViewportRect& r = viewports[i];
                 rect = {r.x, r.y, (std::max)(r.width, 1.0f), (std::max)(r.height, 1.0f)};
             }
-            const ViewportRect placed = ToVulkanViewport(rect, surface_height, lower_left, invert_y);
+            const ViewportRect placed =
+                ToVulkanViewport(rect, surface_height, lower_left, invert_y);
             vp[i] = {
                 .x = placed.x,
                 .y = placed.y,
@@ -2059,15 +2073,16 @@ void DrawContext::ApplyDynamicState(const GraphicsPipeline& active) {
         for (u32 i = 0; i < count; ++i) {
             if (scissors_set & (1u << i)) {
                 const VC::ScissorRect& s = scissors[i];
-                const s32 top = ScissorTopRow(s.y, s.height, static_cast<s32>(framebuffer_extent.height),
-                                              lower_left);
+                const s32 top = ScissorTopRow(
+                    s.y, s.height, static_cast<s32>(framebuffer_extent.height), lower_left);
                 const s32 x0 = std::clamp(s.x, 0, static_cast<s32>(framebuffer_extent.width));
                 const s32 y0 = std::clamp(top, 0, static_cast<s32>(framebuffer_extent.height));
                 const s32 x1 = std::clamp(s.x + (std::max)(s.width, 0), x0,
                                           static_cast<s32>(framebuffer_extent.width));
                 const s32 y1 = std::clamp(top + (std::max)(s.height, 0), y0,
                                           static_cast<s32>(framebuffer_extent.height));
-                rects[i] = HostRect({{x0, y0}, {static_cast<u32>(x1 - x0), static_cast<u32>(y1 - y0)}});
+                rects[i] =
+                    HostRect({{x0, y0}, {static_cast<u32>(x1 - x0), static_cast<u32>(y1 - y0)}});
             } else {
                 rects[i] = {{0, 0}, host_extent};
             }
@@ -2126,7 +2141,8 @@ bool DrawContext::ResolveBuffer(u64 address, u64 size, bool write, BufferRef& ou
     out = {};
     Pool* pool = nullptr;
     u64 offset = 0;
-    if (address == 0 || !host->HostResolvePoolRange(address, (std::max<u64>)(size, 1), pool, offset, "buffer")) {
+    if (address == 0 ||
+        !host->HostResolvePoolRange(address, (std::max<u64>)(size, 1), pool, offset, "buffer")) {
         return false;
     }
     out.buffer = pool->Handle();
@@ -2288,7 +2304,8 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
     if (index) {
         if (!ResolveBuffer(index->address, index->bytes, false, index_ref, ShadowPolicy::Defer)) {
             ++counters.draws_skipped;
-            host->HostUnsupported("Draw", fmt::format("index buffer {:#x} is not in a pool", index->address));
+            host->HostUnsupported(
+                "Draw", fmt::format("index buffer {:#x} is not in a pool", index->address));
             return false;
         }
         if (!index->uploaded || index_ref.pool->backing == Pool::Backing::Imported) {
@@ -2422,8 +2439,8 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
         cmd.SetStencilTestEnableEXT(v.stencil_test_enable);
         cmd.SetStencilOpEXT(VK_STENCIL_FACE_FRONT_BIT, v.front.fail, v.front.pass,
                             v.front.depth_fail, v.front.compare);
-        cmd.SetStencilOpEXT(VK_STENCIL_FACE_BACK_BIT, v.back.fail, v.back.pass,
-                            v.back.depth_fail, v.back.compare);
+        cmd.SetStencilOpEXT(VK_STENCIL_FACE_BACK_BIT, v.back.fail, v.back.pass, v.back.depth_fail,
+                            v.back.compare);
         fixed_state = v;
         fixed_state_set = true;
     }
@@ -2489,8 +2506,8 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
         host_index.type = index->type == 0   ? VK_INDEX_TYPE_UINT8_EXT
                           : index->type == 1 ? VK_INDEX_TYPE_UINT16
                                              : VK_INDEX_TYPE_UINT32;
-        if (cs_mode == CostSplit::Mode::NoBind && cs_draw_index > 0 &&
-            cs_index_bound) [[unlikely]] {
+        if (cs_mode == CostSplit::Mode::NoBind && cs_draw_index > 0 && cs_index_bound)
+            [[unlikely]] {
             // The pass's first class draw bound an index buffer: kept.
         } else if (elide && bound_state.TakeIndexBuffer(host_index.buffer, host_index.offset,
                                                         host_index.type)) {
@@ -2631,8 +2648,8 @@ void DrawContext::Draw(const VC::DrawPayload& p) {
         vk::CommandBuffer cmd = host->HostCmd();
         if (prepared.quad_list || prepared.quad_strip || prepared.line_loop) {
             u32 count = 0;
-            if (GenerateIndices(prepared, nullptr, static_cast<u32>(p.first), p.count, 0, host_index,
-                                count) &&
+            if (GenerateIndices(prepared, nullptr, static_cast<u32>(p.first), p.count, 0,
+                                host_index, count) &&
                 count != 0) {
                 cmd.DrawIndexed(CostSplitCount(count), instances, 0, 0, p.base_instance);
             }
@@ -2660,7 +2677,8 @@ void DrawContext::DrawIndexed(const VC::DrawIndexedPayload& p) {
                          (p.index_type == 0 && !impl.device.IsExtIndexTypeUint8Supported());
     PreparedDraw prepared;
     HostIndex host_index;
-    dbg_call = {p.count, p.instance_count != 0 ? p.instance_count : 1, p.base_vertex, true, p.index_address};
+    dbg_call = {p.count, p.instance_count != 0 ? p.instance_count : 1, p.base_vertex, true,
+                p.index_address};
     if (impl.gpu_profiler) {
         prof_units = u64{p.count} * (p.instance_count != 0 ? p.instance_count : 1);
     }
@@ -2701,12 +2719,12 @@ void DrawContext::ProfBeginPass(const RenderPassKey& key, VkExtent2D extent, u32
             ++colors;
         }
     }
-    prof_pass.tag = GpuProf::Tag{.kind = GpuProf::Kind::Pass,
-                                 .format = format != 0 ? format : key.depth,
-                                 .width = extent.width,
-                                 .height = extent.height,
-                                 .shape = GpuProf::PackShape(colors, key.depth != 0, layers,
-                                                             samples)};
+    prof_pass.tag =
+        GpuProf::Tag{.kind = GpuProf::Kind::Pass,
+                     .format = format != 0 ? format : key.depth,
+                     .width = extent.width,
+                     .height = extent.height,
+                     .shape = GpuProf::PackShape(colors, key.depth != 0, layers, samples)};
     prof_pass.begin = prof->Stamp(host->HostCmd());
     prof_pass.last = prof_pass.begin;
 }

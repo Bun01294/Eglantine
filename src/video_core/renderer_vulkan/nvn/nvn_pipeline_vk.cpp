@@ -49,8 +49,8 @@ std::span<const VkSubpassDependency> RenderPassDependencies(bool sync_diet) {
                             VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                             VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
             .dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                             VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            .srcAccessMask =
+                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
             .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
             .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT,
         },
@@ -74,8 +74,8 @@ VkRenderPass PipelineCache::Impl::GetRenderPass(const RenderPassKey& key) {
     if (const auto it = render_passes.find(key); it != render_passes.end()) {
         return *it->second;
     }
-    const VkSampleCountFlagBits samples = static_cast<VkSampleCountFlagBits>(
-        key.samples == 0 ? 1 : key.samples);
+    const VkSampleCountFlagBits samples =
+        static_cast<VkSampleCountFlagBits>(key.samples == 0 ? 1 : key.samples);
     boost::container::small_vector<VkAttachmentDescription, MAX_COLOR_TARGETS + 1> descriptions;
     std::array<VkAttachmentReference, MAX_COLOR_TARGETS> color_references{};
     u32 color_count = 0;
@@ -196,7 +196,8 @@ PipelineCache::Impl::LayoutObjects PipelineCache::Impl::CreateLayoutObjects(
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
             .pNext = next,
             .flags = out.push_descriptors
-                         ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR
+                         ? static_cast<VkDescriptorSetLayoutCreateFlags>(
+                               VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR)
                          : VkDescriptorSetLayoutCreateFlags{0},
             .bindingCount = static_cast<u32>(bindings.size()),
             .pBindings = bindings.data(),
@@ -236,8 +237,7 @@ VC::DescriptorLayout PipelineCache::Impl::MergeLayouts(
             continue;
         }
         const VC::DescriptorLayout& slice = stage->record->layout;
-        merged.bindings.insert(merged.bindings.end(), slice.bindings.begin(),
-                               slice.bindings.end());
+        merged.bindings.insert(merged.bindings.end(), slice.bindings.begin(), slice.bindings.end());
         merged.uses_rescaling_uniform |= slice.uses_rescaling_uniform;
         merged.uses_render_area |= slice.uses_render_area;
         merged.uses_raw_global_memory |= slice.uses_raw_global_memory;
@@ -327,7 +327,8 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
             }
             const Disk::ShaderRecord& record = *stage->record;
             flags |= record.flags;
-            has_tessellation |= record.stage == STAGE_TESS_CONTROL || record.stage == STAGE_TESS_EVAL;
+            has_tessellation |=
+                record.stage == STAGE_TESS_CONTROL || record.stage == STAGE_TESS_EVAL;
             VkShaderModule module = VK_NULL_HANDLE;
             if (gpl_set) {
                 // The set's modules: their handles are part of the library keys.
@@ -400,13 +401,12 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
             return pipeline->pipeline ? pipeline : nullptr;
         }
         if (gpl_set) {
-            pipeline->pipeline =
-                library_cache->Link(description.ci, *vk_cache, gpl_set, true);
+            pipeline->pipeline = library_cache->Link(description.ci, *vk_cache, gpl_set, true);
             if (pipeline->pipeline) {
                 ++stat_gpl_cached_links;
             } else {
-                pipeline->pipeline = library_cache->Link(description.ci, *vk_cache, gpl_set,
-                                                         false, part_workers.get());
+                pipeline->pipeline = library_cache->Link(description.ci, *vk_cache, gpl_set, false,
+                                                         part_workers.get());
             }
             pipeline->fast_linked = static_cast<bool>(pipeline->pipeline);
             if (pipeline->fast_linked) {
@@ -419,8 +419,8 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
             }
         }
         if (!pipeline->pipeline) {
-            pipeline->pipeline = device.GetLogical().CreateGraphicsPipeline(description.ci,
-                                                                            *vk_cache);
+            pipeline->pipeline =
+                device.GetLogical().CreateGraphicsPipeline(description.ci, *vk_cache);
         }
         pipeline->layout = std::move(layout.layout);
         pipeline->set_layout = std::move(layout.set_layout);

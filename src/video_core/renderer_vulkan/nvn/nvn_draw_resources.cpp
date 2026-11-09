@@ -15,9 +15,9 @@
 #include "common/logging.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
-#include "video_core/sampler_overrides.h"
 #include "video_core/renderer_vulkan/nvn/nvn_draw_resources.h"
 #include "video_core/renderer_vulkan/nvn/nvn_sampler_aniso.h"
+#include "video_core/sampler_overrides.h"
 
 namespace Vulkan::Nvn {
 namespace {
@@ -105,13 +105,12 @@ VkFormat DummyFormat() {
 
 } // namespace
 
-DrawResources::DrawResources(Context::Impl& impl_)
-    : impl{impl_}, clears{impl_.device} {
+DrawResources::DrawResources(Context::Impl& impl_) : impl{impl_}, clears{impl_.device} {
     dummy_buffer = impl.CreateHostBuffer(DUMMY_BUFFER_SIZE, ARENA_USAGE, MemoryUsage::Upload);
     std::memset(dummy_buffer.Mapped().data(), 0, DUMMY_BUFFER_SIZE);
     dummy_buffer.Flush();
-    sink_buffer = impl.CreateHostBuffer(SINK_SLICE_SIZE * SINK_SLICES, ARENA_USAGE,
-                                        MemoryUsage::Upload);
+    sink_buffer =
+        impl.CreateHostBuffer(SINK_SLICE_SIZE * SINK_SLICES, ARENA_USAGE, MemoryUsage::Upload);
     std::memset(sink_buffer.Mapped().data(), 0, SINK_SLICE_SIZE * SINK_SLICES);
     sink_buffer.Flush();
     fallback_sampler = impl.device.GetLogical().CreateSampler({
@@ -237,10 +236,9 @@ void DrawResources::TracePresent(u64 present) {
         }
     }
     const auto now = std::chrono::steady_clock::now();
-    const double ms =
-        t.last_present == std::chrono::steady_clock::time_point{}
-            ? 0.0
-            : std::chrono::duration<double, std::milli>(now - t.last_present).count();
+    const double ms = t.last_present == std::chrono::steady_clock::time_point{}
+                          ? 0.0
+                          : std::chrono::duration<double, std::milli>(now - t.last_present).count();
     t.last_present = now;
     if (present % 30 == 0 || main != t.last_main) {
         std::vector<std::pair<std::pair<u32, u32>, u32>> sizes(t.passes.begin(), t.passes.end());
@@ -319,8 +317,7 @@ VkSampler DrawResources::GetSampler(u64 serial, bool boosted) {
     const VC::SamplerDesc& d = desc_it->second;
     // The key: a sampler the setting leaves alone is the guest's own for every setting, one the
     // setting changes is built per setting value, so a changed setting never reuses a VkSampler.
-    const s32 steps =
-        SamplerStepsKey(d, boosted ? anisotropy_steps : 0, max_sampler_anisotropy);
+    const s32 steps = SamplerStepsKey(d, boosted ? anisotropy_steps : 0, max_sampler_anisotropy);
     if (const auto it = samplers.find(serial); it != samplers.end()) {
         for (const SamplerVariant& variant : it->second) {
             if (variant.steps == steps) {
@@ -336,11 +333,12 @@ VkSampler DrawResources::GetSampler(u64 serial, bool boosted) {
     forced |= VideoCore::SamplerOverrides::ApplyLod(info.minLod, info.maxLod);
     info.anisotropyEnable = static_cast<VkBool32>(info.maxAnisotropy > 1.0f);
     if (VideoCore::SamplerOverrides::ShouldLog()) {
-        LOG_INFO(Render_Vulkan,
-                 "[nvn] sampler {:#x}: mag={} min={} mip={} lod=[{}, {}] bias={} aniso={} forced={}",
-                 serial, static_cast<u32>(info.magFilter), static_cast<u32>(info.minFilter),
-                 static_cast<u32>(info.mipmapMode), info.minLod, info.maxLod, info.mipLodBias,
-                 info.maxAnisotropy, forced);
+        LOG_INFO(
+            Render_Vulkan,
+            "[nvn] sampler {:#x}: mag={} min={} mip={} lod=[{}, {}] bias={} aniso={} forced={}",
+            serial, static_cast<u32>(info.magFilter), static_cast<u32>(info.minFilter),
+            static_cast<u32>(info.mipmapMode), info.minLod, info.maxLod, info.mipLodBias,
+            info.maxAnisotropy, forced);
     }
     VkSamplerReductionModeCreateInfo reduction{
         .sType = VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO,
@@ -416,9 +414,10 @@ std::optional<VideoCommon::PathDiff::Sampler> DrawResources::DescribeSampler(u64
                                              ? VK_BORDER_COLOR_FLOAT_CUSTOM_EXT
                                              : info.borderColor),
         .border = {d.border[0], d.border[1], d.border[2], d.border[3]},
-        .reduction = static_cast<u32>(d.reduction == 1   ? VK_SAMPLER_REDUCTION_MODE_MIN
-                                      : d.reduction == 2 ? VK_SAMPLER_REDUCTION_MODE_MAX
-                                                         : VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE),
+        .reduction =
+            static_cast<u32>(d.reduction == 1   ? VK_SAMPLER_REDUCTION_MODE_MIN
+                             : d.reduction == 2 ? VK_SAMPLER_REDUCTION_MODE_MAX
+                                                : VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE),
     };
 }
 
@@ -535,8 +534,11 @@ DrawResources::Scratch* DrawResources::GetScratch(const Storage& source, u32 slo
     storage->layers = source.layers;
     storage->aspect = source.aspect;
     storage->samples = VK_SAMPLE_COUNT_1_BIT;
-    storage->create_flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
-                            (source.type == VK_IMAGE_TYPE_3D ? VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT : 0u);
+    storage->create_flags =
+        VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
+        (source.type == VK_IMAGE_TYPE_3D
+             ? static_cast<VkImageCreateFlags>(VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT)
+             : 0u);
     storage->create_flags |= source.create_flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     storage->usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                      VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -583,8 +585,7 @@ DrawResources::Scratch* DrawResources::GetRetypedScratch(const Storage& source, 
         const Storage& s = *scratch.storage;
         if (scratch.slot == slot && s.host.format == source.host.format && s.type == type &&
             s.extent.width == source.extent.width && s.extent.height == source.extent.height &&
-            s.extent.depth == 1 &&
-            s.layers == layers && s.aspect == source.aspect) {
+            s.extent.depth == 1 && s.layers == layers && s.aspect == source.aspect) {
             return &scratch;
         }
     }
@@ -597,7 +598,8 @@ DrawResources::Scratch* DrawResources::GetRetypedScratch(const Storage& source, 
     storage->aspect = source.aspect;
     storage->samples = VK_SAMPLE_COUNT_1_BIT;
     storage->create_flags =
-        VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | (cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0u);
+        VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
+        (cube ? static_cast<VkImageCreateFlags>(VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) : 0u);
     storage->usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                      VK_IMAGE_USAGE_SAMPLED_BIT;
     try {
@@ -647,8 +649,8 @@ std::shared_ptr<ArenaChunk> DrawResources::AcquireArena(u64 min_size) {
     }
     auto chunk = std::make_shared<ArenaChunk>();
     chunk->size = (std::max)(min_size, ARENA_CHUNK_SIZE);
-    chunk->buffer = impl.CreateHostBuffer(chunk->size, ARENA_USAGE, MemoryUsage::Upload,
-                                          AllocationKind::Arena);
+    chunk->buffer =
+        impl.CreateHostBuffer(chunk->size, ARENA_USAGE, MemoryUsage::Upload, AllocationKind::Arena);
     chunk->pointer = chunk->buffer.Mapped().data();
     return chunk;
 }
@@ -843,8 +845,8 @@ VkImageView DrawResources::DummyView(VkImageViewType type) {
                 .baseArrayLayer = 0,
                 .layerCount = (type == VK_IMAGE_VIEW_TYPE_1D || type == VK_IMAGE_VIEW_TYPE_2D ||
                                type == VK_IMAGE_VIEW_TYPE_3D)
-                                   ? 1u
-                                   : layers,
+                                  ? 1u
+                                  : layers,
             },
         });
         static_cast<void>(is_array_view);
@@ -876,8 +878,8 @@ VkImageView DrawResources::DummyView(VkImageViewType type) {
             barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
             barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, barrier);
+            cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                0, barrier);
         });
     } catch (const vk::Exception& exception) {
         LOG_ERROR(Render_Vulkan, "[nvn] dummy image creation failed: {}", exception.what());

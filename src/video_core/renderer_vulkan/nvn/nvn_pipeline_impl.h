@@ -39,8 +39,8 @@
 #include "video_core/renderer_vulkan/nvn/nvn_pipeline_disk.h"
 #include "video_core/renderer_vulkan/nvn/nvn_pipeline_state.h"
 #include "video_core/renderer_vulkan/vk_pipeline_library.h"
-#include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/shader_log.h"
+#include "video_core/vulkan_common/vulkan_device.h"
 
 namespace Vulkan::Nvn::Detail {
 constexpr size_t MAX_REASON_CHARS = 100;
@@ -102,7 +102,8 @@ inline VkShaderStageFlags StageFlagsOf(const VC::DescriptorBinding& binding) {
             flags |= VkStageOf(stage);
         }
     }
-    return flags != 0 ? flags : VkStageOf(static_cast<u32>(binding.stage));
+    return flags != 0 ? flags
+                      : static_cast<VkShaderStageFlags>(VkStageOf(static_cast<u32>(binding.stage)));
 }
 
 inline std::string_view StageNameOf(u32 nvn_stage) {
@@ -133,8 +134,7 @@ struct GraphicsKey {
     u64 hash{};
 
     void Finalize() {
-        u64 h = Common::CityHash64(reinterpret_cast<const char*>(hashes.data()),
-                                   sizeof(hashes));
+        u64 h = Common::CityHash64(reinterpret_cast<const char*>(hashes.data()), sizeof(hashes));
         h = Common::CityHash64WithSeed(reinterpret_cast<const char*>(&state), sizeof(state), h);
         h = Common::CityHash64WithSeed(reinterpret_cast<const char*>(&targets), sizeof(targets), h);
         if (try_switch_hash != 0) {
@@ -257,9 +257,8 @@ public:
 
     void Flush() {
         std::unique_lock lock{mutex};
-        idle.wait(lock, [this] {
-            return stop || (state != State::Pending && queue.empty() && !busy);
-        });
+        idle.wait(lock,
+                  [this] { return stop || (state != State::Pending && queue.empty() && !busy); });
     }
 
 private:
@@ -410,7 +409,8 @@ struct PipelineCache::Impl {
         u64 try_switch_hash{};
         u64 hash{};
         void Finalize() {
-            u64 h = Common::CityHash64(reinterpret_cast<const char*>(hashes.data()), sizeof(hashes));
+            u64 h =
+                Common::CityHash64(reinterpret_cast<const char*>(hashes.data()), sizeof(hashes));
             h = Common::CityHash64WithSeed(reinterpret_cast<const char*>(&state), sizeof(state), h);
             if (try_switch_hash != 0) {
                 h = Common::CityHash64WithSeed(reinterpret_cast<const char*>(&try_switch_hash),
@@ -435,7 +435,8 @@ struct PipelineCache::Impl {
         return library_cache != nullptr;
     }
     /// The set of `key` whose texture answers `oracle` still gives, or null.
-    std::shared_ptr<ShaderSet> FindShaderSet(const TranslationKey& key, const TextureOracle& oracle);
+    std::shared_ptr<ShaderSet> FindShaderSet(const TranslationKey& key,
+                                             const TextureOracle& oracle);
     std::shared_ptr<ShaderSet> AddShaderSet(const TranslationKey& key, TranslateOutput translated);
     /// The set of `key` made of exactly these stage artifacts (same shader record ids), or null.
     std::shared_ptr<ShaderSet> FindShaderSetOf(
@@ -564,12 +565,12 @@ struct PipelineCache::Impl {
     /// Counts one handled cached record and reports Build done / total (rate limited, always on
     /// the last one).
     void NotePreloadStep();
-    void PreloadGraphics(const Disk::GraphicsPipelineRecord& record,
-                         const std::unordered_map<Disk::ContentId, StageArtifact,
-                                                  Disk::ContentIdHash>& shaders);
-    void PreloadCompute(const Disk::ComputePipelineRecord& record,
-                        const std::unordered_map<Disk::ContentId, StageArtifact,
-                                                 Disk::ContentIdHash>& shaders);
+    void PreloadGraphics(
+        const Disk::GraphicsPipelineRecord& record,
+        const std::unordered_map<Disk::ContentId, StageArtifact, Disk::ContentIdHash>& shaders);
+    void PreloadCompute(
+        const Disk::ComputePipelineRecord& record,
+        const std::unordered_map<Disk::ContentId, StageArtifact, Disk::ContentIdHash>& shaders);
     void WaitPending(const std::shared_ptr<PendingKey>& pending);
     /// Blocks while the loader is still registering the cached pipelines as pending (false
     /// without waiting when it is done or there is no loader): a draw that misses before that
@@ -611,11 +612,11 @@ struct PipelineCache::Impl {
     std::atomic<u64> stat_wait_count{};
     std::atomic<u64> stat_wait_ns{};
     std::atomic<u64> stat_wait_max_ns{};
-    std::atomic<u64> stat_compile_ns{};     ///< sum of the wall time of every run-time compile
-    std::atomic<u64> stat_translate_ns{};   ///< ... of which in translation
-    std::atomic<u64> stat_create_ns{};      ///< ... of which creating the Vulkan pipeline
+    std::atomic<u64> stat_compile_ns{};   ///< sum of the wall time of every run-time compile
+    std::atomic<u64> stat_translate_ns{}; ///< ... of which in translation
+    std::atomic<u64> stat_create_ns{};    ///< ... of which creating the Vulkan pipeline
     std::atomic<u64> stat_compile_max_ns{};
-    std::atomic<u64> stat_async_peak{};     ///< most compile jobs queued or running at once
+    std::atomic<u64> stat_async_peak{};        ///< most compile jobs queued or running at once
     std::atomic<u64> stat_async_first_ticks{}; ///< steady_clock ticks of the first queued job
     std::atomic<u64> stat_async_last_ticks{};  ///< ... and of the latest finished job
     size_t async_worker_count{};
@@ -634,13 +635,12 @@ struct PipelineCache::Impl {
     std::unordered_map<RenderPassKey, vk::RenderPass, RenderPassKeyHash> render_passes;
 
     mutable std::mutex pipeline_mutex;
-    std::unordered_map<GraphicsKey, std::vector<std::shared_ptr<GraphicsPipeline>>,
-                       GraphicsKeyHash, GraphicsKeyEqual>
+    std::unordered_map<GraphicsKey, std::vector<std::shared_ptr<GraphicsPipeline>>, GraphicsKeyHash,
+                       GraphicsKeyEqual>
         graphics;
     std::unordered_map<ComputeKey, std::vector<std::shared_ptr<ComputePipeline>>, ComputeKeyHash>
         compute;
-    std::unordered_map<GraphicsKey, std::shared_ptr<PendingKey>, GraphicsKeyHash,
-                       GraphicsKeyEqual>
+    std::unordered_map<GraphicsKey, std::shared_ptr<PendingKey>, GraphicsKeyHash, GraphicsKeyEqual>
         pending_graphics;
     std::unordered_map<ComputeKey, std::shared_ptr<PendingKey>, ComputeKeyHash> pending_compute;
     /// Keys whose asynchronous compile produced no pipeline (guarded by pipeline_mutex).
@@ -658,7 +658,8 @@ struct PipelineCache::Impl {
     std::mutex loader_mutex;
     std::condition_variable loader_cv;
     bool loader_done{};
-    std::atomic<bool> loader_queued{}; ///< every cached pipeline is registered in pending_* (or in the maps)
+    std::atomic<bool>
+        loader_queued{}; ///< every cached pipeline is registered in pending_* (or in the maps)
     /// Preload progress for the loading screen (options.load_progress): one step per cached
     /// pipeline record handled (rebuilt, skipped as a duplicate or as unusable).
     bool preload_reporting{};

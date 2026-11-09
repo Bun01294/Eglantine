@@ -12,8 +12,8 @@
 #include <fmt/format.h>
 
 #include "common/cityhash.h"
-#include "common/logging.h"
 #include "common/diag_request.h"
+#include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/buffer_cache/raw_coverage.h"
 #include "video_core/nvn/state_layouts.h"
@@ -35,18 +35,84 @@ constexpr u32 BLEND_ONE_MINUS_SRC1_ALPHA = 0x13;
 
 // NVNformat values the vertex tables use (nvn_enums.inc).
 enum VertexNvnFormat : u32 {
-    F_R8 = 0x01, F_R8SN, F_R8UI, F_R8I, F_R16F, F_R16, F_R16SN, F_R16UI, F_R16I, F_R32F, F_R32UI,
-    F_R32I, F_RG8, F_RG8SN, F_RG8UI, F_RG8I, F_RG16F, F_RG16, F_RG16SN, F_RG16UI, F_RG16I,
-    F_RG32F, F_RG32UI, F_RG32I, F_RGB8, F_RGB8SN, F_RGB8UI, F_RGB8I, F_RGB16F, F_RGB16,
-    F_RGB16SN, F_RGB16UI, F_RGB16I, F_RGB32F, F_RGB32UI, F_RGB32I, F_RGBA8, F_RGBA8SN,
-    F_RGBA8UI, F_RGBA8I, F_RGBA16F, F_RGBA16, F_RGBA16SN, F_RGBA16UI, F_RGBA16I, F_RGBA32F,
-    F_RGBA32UI, F_RGBA32I,
-    F_RGB10A2 = 0x3D, F_RGB10A2UI = 0x3E,
-    F_R8_UI2F = 0x51, F_R8_I2F, F_R16_UI2F, F_R16_I2F, F_R32_UI2F, F_R32_I2F, F_RG8_UI2F,
-    F_RG8_I2F, F_RG16_UI2F, F_RG16_I2F, F_RG32_UI2F, F_RG32_I2F, F_RGB8_UI2F, F_RGB8_I2F,
-    F_RGB16_UI2F, F_RGB16_I2F, F_RGB32_UI2F, F_RGB32_I2F, F_RGBA8_UI2F, F_RGBA8_I2F,
-    F_RGBA16_UI2F, F_RGBA16_I2F, F_RGBA32_UI2F, F_RGBA32_I2F, F_RGB10A2SN, F_RGB10A2I,
-    F_RGB10A2_UI2F, F_RGB10A2_I2F,
+    F_R8 = 0x01,
+    F_R8SN,
+    F_R8UI,
+    F_R8I,
+    F_R16F,
+    F_R16,
+    F_R16SN,
+    F_R16UI,
+    F_R16I,
+    F_R32F,
+    F_R32UI,
+    F_R32I,
+    F_RG8,
+    F_RG8SN,
+    F_RG8UI,
+    F_RG8I,
+    F_RG16F,
+    F_RG16,
+    F_RG16SN,
+    F_RG16UI,
+    F_RG16I,
+    F_RG32F,
+    F_RG32UI,
+    F_RG32I,
+    F_RGB8,
+    F_RGB8SN,
+    F_RGB8UI,
+    F_RGB8I,
+    F_RGB16F,
+    F_RGB16,
+    F_RGB16SN,
+    F_RGB16UI,
+    F_RGB16I,
+    F_RGB32F,
+    F_RGB32UI,
+    F_RGB32I,
+    F_RGBA8,
+    F_RGBA8SN,
+    F_RGBA8UI,
+    F_RGBA8I,
+    F_RGBA16F,
+    F_RGBA16,
+    F_RGBA16SN,
+    F_RGBA16UI,
+    F_RGBA16I,
+    F_RGBA32F,
+    F_RGBA32UI,
+    F_RGBA32I,
+    F_RGB10A2 = 0x3D,
+    F_RGB10A2UI = 0x3E,
+    F_R8_UI2F = 0x51,
+    F_R8_I2F,
+    F_R16_UI2F,
+    F_R16_I2F,
+    F_R32_UI2F,
+    F_R32_I2F,
+    F_RG8_UI2F,
+    F_RG8_I2F,
+    F_RG16_UI2F,
+    F_RG16_I2F,
+    F_RG32_UI2F,
+    F_RG32_I2F,
+    F_RGB8_UI2F,
+    F_RGB8_I2F,
+    F_RGB16_UI2F,
+    F_RGB16_I2F,
+    F_RGB32_UI2F,
+    F_RGB32_I2F,
+    F_RGBA8_UI2F,
+    F_RGBA8_I2F,
+    F_RGBA16_UI2F,
+    F_RGBA16_I2F,
+    F_RGBA32_UI2F,
+    F_RGBA32_I2F,
+    F_RGB10A2SN,
+    F_RGB10A2I,
+    F_RGB10A2_UI2F,
+    F_RGB10A2_I2F,
     F_BGRA8 = 0x9A,
 };
 
@@ -54,7 +120,8 @@ enum class Kind : u8 { None, Float, UInt, SInt, UScaled, SScaled };
 
 struct VertexEntry {
     Kind kind{Kind::None};
-    VkFormat format{VK_FORMAT_UNDEFINED};  ///< the format (scaled formats: the scaled one or UNDEFINED)
+    VkFormat format{
+        VK_FORMAT_UNDEFINED}; ///< the format (scaled formats: the scaled one or UNDEFINED)
     VkFormat integer{VK_FORMAT_UNDEFINED}; ///< scaled formats: the raw integer equivalent
 };
 
@@ -67,73 +134,136 @@ constexpr VertexEntry Scaled(Kind kind, VkFormat scaled, VkFormat integer) {
 
 constexpr VertexEntry LookupVertex(u32 f) {
     switch (f) {
-    case F_R8: return Plain(Kind::Float, VK_FORMAT_R8_UNORM);
-    case F_R8SN: return Plain(Kind::Float, VK_FORMAT_R8_SNORM);
-    case F_R8UI: return Plain(Kind::UInt, VK_FORMAT_R8_UINT);
-    case F_R8I: return Plain(Kind::SInt, VK_FORMAT_R8_SINT);
-    case F_R16F: return Plain(Kind::Float, VK_FORMAT_R16_SFLOAT);
-    case F_R16: return Plain(Kind::Float, VK_FORMAT_R16_UNORM);
-    case F_R16SN: return Plain(Kind::Float, VK_FORMAT_R16_SNORM);
-    case F_R16UI: return Plain(Kind::UInt, VK_FORMAT_R16_UINT);
-    case F_R16I: return Plain(Kind::SInt, VK_FORMAT_R16_SINT);
-    case F_R32F: return Plain(Kind::Float, VK_FORMAT_R32_SFLOAT);
-    case F_R32UI: return Plain(Kind::UInt, VK_FORMAT_R32_UINT);
-    case F_R32I: return Plain(Kind::SInt, VK_FORMAT_R32_SINT);
-    case F_RG8: return Plain(Kind::Float, VK_FORMAT_R8G8_UNORM);
-    case F_RG8SN: return Plain(Kind::Float, VK_FORMAT_R8G8_SNORM);
-    case F_RG8UI: return Plain(Kind::UInt, VK_FORMAT_R8G8_UINT);
-    case F_RG8I: return Plain(Kind::SInt, VK_FORMAT_R8G8_SINT);
-    case F_RG16F: return Plain(Kind::Float, VK_FORMAT_R16G16_SFLOAT);
-    case F_RG16: return Plain(Kind::Float, VK_FORMAT_R16G16_UNORM);
-    case F_RG16SN: return Plain(Kind::Float, VK_FORMAT_R16G16_SNORM);
-    case F_RG16UI: return Plain(Kind::UInt, VK_FORMAT_R16G16_UINT);
-    case F_RG16I: return Plain(Kind::SInt, VK_FORMAT_R16G16_SINT);
-    case F_RG32F: return Plain(Kind::Float, VK_FORMAT_R32G32_SFLOAT);
-    case F_RG32UI: return Plain(Kind::UInt, VK_FORMAT_R32G32_UINT);
-    case F_RG32I: return Plain(Kind::SInt, VK_FORMAT_R32G32_SINT);
-    case F_RGB8: return Plain(Kind::Float, VK_FORMAT_R8G8B8_UNORM);
-    case F_RGB8SN: return Plain(Kind::Float, VK_FORMAT_R8G8B8_SNORM);
-    case F_RGB8UI: return Plain(Kind::UInt, VK_FORMAT_R8G8B8_UINT);
-    case F_RGB8I: return Plain(Kind::SInt, VK_FORMAT_R8G8B8_SINT);
-    case F_RGB16F: return Plain(Kind::Float, VK_FORMAT_R16G16B16_SFLOAT);
-    case F_RGB16: return Plain(Kind::Float, VK_FORMAT_R16G16B16_UNORM);
-    case F_RGB16SN: return Plain(Kind::Float, VK_FORMAT_R16G16B16_SNORM);
-    case F_RGB16UI: return Plain(Kind::UInt, VK_FORMAT_R16G16B16_UINT);
-    case F_RGB16I: return Plain(Kind::SInt, VK_FORMAT_R16G16B16_SINT);
-    case F_RGB32F: return Plain(Kind::Float, VK_FORMAT_R32G32B32_SFLOAT);
-    case F_RGB32UI: return Plain(Kind::UInt, VK_FORMAT_R32G32B32_UINT);
-    case F_RGB32I: return Plain(Kind::SInt, VK_FORMAT_R32G32B32_SINT);
-    case F_RGBA8: return Plain(Kind::Float, VK_FORMAT_R8G8B8A8_UNORM);
-    case F_RGBA8SN: return Plain(Kind::Float, VK_FORMAT_R8G8B8A8_SNORM);
-    case F_RGBA8UI: return Plain(Kind::UInt, VK_FORMAT_R8G8B8A8_UINT);
-    case F_RGBA8I: return Plain(Kind::SInt, VK_FORMAT_R8G8B8A8_SINT);
-    case F_RGBA16F: return Plain(Kind::Float, VK_FORMAT_R16G16B16A16_SFLOAT);
-    case F_RGBA16: return Plain(Kind::Float, VK_FORMAT_R16G16B16A16_UNORM);
-    case F_RGBA16SN: return Plain(Kind::Float, VK_FORMAT_R16G16B16A16_SNORM);
-    case F_RGBA16UI: return Plain(Kind::UInt, VK_FORMAT_R16G16B16A16_UINT);
-    case F_RGBA16I: return Plain(Kind::SInt, VK_FORMAT_R16G16B16A16_SINT);
-    case F_RGBA32F: return Plain(Kind::Float, VK_FORMAT_R32G32B32A32_SFLOAT);
-    case F_RGBA32UI: return Plain(Kind::UInt, VK_FORMAT_R32G32B32A32_UINT);
-    case F_RGBA32I: return Plain(Kind::SInt, VK_FORMAT_R32G32B32A32_SINT);
-    case F_RGB10A2: return Plain(Kind::Float, VK_FORMAT_A2B10G10R10_UNORM_PACK32);
-    case F_RGB10A2UI: return Plain(Kind::UInt, VK_FORMAT_A2B10G10R10_UINT_PACK32);
-    case F_RGB10A2SN: return Plain(Kind::Float, VK_FORMAT_A2B10G10R10_SNORM_PACK32);
-    case F_RGB10A2I: return Plain(Kind::SInt, VK_FORMAT_A2B10G10R10_SINT_PACK32);
-    case F_BGRA8: return Plain(Kind::Float, VK_FORMAT_B8G8R8A8_UNORM);
-    case F_R8_UI2F: return Scaled(Kind::UScaled, VK_FORMAT_R8_USCALED, VK_FORMAT_R8_UINT);
-    case F_R8_I2F: return Scaled(Kind::SScaled, VK_FORMAT_R8_SSCALED, VK_FORMAT_R8_SINT);
-    case F_R16_UI2F: return Scaled(Kind::UScaled, VK_FORMAT_R16_USCALED, VK_FORMAT_R16_UINT);
-    case F_R16_I2F: return Scaled(Kind::SScaled, VK_FORMAT_R16_SSCALED, VK_FORMAT_R16_SINT);
-    case F_R32_UI2F: return Scaled(Kind::UScaled, VK_FORMAT_UNDEFINED, VK_FORMAT_R32_UINT);
-    case F_R32_I2F: return Scaled(Kind::SScaled, VK_FORMAT_UNDEFINED, VK_FORMAT_R32_SINT);
-    case F_RG8_UI2F: return Scaled(Kind::UScaled, VK_FORMAT_R8G8_USCALED, VK_FORMAT_R8G8_UINT);
-    case F_RG8_I2F: return Scaled(Kind::SScaled, VK_FORMAT_R8G8_SSCALED, VK_FORMAT_R8G8_SINT);
+    case F_R8:
+        return Plain(Kind::Float, VK_FORMAT_R8_UNORM);
+    case F_R8SN:
+        return Plain(Kind::Float, VK_FORMAT_R8_SNORM);
+    case F_R8UI:
+        return Plain(Kind::UInt, VK_FORMAT_R8_UINT);
+    case F_R8I:
+        return Plain(Kind::SInt, VK_FORMAT_R8_SINT);
+    case F_R16F:
+        return Plain(Kind::Float, VK_FORMAT_R16_SFLOAT);
+    case F_R16:
+        return Plain(Kind::Float, VK_FORMAT_R16_UNORM);
+    case F_R16SN:
+        return Plain(Kind::Float, VK_FORMAT_R16_SNORM);
+    case F_R16UI:
+        return Plain(Kind::UInt, VK_FORMAT_R16_UINT);
+    case F_R16I:
+        return Plain(Kind::SInt, VK_FORMAT_R16_SINT);
+    case F_R32F:
+        return Plain(Kind::Float, VK_FORMAT_R32_SFLOAT);
+    case F_R32UI:
+        return Plain(Kind::UInt, VK_FORMAT_R32_UINT);
+    case F_R32I:
+        return Plain(Kind::SInt, VK_FORMAT_R32_SINT);
+    case F_RG8:
+        return Plain(Kind::Float, VK_FORMAT_R8G8_UNORM);
+    case F_RG8SN:
+        return Plain(Kind::Float, VK_FORMAT_R8G8_SNORM);
+    case F_RG8UI:
+        return Plain(Kind::UInt, VK_FORMAT_R8G8_UINT);
+    case F_RG8I:
+        return Plain(Kind::SInt, VK_FORMAT_R8G8_SINT);
+    case F_RG16F:
+        return Plain(Kind::Float, VK_FORMAT_R16G16_SFLOAT);
+    case F_RG16:
+        return Plain(Kind::Float, VK_FORMAT_R16G16_UNORM);
+    case F_RG16SN:
+        return Plain(Kind::Float, VK_FORMAT_R16G16_SNORM);
+    case F_RG16UI:
+        return Plain(Kind::UInt, VK_FORMAT_R16G16_UINT);
+    case F_RG16I:
+        return Plain(Kind::SInt, VK_FORMAT_R16G16_SINT);
+    case F_RG32F:
+        return Plain(Kind::Float, VK_FORMAT_R32G32_SFLOAT);
+    case F_RG32UI:
+        return Plain(Kind::UInt, VK_FORMAT_R32G32_UINT);
+    case F_RG32I:
+        return Plain(Kind::SInt, VK_FORMAT_R32G32_SINT);
+    case F_RGB8:
+        return Plain(Kind::Float, VK_FORMAT_R8G8B8_UNORM);
+    case F_RGB8SN:
+        return Plain(Kind::Float, VK_FORMAT_R8G8B8_SNORM);
+    case F_RGB8UI:
+        return Plain(Kind::UInt, VK_FORMAT_R8G8B8_UINT);
+    case F_RGB8I:
+        return Plain(Kind::SInt, VK_FORMAT_R8G8B8_SINT);
+    case F_RGB16F:
+        return Plain(Kind::Float, VK_FORMAT_R16G16B16_SFLOAT);
+    case F_RGB16:
+        return Plain(Kind::Float, VK_FORMAT_R16G16B16_UNORM);
+    case F_RGB16SN:
+        return Plain(Kind::Float, VK_FORMAT_R16G16B16_SNORM);
+    case F_RGB16UI:
+        return Plain(Kind::UInt, VK_FORMAT_R16G16B16_UINT);
+    case F_RGB16I:
+        return Plain(Kind::SInt, VK_FORMAT_R16G16B16_SINT);
+    case F_RGB32F:
+        return Plain(Kind::Float, VK_FORMAT_R32G32B32_SFLOAT);
+    case F_RGB32UI:
+        return Plain(Kind::UInt, VK_FORMAT_R32G32B32_UINT);
+    case F_RGB32I:
+        return Plain(Kind::SInt, VK_FORMAT_R32G32B32_SINT);
+    case F_RGBA8:
+        return Plain(Kind::Float, VK_FORMAT_R8G8B8A8_UNORM);
+    case F_RGBA8SN:
+        return Plain(Kind::Float, VK_FORMAT_R8G8B8A8_SNORM);
+    case F_RGBA8UI:
+        return Plain(Kind::UInt, VK_FORMAT_R8G8B8A8_UINT);
+    case F_RGBA8I:
+        return Plain(Kind::SInt, VK_FORMAT_R8G8B8A8_SINT);
+    case F_RGBA16F:
+        return Plain(Kind::Float, VK_FORMAT_R16G16B16A16_SFLOAT);
+    case F_RGBA16:
+        return Plain(Kind::Float, VK_FORMAT_R16G16B16A16_UNORM);
+    case F_RGBA16SN:
+        return Plain(Kind::Float, VK_FORMAT_R16G16B16A16_SNORM);
+    case F_RGBA16UI:
+        return Plain(Kind::UInt, VK_FORMAT_R16G16B16A16_UINT);
+    case F_RGBA16I:
+        return Plain(Kind::SInt, VK_FORMAT_R16G16B16A16_SINT);
+    case F_RGBA32F:
+        return Plain(Kind::Float, VK_FORMAT_R32G32B32A32_SFLOAT);
+    case F_RGBA32UI:
+        return Plain(Kind::UInt, VK_FORMAT_R32G32B32A32_UINT);
+    case F_RGBA32I:
+        return Plain(Kind::SInt, VK_FORMAT_R32G32B32A32_SINT);
+    case F_RGB10A2:
+        return Plain(Kind::Float, VK_FORMAT_A2B10G10R10_UNORM_PACK32);
+    case F_RGB10A2UI:
+        return Plain(Kind::UInt, VK_FORMAT_A2B10G10R10_UINT_PACK32);
+    case F_RGB10A2SN:
+        return Plain(Kind::Float, VK_FORMAT_A2B10G10R10_SNORM_PACK32);
+    case F_RGB10A2I:
+        return Plain(Kind::SInt, VK_FORMAT_A2B10G10R10_SINT_PACK32);
+    case F_BGRA8:
+        return Plain(Kind::Float, VK_FORMAT_B8G8R8A8_UNORM);
+    case F_R8_UI2F:
+        return Scaled(Kind::UScaled, VK_FORMAT_R8_USCALED, VK_FORMAT_R8_UINT);
+    case F_R8_I2F:
+        return Scaled(Kind::SScaled, VK_FORMAT_R8_SSCALED, VK_FORMAT_R8_SINT);
+    case F_R16_UI2F:
+        return Scaled(Kind::UScaled, VK_FORMAT_R16_USCALED, VK_FORMAT_R16_UINT);
+    case F_R16_I2F:
+        return Scaled(Kind::SScaled, VK_FORMAT_R16_SSCALED, VK_FORMAT_R16_SINT);
+    case F_R32_UI2F:
+        return Scaled(Kind::UScaled, VK_FORMAT_UNDEFINED, VK_FORMAT_R32_UINT);
+    case F_R32_I2F:
+        return Scaled(Kind::SScaled, VK_FORMAT_UNDEFINED, VK_FORMAT_R32_SINT);
+    case F_RG8_UI2F:
+        return Scaled(Kind::UScaled, VK_FORMAT_R8G8_USCALED, VK_FORMAT_R8G8_UINT);
+    case F_RG8_I2F:
+        return Scaled(Kind::SScaled, VK_FORMAT_R8G8_SSCALED, VK_FORMAT_R8G8_SINT);
     case F_RG16_UI2F:
         return Scaled(Kind::UScaled, VK_FORMAT_R16G16_USCALED, VK_FORMAT_R16G16_UINT);
     case F_RG16_I2F:
         return Scaled(Kind::SScaled, VK_FORMAT_R16G16_SSCALED, VK_FORMAT_R16G16_SINT);
-    case F_RG32_UI2F: return Scaled(Kind::UScaled, VK_FORMAT_UNDEFINED, VK_FORMAT_R32G32_UINT);
-    case F_RG32_I2F: return Scaled(Kind::SScaled, VK_FORMAT_UNDEFINED, VK_FORMAT_R32G32_SINT);
+    case F_RG32_UI2F:
+        return Scaled(Kind::UScaled, VK_FORMAT_UNDEFINED, VK_FORMAT_R32G32_UINT);
+    case F_RG32_I2F:
+        return Scaled(Kind::SScaled, VK_FORMAT_UNDEFINED, VK_FORMAT_R32G32_SINT);
     case F_RGB8_UI2F:
         return Scaled(Kind::UScaled, VK_FORMAT_R8G8B8_USCALED, VK_FORMAT_R8G8B8_UINT);
     case F_RGB8_I2F:
@@ -172,25 +302,44 @@ constexpr VertexEntry LookupVertex(u32 f) {
 VkBlendFactor ToBlendFactor(u32 func, bool& known) {
     known = true;
     switch (func) {
-    case 0x01: return VK_BLEND_FACTOR_ZERO;
-    case 0x02: return VK_BLEND_FACTOR_ONE;
-    case 0x03: return VK_BLEND_FACTOR_SRC_COLOR;
-    case 0x04: return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
-    case 0x05: return VK_BLEND_FACTOR_SRC_ALPHA;
-    case 0x06: return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-    case 0x07: return VK_BLEND_FACTOR_DST_ALPHA;
-    case 0x08: return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
-    case 0x09: return VK_BLEND_FACTOR_DST_COLOR;
-    case 0x0A: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
-    case 0x0B: return VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
-    case 0x10: return VK_BLEND_FACTOR_SRC1_COLOR;
-    case 0x11: return VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR;
-    case 0x12: return VK_BLEND_FACTOR_SRC1_ALPHA;
-    case 0x13: return VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
-    case 0x61: return VK_BLEND_FACTOR_CONSTANT_COLOR;
-    case 0x62: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
-    case 0x63: return VK_BLEND_FACTOR_CONSTANT_ALPHA;
-    case 0x64: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+    case 0x01:
+        return VK_BLEND_FACTOR_ZERO;
+    case 0x02:
+        return VK_BLEND_FACTOR_ONE;
+    case 0x03:
+        return VK_BLEND_FACTOR_SRC_COLOR;
+    case 0x04:
+        return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+    case 0x05:
+        return VK_BLEND_FACTOR_SRC_ALPHA;
+    case 0x06:
+        return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    case 0x07:
+        return VK_BLEND_FACTOR_DST_ALPHA;
+    case 0x08:
+        return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
+    case 0x09:
+        return VK_BLEND_FACTOR_DST_COLOR;
+    case 0x0A:
+        return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+    case 0x0B:
+        return VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
+    case 0x10:
+        return VK_BLEND_FACTOR_SRC1_COLOR;
+    case 0x11:
+        return VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR;
+    case 0x12:
+        return VK_BLEND_FACTOR_SRC1_ALPHA;
+    case 0x13:
+        return VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
+    case 0x61:
+        return VK_BLEND_FACTOR_CONSTANT_COLOR;
+    case 0x62:
+        return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+    case 0x63:
+        return VK_BLEND_FACTOR_CONSTANT_ALPHA;
+    case 0x64:
+        return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
     default:
         known = false;
         return VK_BLEND_FACTOR_ONE;
@@ -200,11 +349,16 @@ VkBlendFactor ToBlendFactor(u32 func, bool& known) {
 VkBlendOp ToBlendOp(u32 equation, bool& known) {
     known = true;
     switch (equation) {
-    case 1: return VK_BLEND_OP_ADD;
-    case 2: return VK_BLEND_OP_SUBTRACT;
-    case 3: return VK_BLEND_OP_REVERSE_SUBTRACT;
-    case 4: return VK_BLEND_OP_MIN;
-    case 5: return VK_BLEND_OP_MAX;
+    case 1:
+        return VK_BLEND_OP_ADD;
+    case 2:
+        return VK_BLEND_OP_SUBTRACT;
+    case 3:
+        return VK_BLEND_OP_REVERSE_SUBTRACT;
+    case 4:
+        return VK_BLEND_OP_MIN;
+    case 5:
+        return VK_BLEND_OP_MAX;
     default:
         known = false;
         return VK_BLEND_OP_ADD;
@@ -229,22 +383,38 @@ VkStencilOp ToStencilOp(u32 op) {
 
 VkPrimitiveTopology ToVkTopology(u32 topology) {
     switch (topology) {
-    case 0: return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
-    case 1: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
-    case 2: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; // LINE_LOOP: the replay closes the loop
-    case 3: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
-    case 4: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    case 5: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
-    case 6: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
-    case 7: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; // QUADS: converted by the replay
-    case 8: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; // QUAD_STRIP: converted by the replay
-    case 9: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;  // POLYGON
-    case 10: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY;
-    case 11: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY;
-    case 12: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY;
-    case 13: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
-    case 14: return VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
-    default: return VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
+    case 0:
+        return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+    case 1:
+        return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+    case 2:
+        return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; // LINE_LOOP: the replay closes the loop
+    case 3:
+        return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+    case 4:
+        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    case 5:
+        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    case 6:
+        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+    case 7:
+        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; // QUADS: converted by the replay
+    case 8:
+        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; // QUAD_STRIP: converted by the replay
+    case 9:
+        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; // POLYGON
+    case 10:
+        return VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY;
+    case 11:
+        return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY;
+    case 12:
+        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY;
+    case 13:
+        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
+    case 14:
+        return VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
+    default:
+        return VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
     }
 }
 
@@ -365,14 +535,22 @@ Shader::InputTopology ToInputTopology(u32 nvn_topology) {
 
 std::optional<Shader::CompareFunction> ToAlphaTestFunction(u32 nvn_alpha_func) {
     switch (nvn_alpha_func) {
-    case 1: return Shader::CompareFunction::Never;
-    case 2: return Shader::CompareFunction::Less;
-    case 3: return Shader::CompareFunction::Equal;
-    case 4: return Shader::CompareFunction::LessThanEqual;
-    case 5: return Shader::CompareFunction::Greater;
-    case 6: return Shader::CompareFunction::NotEqual;
-    case 7: return Shader::CompareFunction::GreaterThanEqual;
-    default: return std::nullopt; // ALWAYS (8) and invalid values: no alpha test
+    case 1:
+        return Shader::CompareFunction::Never;
+    case 2:
+        return Shader::CompareFunction::Less;
+    case 3:
+        return Shader::CompareFunction::Equal;
+    case 4:
+        return Shader::CompareFunction::LessThanEqual;
+    case 5:
+        return Shader::CompareFunction::Greater;
+    case 6:
+        return Shader::CompareFunction::NotEqual;
+    case 7:
+        return Shader::CompareFunction::GreaterThanEqual;
+    default:
+        return std::nullopt; // ALWAYS (8) and invalid values: no alpha test
     }
 }
 
@@ -523,8 +701,8 @@ VertexFormatInfo ResolveVertexFormat(bool must_emulate_scaled_formats, u32 nvn_f
     info.format = entry.integer;
     if (!must_emulate_scaled_formats) {
         // The shader expects a float input but the device cannot supply a scaled format.
-        info.type = unsigned_kind ? Shader::AttributeType::UnsignedInt
-                                  : Shader::AttributeType::SignedInt;
+        info.type =
+            unsigned_kind ? Shader::AttributeType::UnsignedInt : Shader::AttributeType::SignedInt;
         info.scaled_without_support = true;
     } else {
         // The recompiler converts the raw integer itself.
@@ -540,15 +718,14 @@ void MakeKeyState(GraphicsFixedState& state, VertexInputMode mode,
     if (mode == VertexInputMode::Dynamic) {
         for (u32 location = 0; location < MAX_VERTEX_ATTRIBUTES; ++location) {
             const u32 format = VCN::VertexAttribState::Format(state.attributes[location]);
-            state.vertex_types[location] = static_cast<u8>(
-                ResolveVertexFormat(must_emulate_scaled_formats, format).type);
+            state.vertex_types[location] =
+                static_cast<u8>(ResolveVertexFormat(must_emulate_scaled_formats, format).type);
         }
     }
     Disk::CanonicalizeState(state, mode);
 }
 
-Shader::AttributeType VertexAttributeType(const GraphicsFixedState& key_state,
-                                          VertexInputMode mode,
+Shader::AttributeType VertexAttributeType(const GraphicsFixedState& key_state, VertexInputMode mode,
                                           bool must_emulate_scaled_formats, u32 location) {
     if (mode == VertexInputMode::Dynamic) {
         const u8 type = key_state.vertex_types[location];
@@ -560,8 +737,8 @@ Shader::AttributeType VertexAttributeType(const GraphicsFixedState& key_state,
     return ResolveVertexFormat(must_emulate_scaled_formats, format).type;
 }
 
-void BuildVertexInput(const Device& device, const GraphicsFixedState& layout,
-                      u32 attributes_read, VertexInput& out, std::vector<std::string>& issues) {
+void BuildVertexInput(const Device& device, const GraphicsFixedState& layout, u32 attributes_read,
+                      VertexInput& out, std::vector<std::string>& issues) {
     out.binding_count = 0;
     out.attribute_count = 0;
     out.used_streams = 0;
@@ -579,14 +756,14 @@ void BuildVertexInput(const Device& device, const GraphicsFixedState& layout,
         }
         const VertexFormatInfo format = ResolveVertexFormat(device, nvn_format);
         if (format.format == VK_FORMAT_UNDEFINED) {
-            issues.push_back(fmt::format("vertex attribute: NVNformat 0x{:x} is not a vertex format",
-                                         nvn_format));
+            issues.push_back(fmt::format(
+                "vertex attribute: NVNformat 0x{:x} is not a vertex format", nvn_format));
             continue;
         }
         if (format.scaled_without_support) {
-            issues.push_back(fmt::format(
-                "vertex attribute: scaled NVNformat 0x{:x} has no scaled Vulkan format (raw integer)",
-                nvn_format));
+            issues.push_back(fmt::format("vertex attribute: scaled NVNformat 0x{:x} has no scaled "
+                                         "Vulkan format (raw integer)",
+                                         nvn_format));
         }
         const u32 stream = VCN::VertexAttribState::StreamIndex(word);
         if (stream >= max_bindings || out.attribute_count >= max_attributes) {
@@ -625,10 +802,11 @@ void BuildVertexInput(const Device& device, const GraphicsFixedState& layout,
 
 /// Raw (untracked) global memory goes through buffer device addresses: the SPIR-V needs int64
 /// and the 64-bit and 32-bit views of the driver bank (descriptor aliasing).
-bool RawGlobalMemorySupported(const Device& device) {
+static bool RawGlobalMemorySupported(const Device& device) {
     static const bool disabled = std::getenv("EDEN_NX2_NVN_NO_RAW_GLOBAL") != nullptr;
     const bool supported = !disabled && device.IsBufferDeviceAddressSupported() &&
-                           device.IsShaderInt64Supported() && device.IsDescriptorAliasingSupported();
+                           device.IsShaderInt64Supported() &&
+                           device.IsDescriptorAliasingSupported();
     static const bool logged = [&] {
         LOG_INFO(Render_Vulkan,
                  "[nvn] raw global memory: {} (buffer device address {}, int64 {}, descriptor "
@@ -735,13 +913,12 @@ Shader::Profile MakeProfile(const Device& device) {
 
         .lower_left_origin_mode = false,
         .need_declared_frag_colors = false,
-        .need_gather_subpixel_offset = driver_id == VK_DRIVER_ID_AMD_PROPRIETARY ||
-                                       driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE ||
-                                       driver_id == VK_DRIVER_ID_MESA_RADV ||
-                                       driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS ||
-                                       driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA ||
-                                       driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
-                                       driver_id == VK_DRIVER_ID_MESA_TURNIP,
+        .need_gather_subpixel_offset =
+            driver_id == VK_DRIVER_ID_AMD_PROPRIETARY ||
+            driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE || driver_id == VK_DRIVER_ID_MESA_RADV ||
+            driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS ||
+            driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA ||
+            driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY || driver_id == VK_DRIVER_ID_MESA_TURNIP,
 
         .has_broken_spirv_clamp = driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS,
         .has_broken_spirv_position_input = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
@@ -806,8 +983,8 @@ Shader::HostTranslateInfo MakeHostInfo(const Device& device, const Shader::Profi
              Common::DiagRequest::TrySwitchEnabled("TRY_STORAGE_RAW_WRITE_THROUGH")),
         .compute_storage64 = std::getenv("EDEN_NX2_TRY_COMPUTE_STORAGE64") != nullptr &&
                              std::getenv("EDEN_NX2_TRY_COMPUTE_STORAGE64")[0] == '1',
-        // The recompiler's rescaling pass runs only while the Resolution setting scales (nvn_rescale.h):
-        // the replay pushes the words and the down factor it reads.
+        // The recompiler's rescaling pass runs only while the Resolution setting scales
+        // (nvn_rescale.h): the replay pushes the words and the down factor it reads.
         .skip_rescaling_pass = !Settings::values.resolution_info.active,
     };
     host_info.ApplyDescriptorLimitPolicy();
@@ -893,10 +1070,9 @@ void DescribeGraphicsPipeline(const Device& device, const GraphicsPipelineParams
         .pNext = nullptr,
         .flags = 0,
         .topology = topology,
-        .primitiveRestartEnable = (state.primitive_restart != 0 && restart_supported) ||
-                                          device.IsMoltenVK()
-                                      ? VK_TRUE
-                                      : VK_FALSE,
+        .primitiveRestartEnable =
+            (state.primitive_restart != 0 && restart_supported) || device.IsMoltenVK() ? VK_TRUE
+                                                                                       : VK_FALSE,
     };
     if (state.primitive_restart != 0 && !restart_supported) {
         issues.push_back("primitive restart: not supported for this topology on the device");
@@ -974,9 +1150,10 @@ void DescribeGraphicsPipeline(const Device& device, const GraphicsPipelineParams
     if (!first_vertex && device.SupportsProvokingVertexLastMode()) {
         out.rasterization.pNext = &out.provoking_vertex;
     } else if (!first_vertex) {
-        issues.push_back("provoking vertex: the device has no last-vertex mode "
-                         "(VK_EXT_provoking_vertex provokingVertexLast); flat outputs come from the "
-                         "first vertex");
+        issues.push_back(
+            "provoking vertex: the device has no last-vertex mode "
+            "(VK_EXT_provoking_vertex provokingVertexLast); flat outputs come from the "
+            "first vertex");
     }
 
     // --- multisample ----------------------------------------------------------------------
@@ -989,8 +1166,9 @@ void DescribeGraphicsPipeline(const Device& device, const GraphicsPipelineParams
         (VCN::MultisampleState::AlphaToCoverage(ms) &&
          !VCN::MultisampleState::AlphaToCoverageDither(ms)) ||
         VCN::MultisampleState::CoverageTruncationEnable(ms)) {
-        issues.push_back("multisample: coverage modulation / coverage-to-color / sample locations / "
-                         "undithered alpha-to-coverage / coverage truncation ignored");
+        issues.push_back(
+            "multisample: coverage modulation / coverage-to-color / sample locations / "
+            "undithered alpha-to-coverage / coverage truncation ignored");
     }
     out.sample_mask = state.sample_mask;
     const bool writes_color0 = (params.color_outputs_written & 1u) != 0;
@@ -1058,7 +1236,8 @@ void DescribeGraphicsPipeline(const Device& device, const GraphicsPipelineParams
         // NVN's r/g/b/a nibble bits are VkColorComponentFlagBits' R/G/B/A bits.
         const u64 blend = state.blend[slot];
         bool is_signed{};
-        const bool integer_target = IsIntegerColorFormat(static_cast<VkFormat>(targets.color[slot]), is_signed);
+        const bool integer_target =
+            IsIntegerColorFormat(static_cast<VkFormat>(targets.color[slot]), is_signed);
         const bool enabled = VCN::ColorState::BlendEnabled(state.color, static_cast<s32>(slot));
         if (enabled && integer_target) {
             blend_on_integer = true;
@@ -1110,14 +1289,10 @@ void DescribeGraphicsPipeline(const Device& device, const GraphicsPipelineParams
     };
 
     out.dynamic_states = {
-        VK_DYNAMIC_STATE_VIEWPORT,
-        VK_DYNAMIC_STATE_SCISSOR,
-        VK_DYNAMIC_STATE_LINE_WIDTH,
-        VK_DYNAMIC_STATE_DEPTH_BIAS,
-        VK_DYNAMIC_STATE_BLEND_CONSTANTS,
-        VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
-        VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
-        VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+        VK_DYNAMIC_STATE_VIEWPORT,           VK_DYNAMIC_STATE_SCISSOR,
+        VK_DYNAMIC_STATE_LINE_WIDTH,         VK_DYNAMIC_STATE_DEPTH_BIAS,
+        VK_DYNAMIC_STATE_BLEND_CONSTANTS,    VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+        VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
     };
     // Strides and divisors come from the vertex input binding descriptions of
     // vkCmdSetVertexInputEXT; VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE is not used.
@@ -1179,15 +1354,17 @@ vk::Pipeline CreateGraphicsPipeline(const Device& device, VkPipelineCache cache,
 
 TranslationSwitches CurrentTranslationSwitches() {
     // Each reader below is the code that consumes the switch while translating; keep the
-    // interpretation identical (shader_recompiler/backend/spirv, frontend/ampere/lower_to_maxwell.h).
-    // The settings are read live there, the EDEN_NX2_* ones once per process: both are the
-    // process-wide value when a cache opens. Settings that only change what is presented (HDR,
-    // upscaler, anti-aliasing, scaling filter, frame generation) or how big the output is
-    // (resolution: the HLE never rescales) are not read by the translation and are no input.
+    // interpretation identical (shader_recompiler/backend/spirv,
+    // frontend/ampere/lower_to_maxwell.h). The settings are read live there, the EDEN_NX2_* ones
+    // once per process: both are the process-wide value when a cache opens. Settings that only
+    // change what is presented (HDR, upscaler, anti-aliasing, scaling filter, frame generation) or
+    // how big the output is (resolution: the HLE never rescales) are not read by the translation
+    // and are no input.
     TranslationSwitches switches;
     switches.loop_safety_checks_disabled =
         Settings::values.disable_shader_loop_safety_checks.GetValue();
-    // Only while scaling: the rescaled SPIR-V bakes the factors in; at 1X the translation skips the pass.
+    // Only while scaling: the rescaled SPIR-V bakes the factors in; at 1X the translation skips the
+    // pass.
     const auto& scaling = Settings::values.resolution_info;
     switches.resolution_scaling_active = scaling.active;
     if (scaling.active) {
@@ -1217,11 +1394,11 @@ TranslationSwitches CurrentTranslationSwitches() {
     switches.raw_global_fast = VideoCommon::RawGlobalFastEnabled();
     switches.direct_unused_atomics =
         Common::DiagRequest::TrySwitchEnabled("TRY_DIRECT_UNUSED_ATOMICS");
-    switches.native_f32_atomics =
-        Common::DiagRequest::TrySwitchEnabled("TRY_NATIVE_F32_ATOMICS");
+    switches.native_f32_atomics = Common::DiagRequest::TrySwitchEnabled("TRY_NATIVE_F32_ATOMICS");
     switches.atomic_reserve = Common::DiagRequest::TrySwitchEnabled("TRY_ATOMIC_RESERVE");
     switches.ro_mirror_exact = Common::DiagRequest::TrySwitchEnabled("TRY_RO_MIRROR_EXACT");
-    switches.storage_raw_write_through = Common::DiagRequest::TrySwitchEnabled("TRY_STORAGE_RAW_WRITE_THROUGH");
+    switches.storage_raw_write_through =
+        Common::DiagRequest::TrySwitchEnabled("TRY_STORAGE_RAW_WRITE_THROUGH");
     return switches;
 }
 u64 TrySwitchesHash() {
@@ -1234,19 +1411,20 @@ u64 TrySwitchesHash() {
            (u64{Common::DiagRequest::TrySwitchDiffersFromDefault("TRY_NATIVE_F32_ATOMICS")} << 2) |
            (u64{Common::DiagRequest::TrySwitchDiffersFromDefault("TRY_ATOMIC_RESERVE")} << 3) |
            (u64{Common::DiagRequest::TrySwitchDiffersFromDefault("TRY_RO_MIRROR_EXACT")} << 4) |
-           (u64{Common::DiagRequest::TrySwitchDiffersFromDefault(
-                "TRY_STORAGE_RAW_WRITE_THROUGH")} << 5);
+           (u64{Common::DiagRequest::TrySwitchDiffersFromDefault("TRY_STORAGE_RAW_WRITE_THROUGH")}
+            << 5);
 }
 
 u64 HashTranslationSwitches(const TranslationSwitches& switches) {
     // The raw coverage, raw global fast and mirror write-through fields are only in the text when
     // on: the files without them stay valid. The resolution setting is in the text only while it
-    // scales (the NVN translation skips the rescaling pass at 1X, HostTranslateInfo::skip_rescaling_pass).
+    // scales (the NVN translation skips the rescaling pass at 1X,
+    // HostTranslateInfo::skip_rescaling_pass).
     const std::string text = fmt::format(
         "loop_off={} denorm_preserve={} nan={} undef_zero={} tensor={}/{}{}{}{}",
         switches.loop_safety_checks_disabled, switches.fp32_denorm_preserve,
-        static_cast<int>(switches.nan_outputs), switches.undef_is_zero,
-        switches.tensor_mode_set, switches.tensor_mode_set ? switches.tensor_mode : std::string{},
+        static_cast<int>(switches.nan_outputs), switches.undef_is_zero, switches.tensor_mode_set,
+        switches.tensor_mode_set ? switches.tensor_mode : std::string{},
         switches.raw_coverage ? " raw_coverage=1" : "",
         switches.raw_global_fast ? " raw_global_fast=1" : "",
         switches.ro_mirror_exact ? " ro_mirror_exact=1" : "",
