@@ -5,12 +5,19 @@
 // ASTC stand-ins held as BC1/BC3/BC7 (nvn_bc_encode.h, nvn_format.h ToBcStandin): the stand-in
 // choice, the chunking and block rules, a GPU round trip of block-linear ASTC blocks through the
 // replay's decoder, the BC scratch and the encoder into a BC image, and BC7 against BC3 on layered
-// mip chains and alpha cut-outs, with the encode cost (SKIP without a GPU).
+// mip chains and alpha cut-outs, with the encode cost (SKIP without a GPU). The smart selection
+// (nvn_format.h SmartBc): the ASTC channel classifier against the CPU decoder, the formats and
+// view swizzles, BC4/BC5/BC1 against BC3 and the refined endpoints, and the emulated path's
+// BC1/BC3 blocks against another build's encoder.
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <memory>
 #include <random>
@@ -26,6 +33,7 @@
 #include "video_core/renderer_vulkan/nvn/nvn_texture_layout.h"
 #include "video_core/texture_cache/decode_bc.h"
 #include "video_core/texture_cache/types.h"
+#include "video_core/textures/astc.h"
 #include "video_core/textures/decoders.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_instance.h"
@@ -164,19 +172,37 @@ std::vector<Rgba8Level> MakeMipChain(u32 width, u32 height, u32 layers, Texel&& 
 struct GpuEncodeResult {
     std::vector<Rgba8Level> decoded; ///< per level, as a sampler reads the BC image
     double gpu_ms{};                 ///< staging copies, encodes and block copies, every level
+    std::vector<u8> blocks;          ///< every level's blocks, when asked for (SmartEncode)
+};
+
+/// How EncodeOnGpu encodes beyond the stand-in kind (the smart selection's stand-ins).
+struct SmartEncode {
+    bool smart{};  ///< a smart stand-in: BC1 blocks never punch through (BcBlocksOf)
+    bool refine{}; ///< refined BC1/BC3 colour endpoints
+    std::span<const u32> spirv{}; ///< another build's bc_encoder.comp
+    bool keep_blocks{};           ///< fill GpuEncodeResult::blocks
 };
 
 /// Runs `levels` through the recorder's BC upload sequence (Recorder::UploadBcFromStaging and
 /// RecordBcUpload: RGBA8 copied into the scratch a chunk of layers at a time, encoded, the blocks
-/// copied into the level of a BC image), reads the image back and decodes it on the CPU.
+/// copied into the level of a BC image), reads the image back and decodes it on the CPU. BC4 and
+/// BC5 decode as their stand-in views read them: (R, R, R, 1) and (R, R, R, G).
 GpuEncodeResult EncodeOnGpu(const Vulkan::Device& device, std::span<const Rgba8Level> levels,
-                            AstcStandin kind, u32 quality, bool decode = true) {
+                            AstcStandin kind, u32 quality, bool decode = true,
+                            const SmartEncode& smart = {}) {
     using namespace Vulkan;
     const bool bc7 = kind == AstcStandin::Bc7;
-    const u32 block_bytes = kind == AstcStandin::Bc1 ? 8 : 16;
-    const VkFormat format = bc7 ? VK_FORMAT_BC7_UNORM_BLOCK
+    const u32 block_bytes = kind == AstcStandin::Bc1 || kind == AstcStandin::Bc4 ? 8 : 16;
+    const VkFormat format = bc7                        ? VK_FORMAT_BC7_UNORM_BLOCK
                             : kind == AstcStandin::Bc3 ? VK_FORMAT_BC3_UNORM_BLOCK
+                            : kind == AstcStandin::Bc4 ? VK_FORMAT_BC4_UNORM_BLOCK
+                            : kind == AstcStandin::Bc5 ? VK_FORMAT_BC5_UNORM_BLOCK
                                                        : VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+    const PixelFormat decode_format = bc7                        ? PixelFormat::BC7_UNORM
+                                      : kind == AstcStandin::Bc3 ? PixelFormat::BC3_UNORM
+                                      : kind == AstcStandin::Bc4 ? PixelFormat::BC4_UNORM
+                                      : kind == AstcStandin::Bc5 ? PixelFormat::BC5_UNORM
+                                                                 : PixelFormat::BC1_RGBA_UNORM;
     const u32 width = levels[0].width;
     const u32 height = levels[0].height;
     const u32 layers = levels[0].layers;
@@ -185,7 +211,7 @@ GpuEncodeResult EncodeOnGpu(const Vulkan::Device& device, std::span<const Rgba8L
     VmaAllocator vma = device.CreateThreadSafeAllocator();
     {
         MemoryAllocator allocator(device, vma);
-        const BcGpuEncoder encoder(device, bc7);
+        const BcGpuEncoder encoder(device, bc7, smart.spirv);
         u32 scratch_layers = 1;
         for (const BcChunk& chunk : SplitBcLayers(0, 0, layers, width, height)) {
             scratch_layers = (std::max)(scratch_layers, chunk.layers);
@@ -356,7 +382,8 @@ GpuEncodeResult EncodeOnGpu(const Vulkan::Device& device, std::span<const Rgba8L
                                       *scratch->blocks, blocks_size);
                 } else {
                     encoder.Record(cmd, *scratch->view, chunk.width, chunk.height, chunk.layers,
-                                   kind == AstcStandin::Bc3, *scratch->blocks, blocks_size);
+                                   BcBlocksOf(kind, smart.smart), smart.refine, *scratch->blocks,
+                                   blocks_size);
                 }
                 const VkMemoryBarrier blocks_written{
                     .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -414,27 +441,43 @@ GpuEncodeResult EncodeOnGpu(const Vulkan::Device& device, std::span<const Rgba8L
         const double period = device.GetPhysical().GetProperties().limits.timestampPeriod;
         result.gpu_ms = static_cast<double>(ticks[1] - ticks[0]) * period / 1e6;
 
-        if (decode) {
+        if (decode || smart.keep_blocks) {
             download.Invalidate();
+        }
+        if (smart.keep_blocks) {
+            result.blocks.assign(download.Mapped().data(),
+                                 download.Mapped().data() + download_size);
+        }
+        if (decode) {
             const u8* blocks = download.Mapped().data();
+            const u32 decoded_bytes = VideoCommon::ConvertedBytesPerBlock(decode_format);
             for (u32 level = 0; level < level_count; ++level) {
                 const Rgba8Level& texels = levels[level];
                 Rgba8Level decoded{texels.width, texels.height, layers,
                                    std::vector<u8>(texels.texels.size())};
                 const u64 layer_blocks = BcBlocksSize(texels.width, texels.height, 1, block_bytes);
-                const size_t layer_texels = size_t{texels.width} * texels.height * 4;
+                const size_t layer_pixels = size_t{texels.width} * texels.height;
+                std::vector<u8> channels(layer_pixels * decoded_bytes);
                 for (u32 layer = 0; layer < layers; ++layer) {
                     VideoCommon::BufferImageCopy copy{};
                     copy.image_subresource.num_layers = 1;
                     copy.image_extent = {texels.width, texels.height, 1};
                     copy.buffer_row_length = (texels.width + 3) / 4 * 4;
                     VideoCommon::DecompressBCn(
-                        std::span<const u8>{blocks, static_cast<size_t>(layer_blocks)},
-                        std::span<u8>{decoded.texels.data() + layer * layer_texels, layer_texels},
-                        copy,
-                        bc7 ? PixelFormat::BC7_UNORM
-                            : kind == AstcStandin::Bc3 ? PixelFormat::BC3_UNORM
-                                                       : PixelFormat::BC1_RGBA_UNORM);
+                        std::span<const u8>{blocks, static_cast<size_t>(layer_blocks)}, channels,
+                        copy, decode_format);
+                    u8* const out = decoded.texels.data() + layer * layer_pixels * 4;
+                    for (size_t i = 0; i < layer_pixels; ++i) {
+                        if (decoded_bytes == 4) {
+                            std::memcpy(out + i * 4, channels.data() + i * 4, 4);
+                            continue;
+                        }
+                        const u8 l = channels[i * decoded_bytes];
+                        out[i * 4] = l;
+                        out[i * 4 + 1] = l;
+                        out[i * 4 + 2] = l;
+                        out[i * 4 + 3] = decoded_bytes == 2 ? channels[i * 2 + 1] : u8{255};
+                    }
                     blocks += layer_blocks;
                 }
                 result.decoded.push_back(std::move(decoded));
@@ -910,7 +953,8 @@ TEST_CASE("NVN ASTC stand-in: block-linear ASTC decodes and re-encodes into a BC
                 };
                 cmd.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, texels_written);
-                encoder.Record(cmd, *scratch->view, width, height, LAYERS, bc3, *scratch->blocks,
+                encoder.Record(cmd, *scratch->view, width, height, LAYERS,
+                               bc3 ? BcBlocks::Bc3 : BcBlocks::Bc1, false, *scratch->blocks,
                                BcBlocksSize(width, height, LAYERS, block_bytes));
                 const VkMemoryBarrier blocks_written{
                     .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -1138,4 +1182,755 @@ TEST_CASE("NVN ASTC stand-in: BC7 encode cost of a 1365x1365 terrain array chunk
             report(quality == 0 ? "BC7 q0" : (quality == 1 ? "BC7 q1" : "BC7 q2"), result);
         }
     }
+}
+
+namespace {
+
+using Tegra::Texture::ASTC::Channels;
+
+/// Channel bits of decoded texels (the Channels values): R, G and B unequal somewhere / alpha
+/// below 255 somewhere.
+constexpr u32 COLOUR = 2;
+constexpr u32 ALPHA = 1;
+
+/// Decodes 16-byte ASTC blocks of footprint `bw` x `bh` with the CPU decoder, in rows of up to 256
+/// blocks; the texels of block i at i * bw * bh * 4.
+std::vector<u8> DecodeAstcBlocks(std::span<const u8> blocks, u32 bw, u32 bh) {
+    const u32 count = static_cast<u32>(blocks.size() / 16);
+    const u32 columns = (std::min)(count, 256u);
+    const u32 rows = (count + columns - 1) / columns;
+    std::vector<u8> padded(size_t{columns} * rows * 16, 0);
+    std::memcpy(padded.data(), blocks.data(), size_t{count} * 16);
+    std::vector<u8> texels(size_t{columns} * bw * rows * bh * 4);
+    Tegra::Texture::ASTC::Decompress(padded, columns * bw, rows * bh, 1, bw, bh, texels);
+    std::vector<u8> out(size_t{count} * bw * bh * 4);
+    for (u32 i = 0; i < count; ++i) {
+        const u32 row = i / columns;
+        const u32 column = i % columns;
+        for (u32 y = 0; y < bh; ++y) {
+            std::memcpy(&out[(size_t{i} * bw * bh + size_t{y} * bw) * 4],
+                        &texels[((size_t{row} * bh + y) * columns * bw + size_t{column} * bw) * 4],
+                        size_t{bw} * 4);
+        }
+    }
+    return out;
+}
+
+u32 TexelChannels(std::span<const u8> texels) {
+    u32 found = 0;
+    for (size_t i = 0; i + 4 <= texels.size(); i += 4) {
+        if (texels[i] != texels[i + 1] || texels[i + 1] != texels[i + 2]) {
+            found |= COLOUR;
+        }
+        if (texels[i + 3] != 255) {
+            found |= ALPHA;
+        }
+    }
+    return found;
+}
+
+/// A pseudo-random block: anything (variant 0); one partition with a luminance mode (1); two to
+/// four partitions sharing one luminance mode (2); two to four partitions with per-partition
+/// modes (3); a void-extent block, grey or not, opaque or not (4).
+std::array<u8, 16> RandomBlock(std::mt19937& random, u32 variant) {
+    constexpr std::array<u32, 4> LUMINANCE{0, 1, 4, 5};
+    std::array<u8, 16> block;
+    for (u8& byte : block) {
+        byte = static_cast<u8>(random());
+    }
+    u32 low;
+    std::memcpy(&low, block.data(), sizeof(low));
+    switch (variant % 5) {
+    case 0:
+        break;
+    case 1:
+        low = (low & ~(0x3u << 11) & ~(0xFu << 13)) | (LUMINANCE[random() % 4] << 13);
+        break;
+    case 2:
+        low = (low & ~(0x3u << 11) & ~(0x3Fu << 23)) | ((1 + random() % 3) << 11) |
+              (LUMINANCE[random() % 4] << 25);
+        break;
+    case 3:
+        low = (low & ~(0x3u << 11)) | ((1 + random() % 3) << 11);
+        if (((low >> 23) & 3) == 0) {
+            low |= 1u << 23;
+        }
+        break;
+    default: {
+        const u16 l = static_cast<u16>(random());
+        std::array<u16, 4> rgba{l, l, l, 0xFFFF};
+        if (random() % 2 != 0) {
+            rgba[random() % 3] = static_cast<u16>(random());
+        }
+        if (random() % 2 != 0) {
+            rgba[3] = static_cast<u16>(random());
+        }
+        return VoidExtentBlock(rgba);
+    }
+    }
+    std::memcpy(block.data(), &low, sizeof(low));
+    return block;
+}
+
+/// A block of mode `mode`, one partition, colour endpoint mode `cem`, the rest random.
+std::array<u8, 16> BlockWithMode(std::mt19937& random, u32 mode, u32 cem) {
+    std::array<u8, 16> block;
+    for (u8& byte : block) {
+        byte = static_cast<u8>(random());
+    }
+    u32 low;
+    std::memcpy(&low, block.data(), sizeof(low));
+    low = (low & ~0x1FFFFu) | mode | (cem << 13);
+    std::memcpy(block.data(), &low, sizeof(low));
+    return block;
+}
+
+/// The first block mode that decodes (no error colour) with one weight plane at footprint
+/// `bw` x `bh`, found with the CPU decoder alone: CEM 0 blocks of it decode to opaque grey, CEM 8
+/// ones to colours.
+u32 FindPlainMode(u32 bw, u32 bh) {
+    std::mt19937 random(99);
+    for (u32 mode = 0; mode < 2048; ++mode) {
+        std::vector<u8> blocks;
+        for (u32 i = 0; i < 8; ++i) {
+            for (const u32 cem : {0u, 8u}) {
+                const auto block = BlockWithMode(random, mode, cem);
+                blocks.insert(blocks.end(), block.begin(), block.end());
+            }
+        }
+        const std::vector<u8> texels = DecodeAstcBlocks(blocks, bw, bh);
+        const size_t per_block = size_t{bw} * bh * 4;
+        bool plain = true;
+        for (u32 i = 0; i < 16 && plain; ++i) {
+            const std::span<const u8> one{&texels[i * per_block], per_block};
+            const u32 found = TexelChannels(one);
+            plain = i % 2 == 0 ? found == 0 : found == COLOUR;
+        }
+        if (plain) {
+            return mode;
+        }
+    }
+    return 0;
+}
+
+std::vector<u8> Repeat(const std::array<u8, 16>& block, size_t count) {
+    std::vector<u8> result(count * 16);
+    for (size_t i = 0; i < count; ++i) {
+        std::memcpy(&result[i * 16], block.data(), 16);
+    }
+    return result;
+}
+
+Channels Classify(std::span<const u8> data, u32 bw = 8, u32 bh = 8, bool* empty = nullptr) {
+    return Tegra::Texture::ASTC::ClassifyChannels(data, bw, bh, empty);
+}
+
+/// What a sampler returns for component `swizzle` of a texel `rgba`.
+u8 Swizzled(const std::array<u8, 4>& rgba, VkComponentSwizzle swizzle, u32 component) {
+    switch (swizzle) {
+    case VK_COMPONENT_SWIZZLE_ZERO:
+        return 0;
+    case VK_COMPONENT_SWIZZLE_ONE:
+        return 255;
+    case VK_COMPONENT_SWIZZLE_R:
+        return rgba[0];
+    case VK_COMPONENT_SWIZZLE_G:
+        return rgba[1];
+    case VK_COMPONENT_SWIZZLE_B:
+        return rgba[2];
+    case VK_COMPONENT_SWIZZLE_A:
+        return rgba[3];
+    default:
+        return rgba[component]; // IDENTITY
+    }
+}
+
+/// Grey (L, L, L, 255) or grey with alpha (L, L, L, A) from a material layer.
+std::array<u8, 4> GreyTexel(u32 x, u32 y, u32 layer, bool alpha) {
+    const std::array<u8, 4> material = MaterialTexel(x, y, layer);
+    const u8 l = static_cast<u8>((material[0] * 3 + material[1] * 6 + material[2] + 5) / 10);
+    return {l, l, l, alpha ? material[3] : u8{255}};
+}
+
+/// The bc_encoder.comp SPIR-V of another build from `path`: its generated bc_encoder_comp_spv.h
+/// (the 0x........ words) or the raw .spv.
+std::vector<u32> LoadSpirv(const char* path) {
+    std::ifstream file(path, std::ios::binary);
+    const std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+    std::vector<u32> words;
+    if (text.size() >= 4 && static_cast<u8>(text[0]) == 0x03 && static_cast<u8>(text[1]) == 0x02 &&
+        static_cast<u8>(text[2]) == 0x23 && static_cast<u8>(text[3]) == 0x07) {
+        words.resize(text.size() / 4);
+        std::memcpy(words.data(), text.data(), words.size() * 4);
+        return words;
+    }
+    for (size_t at = text.find("0x"); at != std::string::npos; at = text.find("0x", at + 2)) {
+        if (at + 10 <= text.size()) {
+            words.push_back(static_cast<u32>(std::stoul(text.substr(at + 2, 8), nullptr, 16)));
+        }
+    }
+    return words;
+}
+
+} // Anonymous namespace
+
+TEST_CASE("NVN smart BC: the classifier never claims fewer channels than the CPU decoder gives",
+          "[nvn]") {
+    // Every block alone, against what the decoder makes of it: luminance-only blocks must decode
+    // grey, opaque ones opaque. Random blocks reach the error, dual-plane, multi-partition and
+    // void-extent paths; most of the luminance ones come from variants 1 and 2.
+    std::mt19937 random(2026);
+    for (const auto& [bw, bh] : {std::pair{4u, 4u}, std::pair{6u, 6u}, std::pair{8u, 8u},
+                                 std::pair{10u, 8u}, std::pair{12u, 12u}}) {
+        constexpr u32 COUNT = 30000;
+        std::vector<u8> blocks;
+        blocks.reserve(COUNT * 16);
+        for (u32 i = 0; i < COUNT; ++i) {
+            const auto block = RandomBlock(random, i);
+            blocks.insert(blocks.end(), block.begin(), block.end());
+        }
+        const std::vector<u8> texels = DecodeAstcBlocks(blocks, bw, bh);
+        const size_t per_block = size_t{bw} * bh * 4;
+        std::array<u32, 4> classes{};
+        u32 wrong = 0;
+        for (u32 i = 0; i < COUNT; ++i) {
+            const Channels channels = Classify({&blocks[i * 16], 16}, bw, bh);
+            const u32 decoded = TexelChannels({&texels[i * per_block], per_block});
+            ++classes[static_cast<size_t>(channels)];
+            if ((decoded & ~static_cast<u32>(channels)) != 0) {
+                if (wrong++ < 8) {
+                    WARN(fmt::format("{}x{} block {} variant {}: classified {}, decodes to {}", bw,
+                                     bh, i, i % 5, static_cast<int>(channels), decoded));
+                }
+            }
+        }
+        WARN(fmt::format("{}x{}: {} random blocks: L {}, LA {}, RGB {}, RGBA {}", bw, bh, COUNT,
+                         classes[0], classes[1], classes[2], classes[3]));
+        INFO(bw << "x" << bh);
+        CHECK(wrong == 0);
+        // The fuzz reaches every class.
+        for (const u32 count : classes) {
+            CHECK(count >= 100);
+        }
+    }
+}
+
+TEST_CASE("NVN smart BC: classes of hand-built blocks, mixed textures, padding and the early exit",
+          "[nvn]") {
+    // Void-extent blocks of chosen colours.
+    const auto grey = VoidExtentBlock({0x8000, 0x8000, 0x8000, 0xFFFF});
+    const auto grey_alpha = VoidExtentBlock({0x8000, 0x8000, 0x8000, 0x4000});
+    const auto colour = VoidExtentBlock({0x8000, 0x8001, 0x8000, 0xFFFF});
+    const auto colour_alpha = VoidExtentBlock({0x1000, 0x8000, 0xF000, 0xFFFE});
+    REQUIRE(Classify(grey) == Channels::Luminance);
+    REQUIRE(Classify(grey_alpha) == Channels::LuminanceAlpha);
+    REQUIRE(Classify(colour) == Channels::Rgb);
+    REQUIRE(Classify(colour_alpha) == Channels::Rgba);
+    // HDR void extent (mode bit 9) and reserved bits clear: both decoders fill the error colour.
+    auto hdr = grey;
+    hdr[1] |= 0x02;
+    REQUIRE(Classify(hdr) == Channels::Rgba);
+    auto reserved = grey;
+    reserved[1] &= ~0x0C;
+    REQUIRE(Classify(reserved) == Channels::Rgba);
+    REQUIRE(Tegra::Texture::ASTC::IsOpaque(reserved)); // IsOpaque calls the error colour opaque
+
+    // One-partition blocks of each endpoint mode, on a mode the decoder accepts.
+    for (const auto& [bw, bh] : {std::pair{4u, 4u}, std::pair{8u, 8u}, std::pair{12u, 12u}}) {
+        const u32 mode = FindPlainMode(bw, bh);
+        INFO(bw << "x" << bh << " block mode " << mode);
+        REQUIRE(mode != 0);
+        std::mt19937 random(bw * 31 + bh);
+        // CEM -> class: luminance 0 1, luminance+alpha 4 5, RGB 6 8 9, RGBA 10 12 13, HDR 2 3 7 11
+        // 14 15 (counted as RGBA).
+        constexpr std::array<Channels, 16> EXPECTED{
+            Channels::Luminance, Channels::Luminance,      Channels::Rgba, Channels::Rgba,
+            Channels::LuminanceAlpha, Channels::LuminanceAlpha, Channels::Rgb, Channels::Rgba,
+            Channels::Rgb,       Channels::Rgb,            Channels::Rgba, Channels::Rgba,
+            Channels::Rgba,      Channels::Rgba,           Channels::Rgba, Channels::Rgba,
+        };
+        for (u32 cem = 0; cem < 16; ++cem) {
+            for (u32 i = 0; i < 16; ++i) {
+                const auto block = BlockWithMode(random, mode, cem);
+                const Channels channels = Classify(block, bw, bh);
+                INFO("CEM " << cem);
+                CHECK(channels == EXPECTED[cem]);
+                const std::vector<u8> texels = DecodeAstcBlocks(block, bw, bh);
+                CHECK((TexelChannels(texels) & ~static_cast<u32>(channels)) == 0);
+            }
+        }
+        // A weight grid larger than the footprint decodes to the error colour: a 12x12 grid mode
+        // is RGBA at 4x4.
+        if (bw == 12) {
+            bool grid_found = false;
+            for (u32 m = 0; m < 2048 && !grid_found; ++m) {
+                const auto block = BlockWithMode(random, m, 0);
+                const std::vector<u8> big = DecodeAstcBlocks(block, 12, 12);
+                const std::vector<u8> small = DecodeAstcBlocks(block, 4, 4);
+                if (TexelChannels(big) == 0 && TexelChannels(small) == ALPHA &&
+                    std::all_of(small.begin(), small.end(), [](u8 v) { return v == 0; })) {
+                    grid_found = true;
+                    CHECK(Classify(block, 12, 12) == Channels::Luminance);
+                    CHECK(Classify(block, 4, 4) == Channels::Rgba);
+                }
+            }
+            CHECK(grid_found);
+        }
+    }
+
+    // Mixed textures: the union of the blocks' channels.
+    const auto join = [](std::initializer_list<std::array<u8, 16>> blocks) {
+        std::vector<u8> data;
+        for (const auto& block : blocks) {
+            data.insert(data.end(), block.begin(), block.end());
+        }
+        return data;
+    };
+    CHECK(Classify(join({grey, grey, grey_alpha})) == Channels::LuminanceAlpha);
+    CHECK(Classify(join({grey, colour, grey})) == Channels::Rgb);
+    CHECK(Classify(join({grey_alpha, colour})) == Channels::Rgba);
+    CHECK(Classify(join({colour, grey_alpha, grey})) == Channels::Rgba);
+
+    // All-zero blocks (block-linear padding) are skipped; other error blocks are RGBA.
+    const std::array<u8, 16> zero{};
+    bool empty = false;
+    CHECK(Classify(join({zero, zero, zero}), 8, 8, &empty) == Channels::Luminance);
+    CHECK(empty);
+    CHECK(Classify(join({zero, grey, zero}), 8, 8, &empty) == Channels::Luminance);
+    CHECK_FALSE(empty);
+    CHECK(Classify(join({colour, zero}), 8, 8, &empty) == Channels::Rgb);
+    CHECK_FALSE(empty);
+    auto error = zero;
+    error[9] = 1; // mode 0 (reserved) with data: not padding
+    CHECK(Classify(join({grey, error}), 8, 8, &empty) == Channels::Rgba);
+
+    // Cost: a whole scan of 64 MiB of grey or opaque colour blocks (what an L or BC1 texture
+    // needs), and the early exit when the first block is RGBA.
+    const size_t blocks = (size_t{64} << 20) / 16;
+    const std::vector<u8> grey_texture = Repeat(grey, blocks);
+    std::vector<u8> colour_texture = Repeat(colour, blocks);
+    std::mt19937 random(5);
+    const u32 mode = FindPlainMode(8, 8);
+    for (size_t i = 0; i < blocks; i += 3) {
+        // Endpoint blocks between the void-extent ones: the table and CEM path.
+        const auto block = BlockWithMode(random, mode, i % 2 == 0 ? 8 : 0);
+        std::memcpy(&colour_texture[i * 16], block.data(), 16);
+    }
+    std::vector<u8> early = grey_texture;
+    std::memcpy(early.data() + 16, colour_alpha.data(), 16);
+    const auto time = [](const std::vector<u8>& data, Channels& channels) {
+        const auto begin = std::chrono::steady_clock::now();
+        channels = Classify(data);
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
+            .count();
+    };
+    Channels channels{};
+    (void)time(grey_texture, channels); // warm the table and the caches
+    const double grey_ms = time(grey_texture, channels);
+    CHECK(channels == Channels::Luminance);
+    const double colour_ms = time(colour_texture, channels);
+    CHECK(channels == Channels::Rgb);
+    const double early_ms = time(early, channels);
+    CHECK(channels == Channels::Rgba);
+    const auto opaque_begin = std::chrono::steady_clock::now();
+    const bool opaque = Tegra::Texture::ASTC::IsOpaque(colour_texture);
+    const double opaque_ms = std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - opaque_begin)
+                                 .count();
+    CHECK(opaque);
+    WARN(fmt::format("classifier: 64 MiB of ASTC: grey void extents {:.1f} ms ({:.3f} ms/MiB), "
+                     "colour blocks {:.1f} ms ({:.3f} ms/MiB), IsOpaque on the same {:.1f} ms; "
+                     "RGBA in block 2: {:.4f} ms",
+                     grey_ms, grey_ms / 64.0, colour_ms, colour_ms / 64.0, opaque_ms, early_ms));
+    CHECK(early_ms * 20.0 < grey_ms);
+}
+
+TEST_CASE("NVN smart BC: IsOpaque answers as before", "[nvn]") {
+    // The classifier shares IsOpaque's mode table and endpoint-mode decoding: the emulated path's
+    // BC1 choice must not move. Single blocks of every variant, then runs of them; the hash of
+    // the answers is what IsOpaque of efe3468fc1 (before the sharing) gave on the same corpus,
+    // compared answer by answer when the classifier was added.
+    constexpr u64 BASE_HASH = 0x5ecccc9c77e1788full;
+    constexpr u32 BASE_OPAQUE = 125266;
+    std::mt19937 random(77);
+    std::vector<u8> corpus;
+    constexpr u32 COUNT = 200000;
+    corpus.reserve(COUNT * 16);
+    for (u32 i = 0; i < COUNT; ++i) {
+        const auto block = RandomBlock(random, i);
+        corpus.insert(corpus.end(), block.begin(), block.end());
+    }
+    u64 hash = 0xcbf29ce484222325ull;
+    u32 opaque = 0;
+    const auto note = [&](bool answer) {
+        hash = (hash ^ (answer ? 1u : 0u)) * 0x100000001b3ull;
+        opaque += answer ? 1 : 0;
+    };
+    for (u32 i = 0; i < COUNT; ++i) {
+        note(Tegra::Texture::ASTC::IsOpaque(std::span<const u8>{&corpus[i * 16], 16}));
+    }
+    for (u32 run = 0; run < COUNT / 8; ++run) {
+        note(Tegra::Texture::ASTC::IsOpaque(std::span<const u8>{&corpus[run * 8 * 16], 8 * 16}));
+    }
+    WARN(fmt::format("IsOpaque: {} of {} answers opaque, hash {:#018x}", opaque,
+                     COUNT + COUNT / 8, hash));
+    CHECK(opaque == BASE_OPAQUE);
+    CHECK(hash == BASE_HASH);
+}
+
+TEST_CASE("NVN smart BC: switches, formats and views", "[nvn]") {
+    // On by default with BC3 only; `0` turns a part (or everything) off.
+    const SmartBc on = ParseSmartBc(AstcStandin::Bc3, nullptr, nullptr, nullptr, nullptr);
+    REQUIRE((on.enabled && on.bc1 && on.bc45 && on.refine));
+    for (const AstcStandin other : {AstcStandin::Rgba8, AstcStandin::Bc1, AstcStandin::Bc7}) {
+        const SmartBc off = ParseSmartBc(other, nullptr, nullptr, nullptr, nullptr);
+        REQUIRE_FALSE((off.enabled || off.bc1 || off.bc45 || off.refine));
+    }
+    const SmartBc all_off = ParseSmartBc(AstcStandin::Bc3, "0", "1", "1", "1");
+    REQUIRE_FALSE((all_off.enabled || all_off.bc1 || all_off.bc45 || all_off.refine));
+    REQUIRE(SmartBcName(all_off) == "off");
+    const SmartBc no_bc1 = ParseSmartBc(AstcStandin::Bc3, "1", "0", nullptr, nullptr);
+    REQUIRE((no_bc1.enabled && !no_bc1.bc1 && no_bc1.bc45 && no_bc1.refine));
+    const SmartBc no_bc45 = ParseSmartBc(AstcStandin::Bc3, nullptr, nullptr, "0", nullptr);
+    REQUIRE((no_bc45.bc1 && !no_bc45.bc45));
+    const SmartBc no_refine = ParseSmartBc(AstcStandin::Bc3, nullptr, nullptr, nullptr, "0");
+    REQUIRE((no_refine.bc1 && no_refine.bc45 && !no_refine.refine));
+    REQUIRE(SmartBcName(on) == "on (BC1, BC4/BC5, refined endpoints)");
+
+    // Class -> stand-in, UNORM and sRGB, under each switch.
+    using C = Channels;
+    using S = AstcStandin;
+    REQUIRE(SmartStandinFor(C::Luminance, false, on) == S::Bc4);
+    REQUIRE(SmartStandinFor(C::LuminanceAlpha, false, on) == S::Bc5);
+    REQUIRE(SmartStandinFor(C::Rgb, false, on) == S::Bc1);
+    REQUIRE(SmartStandinFor(C::Rgba, false, on) == S::Bc3);
+    REQUIRE(SmartStandinFor(C::Luminance, true, on) == S::Bc1);
+    REQUIRE(SmartStandinFor(C::LuminanceAlpha, true, on) == S::Bc3);
+    REQUIRE(SmartStandinFor(C::Rgb, true, on) == S::Bc1);
+    REQUIRE(SmartStandinFor(C::Luminance, false, no_bc45) == S::Bc1);
+    REQUIRE(SmartStandinFor(C::LuminanceAlpha, false, no_bc45) == S::Bc3);
+    REQUIRE(SmartStandinFor(C::Rgb, false, no_bc1) == S::Bc3);
+    REQUIRE(SmartStandinFor(C::Luminance, false, no_bc1) == S::Bc4);
+    for (const C c : {C::Luminance, C::LuminanceAlpha, C::Rgb, C::Rgba}) {
+        REQUIRE(SmartStandinFor(c, false, all_off) == S::Bc3);
+    }
+    // What each stand-in holds (a re-upload of another class recreates it).
+    REQUIRE(StandinHolds(S::Bc4, C::Luminance));
+    REQUIRE_FALSE(StandinHolds(S::Bc4, C::LuminanceAlpha));
+    REQUIRE_FALSE(StandinHolds(S::Bc4, C::Rgb));
+    REQUIRE(StandinHolds(S::Bc5, C::LuminanceAlpha));
+    REQUIRE_FALSE(StandinHolds(S::Bc5, C::Rgb));
+    REQUIRE(StandinHolds(S::Bc1, C::Rgb));
+    REQUIRE(StandinHolds(S::Bc1, C::Luminance));
+    REQUIRE_FALSE(StandinHolds(S::Bc1, C::LuminanceAlpha));
+    REQUIRE_FALSE(StandinHolds(S::Bc1, C::Rgba));
+    REQUIRE(StandinHolds(S::Bc3, C::Rgba));
+
+    // Formats: BC4/BC5 UNORM only (sRGB falls back to BC1/BC3), 8 / 16 bytes per block.
+    const HostFormat unorm = AstcRgba8StandIn(PixelFormat::ASTC_2D_8X8_UNORM, false);
+    const HostFormat srgb = AstcRgba8StandIn(PixelFormat::ASTC_2D_8X8_SRGB, true);
+    const HostFormat bc4 = ToBcStandin(unorm, S::Bc4);
+    const HostFormat bc5 = ToBcStandin(unorm, S::Bc5);
+    REQUIRE(bc4.format == VK_FORMAT_BC4_UNORM_BLOCK);
+    REQUIRE(bc5.format == VK_FORMAT_BC5_UNORM_BLOCK);
+    REQUIRE((bc4.bc_standin && !bc4.attachable && !bc4.storage));
+    REQUIRE(BcStandinOf(bc4) == S::Bc4);
+    REQUIRE(BcStandinOf(bc5) == S::Bc5);
+    REQUIRE(BcStandinBlockBytes(bc4) == 8);
+    REQUIRE(BcStandinBlockBytes(bc5) == 16);
+    REQUIRE(ToBcStandin(srgb, S::Bc4).format == VK_FORMAT_BC1_RGBA_SRGB_BLOCK);
+    REQUIRE(ToBcStandin(srgb, S::Bc5).format == VK_FORMAT_BC3_SRGB_BLOCK);
+    // A smart stand-in changes format from BC3 to its class's and back.
+    REQUIRE(ToBcStandin(ToBcStandin(unorm, S::Bc3), S::Bc4).format == VK_FORMAT_BC4_UNORM_BLOCK);
+    REQUIRE(ToBcStandin(bc4, S::Bc3).format == VK_FORMAT_BC3_UNORM_BLOCK);
+    REQUIRE(std::string{AstcStandinName(S::Bc4)} == "BC4");
+    REQUIRE(std::string{AstcStandinName(S::Bc5)} == "BC5");
+
+    // Views: the storage's format, the texture's sRGB-ness; none in sRGB for BC4/BC5.
+    REQUIRE(ViewsBcStandin(VK_FORMAT_BC4_UNORM_BLOCK, VK_FORMAT_BC4_UNORM_BLOCK));
+    REQUIRE(ViewsBcStandin(VK_FORMAT_BC5_UNORM_BLOCK, VK_FORMAT_BC5_UNORM_BLOCK));
+    REQUIRE_FALSE(ViewsBcStandin(VK_FORMAT_BC4_UNORM_BLOCK, VK_FORMAT_BC5_UNORM_BLOCK));
+    REQUIRE_FALSE(ViewsBcStandin(VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_BC5_UNORM_BLOCK));
+    REQUIRE_FALSE(ViewsBcStandin(VK_FORMAT_UNDEFINED, VK_FORMAT_BC4_UNORM_BLOCK));
+    REQUIRE(StandinViewFormat(unorm, bc4) == VK_FORMAT_BC4_UNORM_BLOCK);
+    REQUIRE(StandinViewFormat(unorm, bc5) == VK_FORMAT_BC5_UNORM_BLOCK);
+    REQUIRE(StandinViewFormat(srgb, bc4) == VK_FORMAT_UNDEFINED);
+    const HostFormat bc1 = ToBcStandin(unorm, S::Bc1);
+    REQUIRE(StandinViewFormat(srgb, bc1) == VK_FORMAT_BC1_RGBA_SRGB_BLOCK);
+    REQUIRE(StandinViewFormat(unorm, ToBcStandin(srgb, S::Bc3)) == VK_FORMAT_BC3_UNORM_BLOCK);
+    REQUIRE(StandinViewFormat(srgb, ToBcStandin(unorm, S::Bc7)) == VK_FORMAT_BC7_SRGB_BLOCK);
+
+    // Encoder modes: a smart BC1 stand-in never punches through, the emulated path's BC1 may.
+    REQUIRE(BcBlocksOf(S::Bc1, true) == BcBlocks::Bc1Opaque);
+    REQUIRE(BcBlocksOf(S::Bc1, false) == BcBlocks::Bc1);
+    REQUIRE(BcBlocksOf(S::Bc3, true) == BcBlocks::Bc3);
+    REQUIRE(BcBlocksOf(S::Bc4, true) == BcBlocks::Bc4);
+    REQUIRE(BcBlocksOf(S::Bc5, true) == BcBlocks::Bc5);
+}
+
+TEST_CASE("NVN smart BC: BC4/BC5 view swizzles read what the RGBA8 stand-in gives", "[nvn]") {
+    // Proven on the mapping (no GPU sampling): for every guest swizzle of R, G, B, A, ZERO, ONE
+    // (and IDENTITY), the BC4 texel (L, 0, 0, 1) and the BC5 texel (L, A, 0, 1) read through the
+    // composed swizzle give what the RGBA8 stand-in's (L, L, L, 1) / (L, L, L, A) gives through
+    // the guest's. BC1/BC3/BC7 keep the guest swizzle.
+    constexpr std::array<VkComponentSwizzle, 7> CHOICES{
+        VK_COMPONENT_SWIZZLE_R,    VK_COMPONENT_SWIZZLE_G,   VK_COMPONENT_SWIZZLE_B,
+        VK_COMPONENT_SWIZZLE_A,    VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE,
+        VK_COMPONENT_SWIZZLE_IDENTITY,
+    };
+    constexpr u8 L = 77;
+    constexpr u8 A = 201;
+    u32 checked = 0;
+    u32 wrong = 0;
+    for (u32 index = 0; index < 7 * 7 * 7 * 7; ++index) {
+        const std::array<VkComponentSwizzle, 4> guest{CHOICES[index % 7], CHOICES[index / 7 % 7],
+                                                      CHOICES[index / 49 % 7],
+                                                      CHOICES[index / 343 % 7]};
+        for (const AstcStandin kind : {AstcStandin::Bc4, AstcStandin::Bc5}) {
+            const bool alpha = kind == AstcStandin::Bc5;
+            const std::array<u8, 4> rgba8{L, L, L, alpha ? A : u8{255}};
+            const std::array<u8, 4> bc{L, alpha ? A : u8{0}, 0, 255};
+            const std::array<VkComponentSwizzle, 4> composed = ComposeStandinSwizzle(guest, kind);
+            for (u32 c = 0; c < 4; ++c) {
+                ++checked;
+                if (Swizzled(rgba8, guest[c], c) != Swizzled(bc, composed[c], c)) {
+                    ++wrong;
+                }
+                CHECK(composed[c] != VK_COMPONENT_SWIZZLE_IDENTITY);
+            }
+        }
+        for (const AstcStandin kind : {AstcStandin::Bc1, AstcStandin::Bc3, AstcStandin::Bc7}) {
+            CHECK(ComposeStandinSwizzle(guest, kind) == guest);
+        }
+    }
+    WARN(fmt::format("view swizzles: {} components of {} guest swizzles checked", checked,
+                     7 * 7 * 7 * 7));
+    CHECK(wrong == 0);
+}
+
+TEST_CASE("NVN smart BC: BC4, BC5 and BC1 against BC3 on every layer of every level", "[nvn]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    const Vulkan::Device& device = *vulkan->device;
+    if (!BcGpuEncoder::SupportsBc45(device)) {
+        SKIP("the device cannot run the BC encoder into BC4/BC5");
+    }
+    // 341x341x8 down to 1x1 (partial blocks at every level), one chunk per level as the recorder.
+    const SmartEncode smart{.smart = true, .refine = true};
+    const auto table = [](const char* name, const std::vector<Rgba8Level>& levels,
+                          const GpuEncodeResult& ours, const GpuEncodeResult& theirs,
+                          double tolerance, bool alpha_too) {
+        double mean_gain = 0.0;
+        u32 samples = 0;
+        for (u32 level = 0; level < levels.size(); ++level) {
+            std::string line = fmt::format("{} level {} ({}x{}) L{} dB, BC3 in ():", name, level,
+                                           levels[level].width, levels[level].height,
+                                           alpha_too ? "/A" : "");
+            for (u32 layer = 0; layer < levels[level].layers; ++layer) {
+                const Psnr a = LayerPsnr(levels[level], ours.decoded[level], layer);
+                const Psnr b = LayerPsnr(levels[level], theirs.decoded[level], layer);
+                line += alpha_too ? fmt::format(" {:.1f}/{:.1f} ({:.1f}/{:.1f})", a.rgb, a.alpha,
+                                                b.rgb, b.alpha)
+                                  : fmt::format(" {:.1f} ({:.1f})", a.rgb, b.rgb);
+                INFO(name << " level " << level << " layer " << layer);
+                CHECK(a.rgb >= b.rgb - tolerance);
+                if (alpha_too) {
+                    CHECK(a.alpha >= b.alpha - 0.01);
+                }
+                mean_gain += (std::min)(a.rgb, 60.0) - (std::min)(b.rgb, 60.0);
+                ++samples;
+            }
+            WARN(line);
+        }
+        WARN(fmt::format("{}: mean gain over BC3 {:.2f} dB (capped at 60 dB)", name,
+                         mean_gain / samples));
+    };
+
+    // Grey: BC4 (the luminance alone, 8-bit endpoints) against BC3 (565 colour block).
+    const std::vector<Rgba8Level> grey =
+        MakeMipChain(341, 341, 8, [](u32 x, u32 y, u32 l) { return GreyTexel(x, y, l, false); });
+    const GpuEncodeResult grey_bc3 = EncodeOnGpu(device, grey, AstcStandin::Bc3, 0);
+    const GpuEncodeResult grey_bc4 = EncodeOnGpu(device, grey, AstcStandin::Bc4, 0, true, smart);
+    table("grey BC4", grey, grey_bc4, grey_bc3, 0.0, false);
+    for (const Rgba8Level& level : grey_bc4.decoded) {
+        for (size_t i = 3; i < level.texels.size(); i += 4) {
+            REQUIRE(level.texels[i] == 255);
+        }
+    }
+
+    // Grey with blend alpha: BC5 (L, A) against BC3; BC5's alpha block is BC3's.
+    const std::vector<Rgba8Level> grey_alpha =
+        MakeMipChain(341, 341, 8, [](u32 x, u32 y, u32 l) { return GreyTexel(x, y, l, true); });
+    const GpuEncodeResult la_bc3 = EncodeOnGpu(device, grey_alpha, AstcStandin::Bc3, 0);
+    const GpuEncodeResult la_bc5 =
+        EncodeOnGpu(device, grey_alpha, AstcStandin::Bc5, 0, true, smart);
+    table("grey+alpha BC5", grey_alpha, la_bc5, la_bc3, 0.0, true);
+
+    // Opaque colour: smart BC1 (four-colour blocks, refined endpoints) against BC3 as today.
+    const std::vector<Rgba8Level> opaque = MakeMipChain(341, 341, 8, [](u32 x, u32 y, u32 l) {
+        std::array<u8, 4> texel = MaterialTexel(x, y, l);
+        texel[3] = 255;
+        return texel;
+    });
+    const GpuEncodeResult rgb_bc3 = EncodeOnGpu(device, opaque, AstcStandin::Bc3, 0);
+    const GpuEncodeResult rgb_bc1 = EncodeOnGpu(device, opaque, AstcStandin::Bc1, 0, true, smart);
+    table("opaque BC1", opaque, rgb_bc1, rgb_bc3, 0.25, false);
+    size_t not_opaque = 0;
+    for (const Rgba8Level& level : rgb_bc1.decoded) {
+        for (size_t i = 3; i < level.texels.size(); i += 4) {
+            not_opaque += level.texels[i] != 255 ? 1 : 0;
+        }
+    }
+    CHECK(not_opaque == 0);
+    // The grey texture as smart BC1 (BC4/BC5 switched off): as good as BC3 too.
+    const GpuEncodeResult grey_bc1 = EncodeOnGpu(device, grey, AstcStandin::Bc1, 0, true, smart);
+    table("grey BC1", grey, grey_bc1, grey_bc3, 0.25, false);
+}
+
+TEST_CASE("NVN smart BC: refined BC1/BC3 endpoints against the box fit", "[nvn]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    const Vulkan::Device& device = *vulkan->device;
+    if (!BcGpuEncoder::Supported(device)) {
+        SKIP("the device cannot run the BC encoder");
+    }
+    const SmartEncode refined{.smart = true, .refine = true};
+    for (const u32 content : {0u, 1u, 2u}) {
+        const char* const name = content == 0 ? "opaque material"
+                                 : content == 1 ? "blend material"
+                                                : "smooth";
+        const std::vector<Rgba8Level> levels =
+            MakeMipChain(341, 341, 8, [content](u32 x, u32 y, u32 layer) {
+                if (content == 2) {
+                    const double blend = Noise(layer * 31 + 5, x, y, 48.0);
+                    const double grain = Noise(layer, x, y, 9.0);
+                    return std::array<u8, 4>{Clamp8(60.0 + 120.0 * blend),
+                                             Clamp8(110.0 - 40.0 * blend + 20.0 * grain),
+                                             Clamp8(40.0 + 50.0 * blend), 255};
+                }
+                std::array<u8, 4> texel = MaterialTexel(x, y, layer);
+                texel[3] = content == 0 ? 255 : texel[3];
+                return texel;
+            });
+        const GpuEncodeResult old_fit = EncodeOnGpu(device, levels, AstcStandin::Bc3, 0);
+        const GpuEncodeResult new_fit =
+            EncodeOnGpu(device, levels, AstcStandin::Bc3, 0, true, refined);
+        double gain = 0.0;
+        double worst = 99.0;
+        u32 samples = 0;
+        for (u32 level = 0; level < levels.size(); ++level) {
+            std::string line = fmt::format("{} BC3 level {} ({}x{}) RGB dB refined (box):", name,
+                                           level, levels[level].width, levels[level].height);
+            for (u32 layer = 0; layer < levels[level].layers; ++layer) {
+                const Psnr a = LayerPsnr(levels[level], new_fit.decoded[level], layer);
+                const Psnr b = LayerPsnr(levels[level], old_fit.decoded[level], layer);
+                line += fmt::format(" {:.2f} ({:.2f})", a.rgb, b.rgb);
+                INFO(name << " level " << level << " layer " << layer);
+                // The refined fit keeps the box fit of a block unless it measures less error with a
+                // float palette; decoders round the 1/3 and 2/3 entries their own way, which can
+                // cost a single-block level (2x2, 1x1) a fraction of a dB.
+                CHECK(a.rgb >= b.rgb - 0.25);
+                CHECK(a.alpha == b.alpha);
+                gain += (std::min)(a.rgb, 60.0) - (std::min)(b.rgb, 60.0);
+                worst = (std::min)(worst, a.rgb - b.rgb);
+                ++samples;
+            }
+            WARN(line);
+        }
+        WARN(fmt::format("{}: refined endpoints {:+.2f} dB RGB on average over {} layer/levels "
+                         "(least {:+.2f} dB)",
+                         name, gain / samples, samples, worst));
+    }
+}
+
+TEST_CASE("NVN smart BC: encode cost of a 1365x1365 terrain array chunk per format", "[nvn]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    const Vulkan::Device& device = *vulkan->device;
+    if (!BcGpuEncoder::SupportsBc45(device)) {
+        SKIP("the device cannot run the BC encoder into BC4/BC5");
+    }
+    constexpr u32 LAYERS = 9;
+    const std::vector<Rgba8Level> levels = MakeMipChain(1365, 1365, LAYERS, MaterialTexel);
+    REQUIRE(levels.size() == 11);
+    const SmartEncode smart{.smart = true, .refine = true};
+    struct Run {
+        const char* name;
+        AstcStandin kind;
+        bool smart;
+    };
+    constexpr std::array<Run, 6> RUNS{{
+        {"BC3 (box fit, as today)", AstcStandin::Bc3, false},
+        {"BC3 refined", AstcStandin::Bc3, true},
+        {"BC1 refined", AstcStandin::Bc1, true},
+        {"BC1 (box fit)", AstcStandin::Bc1, false},
+        {"BC4", AstcStandin::Bc4, true},
+        {"BC5", AstcStandin::Bc5, true},
+    }};
+    (void)EncodeOnGpu(device, levels, AstcStandin::Bc3, 0, false); // warm up
+    std::array<double, RUNS.size()> per_layer{};
+    for (size_t i = 0; i < RUNS.size(); ++i) {
+        double best = 1e9;
+        for (u32 repeat = 0; repeat < 3; ++repeat) {
+            const GpuEncodeResult result = EncodeOnGpu(device, levels, RUNS[i].kind, 0, false,
+                                                       RUNS[i].smart ? smart : SmartEncode{});
+            best = (std::min)(best, result.gpu_ms / LAYERS);
+        }
+        per_layer[i] = best;
+        WARN(fmt::format("{}: {:.3f} ms per 1365x1365 layer with 11 levels ({:.1f}x BC3; ~{:.0f} "
+                         "ms for 90 layers)",
+                         RUNS[i].name, best, best / per_layer[0], best * 90.0));
+    }
+    // The refined fit's budget: at most ~3x today's BC3 (with room for timing noise).
+    CHECK(per_layer[1] <= per_layer[0] * 3.5);
+}
+
+TEST_CASE("NVN smart BC: the emulated path's BC1/BC3 blocks are those of another build", "[nvn]") {
+    // EDEN_TEST_BC_ENCODER_BASE_SPV: another build's bc_encoder_comp_spv.h (or .spv). Without the
+    // refine bit, modes 0 (BC1, punch-through) and 1 (BC3) must give the same bits.
+    const char* const path = std::getenv("EDEN_TEST_BC_ENCODER_BASE_SPV");
+    if (path == nullptr) {
+        SKIP("EDEN_TEST_BC_ENCODER_BASE_SPV is not set");
+    }
+    const std::vector<u32> base = LoadSpirv(path);
+    REQUIRE(base.size() > 5);
+    REQUIRE(base[0] == 0x07230203);
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    const Vulkan::Device& device = *vulkan->device;
+    if (!BcGpuEncoder::Supported(device)) {
+        SKIP("the device cannot run the BC encoder");
+    }
+    const std::vector<std::vector<Rgba8Level>> inputs{
+        MakeMipChain(341, 341, 8, MaterialTexel),
+        MakeMipChain(213, 157, 3, CutoutTexel),
+        MakeMipChain(130, 70, 2, [](u32 x, u32 y, u32 l) { return GreyTexel(x, y, l, true); }),
+    };
+    size_t compared = 0;
+    for (size_t input = 0; input < inputs.size(); ++input) {
+        for (const AstcStandin kind : {AstcStandin::Bc1, AstcStandin::Bc3}) {
+            const GpuEncodeResult ours = EncodeOnGpu(device, inputs[input], kind, 0, false,
+                                                     SmartEncode{.keep_blocks = true});
+            const GpuEncodeResult theirs = EncodeOnGpu(
+                device, inputs[input], kind, 0, false,
+                SmartEncode{.spirv = base, .keep_blocks = true});
+            INFO("input " << input << " " << AstcStandinName(kind));
+            REQUIRE(ours.blocks.size() == theirs.blocks.size());
+            size_t differing = 0;
+            for (size_t i = 0; i < ours.blocks.size(); ++i) {
+                differing += ours.blocks[i] != theirs.blocks[i] ? 1 : 0;
+            }
+            CHECK(differing == 0);
+            compared += ours.blocks.size();
+        }
+    }
+    WARN(fmt::format("emulated-path BC1/BC3: {} bytes of blocks compared with {}", compared, path));
 }
