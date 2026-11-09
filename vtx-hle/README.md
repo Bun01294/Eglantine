@@ -81,3 +81,7 @@ does not have:
 - The bridge is informed by [nxnative](https://github.com/seedds/nxnative) by seedds (MIT). Files
   that contain code ported from it carry seedds's copyright notice and the MIT licence next to the
   GPL (`SPDX-License-Identifier: GPL-3.0-or-later AND MIT`).
+- The BC7 encoder of the ASTC stand-ins (`src/video_core/host_shaders/bc7_encoder.comp`) is ported
+  from `BC7Encode.hlsl` of [DirectXTex](https://github.com/microsoft/DirectXTex), Copyright (c)
+  Microsoft Corporation, MIT License. The file carries Microsoft's copyright notice and the MIT
+  licence next to the GPL (`SPDX-License-Identifier: GPL-3.0-or-later AND MIT`).

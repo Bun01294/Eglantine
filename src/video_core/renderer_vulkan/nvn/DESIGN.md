@@ -449,9 +449,51 @@ level (`Recorder::RecordBcUpload`): the GPU decoder fills the scratch from the p
 decoded staging is copied into it, a partial CopyBufferToTexture likewise (4x4-aligned regions
 only). Tile-backed sparse, 3D and multisampled ASTC storages stay RGBA8. A BC stand-in cannot be
 cleared, bound as an image, viewed in a non-BC format, or copied to/from another stand-in in regions
-that cut its 4x4 blocks (unsupported, logged); the storage census counts them as `as BC3 ...`.
-`renderer_vulkan.cpp` still pins the setting's override to Uncompressed so `MaxwellToVK` returns
-RGBA8; the replay reads the saved value itself.
+that cut its 4x4 blocks (unsupported, logged); the storage census counts them per format as
+`as BC3 ...`, `as BC7 ...`. `renderer_vulkan.cpp` still pins the setting's override to
+Uncompressed so `MaxwellToVK` returns RGBA8; the replay reads the saved value itself.
+`EDEN_NX2_NVN_ASTC_STANDIN=bc7` (the setting has no BC7) holds them as BC7 (same memory as BC3, far
+less loss) with `bc7_encoder.comp`, DirectXTex's BC7 compute encoder (MIT) ported to GLSL: a pass
+for modes 4/5/6, one per partitioned mode, then the encode, the best mode per block in the
+scratch's `modes` buffer between them (`BcGpuEncoder::RecordBc7`). `EDEN_NX2_NVN_BC7_QUALITY`
+picks the modes tried: 0 = 4/5/6, 1 (default) adds 1/3/7, 2 adds 0/2 (blocks modes 4-6 already
+hold within ~45 dB skip the partitioned passes). The port orients each subset's box along its
+covariance, checks the neighbours of the last pass's projected indices and refits the endpoints by
+least squares, and keeps alpha 0/255 exact and texels on their side of alpha tests at 64/128/192
+(an error penalty, endpoint rounding and the index choice). Its texel loops read no constant
+arrays: glslang copies such an array into local memory at every dynamically indexed read, which
+made the first port ~5x slower. Each upload's GPU time (decode or copy and encode) is
+measured with a timestamp pair per submission (`BcUploadTimes`): uploads of 16 MiB stand-ins or
+more get a log line, and every 60 presents a line sums the window's uploads.
+**Smart BC stand-ins.** With the BC3 kind (the default) each stand-in gets the BC format its ASTC
+blocks need (`SmartBc`, `SmartStandinFor`). `Tegra::Texture::ASTC::ClassifyChannels` (next to
+`IsOpaque`, sharing its 11-bit mode table and endpoint-mode decoding) reads each block's colour
+endpoint modes (CEMs) and void-extent colour: luminance CEMs (0, 1) only -> L, also
+luminance+alpha (4, 5) -> LA, colour CEMs without alpha -> RGB, else RGBA; HDR CEMs, error blocks
+and dual-plane blocks whose second plane is on R/G/B (for L/LA) count as colour or RGBA, all-zero
+blocks (block-linear padding) are skipped, and it stops at the first block that makes it RGBA.
+L -> BC4 (half of BC3), LA -> BC5 holding (L, A), RGB -> BC1 in four-colour mode (half), RGBA ->
+BC3; sRGB has no BC4/BC5, so sRGB L/LA go to BC1/BC3. `EnsureImage` classifies the guest bytes
+before the first image (`ChooseSmartStandin`; all zero: BC3 until a whole upload brings blocks).
+The ASTC decode of an L/LA texture is (L, L, L, 1) / (L, L, L, A), so a BC4/BC5 view composes each
+component of the guest's swizzle with (R, R, R, ONE) / (R, R, R, G) (`ComposeStandinSwizzle`, in
+`ViewKeyOf`; the view format comes from the storage, `StandinViewFormat`). Each later whole upload
+classifies again (`Recorder::RefitStandin`): bytes that no longer fit (alpha in BC1/BC4, colour in
+BC4/BC5) recreate the stand-in as BC3 for good (old image and views retired after the submission,
+logged, counted). A partial upload or a texture copy into or out of a smart stand-in first pins it
+to BC3 (`PinStandin`: copies need one format on both sides, and a later format change must not
+drop copied texels). An sRGB view rules BC4/BC5 out for its storage (one already BC4/BC5 is
+recreated at an upload the view forces). Overlap transfers between stand-ins of two formats are
+refused, as between RGBA8 and BC ones. With smart stand-ins the BC1/BC3 colour blocks are refined
+(`bc_encoder.comp` REFINE): the better of the box fit and the extremes along the principal axis,
+then least-squares refits and single 565-code steps, each kept when the error of the block's
+texels inside the level drops; the emulated path's modes (0, 1, no REFINE) encode the same bits
+as before. Switches:
+`EDEN_NX2_NVN_SMART_BC=0` (BC3 everywhere, box fit: the old behaviour), `EDEN_NX2_NVN_SMART_BC1=0`
+(opaque stays BC3), `EDEN_NX2_NVN_SMART_BC45=0` (L to BC1, LA to BC3), `EDEN_NX2_NVN_BC_REFINE=0`
+(box fit); the startup line names them. The census adds `as BC4` /
+`as BC5` and a `smart BC so far` line (scans per class, MiB scanned and scan time, re-classified,
+pinned by copies); the 60-present window line counts the same per window.
 Block-linear storages that need no decode (every texel size, BCn blocks the device holds, 2D, arrays,
 3D, mip chains) of 64 KiB or more are untiled on the GPU (`nvn_untile_gpu.cpp`, idea from
 switch2-recomp's "GPU untile"): the emulated path's `block_linear_unswizzle_3d_bcn.comp` (its

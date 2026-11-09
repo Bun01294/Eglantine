@@ -212,6 +212,11 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "intermediate format: RGBA8.\n"
               "BC1/BC3: The intermediate format will be recompressed to BC1 or BC3 format,\n"
               " saving VRAM but degrading image quality."));
+    INSERT(Settings, nvn_smart_bc, tr("Smart BC stand-ins (VTX-HLE only)"),
+           tr("Holds each ASTC texture in the BC format its channels need: BC4 for luminance,\n"
+              "BC5 for luminance and alpha, BC1 for opaque colour (half the VRAM of BC3) and\n"
+              "BC3 for the rest. Off: BC3 everywhere. Applied when the graphics path is VTX-HLE\n"
+              "and ASTC recompression is BC3; needs a restart."));
     INSERT(Settings, frame_pacing_mode, tr("Frame Pacing Mode (Vulkan only)"),
            tr("Controls how the emulator manages frame pacing to reduce stuttering and make the "
               "frame rate smoother and more consistent."));

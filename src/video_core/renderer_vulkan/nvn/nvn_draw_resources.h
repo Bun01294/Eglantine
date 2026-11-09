@@ -427,6 +427,9 @@ struct DrawResources {
     VkImageView GetView(const Texture& texture, const ViewKey& key);
     /// Detaches the views of a destroyed texture so they can be released after its last use.
     std::shared_ptr<TextureViews> TakeViews(u64 serial);
+    /// Detaches the views of every texture over `storage`, whose image is being replaced, so they
+    /// can be released after its last use (the textures make new ones on the new image).
+    std::vector<vk::ImageView> TakeStorageViews(const Storage& storage);
 
     // --- feedback copies (a texture sampled while it is a render target of the draw) ---
     struct Scratch {

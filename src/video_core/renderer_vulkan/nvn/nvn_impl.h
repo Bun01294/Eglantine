@@ -331,6 +331,27 @@ struct Storage : std::enable_shared_from_this<Storage> {
     /// The image has STORAGE usage and extended usage so that `AstcGpuDecoder` can write its
     /// levels (ASTC stand-ins only). Whether it is used is decided per upload.
     bool astc_gpu{false};
+    /// A BC stand-in of the smart selection (nvn_format.h SmartBc): its format is chosen when the
+    /// image is created (EnsureImage classifies the guest's ASTC bytes; BC3 until then), and each
+    /// later whole upload classifies its bytes again (Recorder::RefitStandin).
+    bool smart_standin{false};
+    /// Kept at BC3 for good: a copy or partial upload into or out of it, or a re-upload whose
+    /// bytes did not fit the format chosen first. Nothing classifies it again.
+    bool standin_pinned{false};
+    /// The bytes classified when the image was created were all zero (not loaded yet): it stays
+    /// BC3 until a whole upload brings blocks, whose class then chooses the format.
+    bool standin_empty{false};
+    /// Classified by EnsureImage and not uploaded since: the first upload reads the same bytes.
+    bool standin_fresh{false};
+    /// An sRGB texture view of it exists: no BC4/BC5 (luminance to BC1, luminance+alpha to BC3).
+    bool standin_srgb_view{false};
+    /// A stand-in format change asked for during a submission (smart BC's classification at an
+    /// upload). Recreating the image now would leave the bindings already recorded this frame with
+    /// a view key of the old BC format (invalid usage: a view of another BC class than its image's
+    /// loses the device on NVIDIA), so the change is applied at the start of the next submission.
+    std::optional<AstcStandin> pending_standin;
+    /// The class the format was chosen for (Rgba when kept at BC3).
+    Tegra::Texture::ASTC::Channels standin_class{Tegra::Texture::ASTC::Channels::Rgba};
     /// Tile-granular backing of a large sparse texture in a virtual pool (nvn_sparse.h): the image
     /// is a sparse residency image bound per mapped tile, and the whole-storage upload and
     /// change-check paths do not apply. Null for ordinary storages.
@@ -415,6 +436,8 @@ struct InFlight {
     std::unique_ptr<CounterFlight> counters;
     /// GPU timestamps of this submission (EDEN_NX2_NVN_GPU_PROFILE); null when the profiler is off.
     std::unique_ptr<GpuProf::Flight> gpu_prof;
+    /// GPU time of this submission's BC stand-in uploads; null until one is recorded.
+    std::unique_ptr<BcUploadTimes> bc_times;
 
     /// A capture of the presented picture (EDEN_NX2_FRAME_CAPTURE), written at completion.
     struct Capture {
@@ -998,6 +1021,8 @@ struct Context::Impl {
     mutable std::array<ResolveSlot, 16> resolve_cache{};
     mutable u32 resolve_next{0};
     std::vector<Retired> retired;
+    /// Stand-ins whose format change waits for the next submission (Storage::pending_standin).
+    std::vector<std::weak_ptr<Storage>> pending_standins;
     /// Storages of one pool, for overlap resolution.
     struct PoolIndex {
         std::multimap<u64, Storage*> spans; ///< begin offset -> cached storage
@@ -1266,6 +1291,48 @@ struct Context::Impl {
     std::shared_ptr<BcScratch> bc_scratch;
     bool bc_scratch_failed_logged{false};
     [[nodiscard]] std::shared_ptr<BcScratch> AcquireBcScratch(u32 width, u32 height, u32 layers);
+    /// EDEN_NX2_NVN_BC7_QUALITY (nvn_bc_encode.h) for BC7 stand-ins.
+    u32 bc7_quality{BC7_QUALITY_DEFAULT};
+    /// The smart BC stand-in selection (EDEN_NX2_NVN_SMART_BC*, nvn_format.h SmartBc).
+    SmartBc smart_bc{};
+    /// Smart stand-ins: classifications by Tegra::Texture::ASTC::Channels (index 4: all-zero
+    /// bytes), the guest bytes they scanned and the time it took, stand-ins recreated as BC3
+    /// because new bytes did not fit (RefitStandin) or pinned there by a copy, and the same for
+    /// the window ProcessPresent logs.
+    struct SmartBcCounts {
+        std::array<std::atomic<u64>, 5> classes{};
+        std::atomic<u64> scan_bytes{};
+        std::atomic<u64> scan_ns{};
+        std::atomic<u64> refits{};
+        std::atomic<u64> pinned{};
+    };
+    SmartBcCounts smart_total;
+    SmartBcCounts smart_window;
+    /// Classifies `size` guest bytes of smart stand-in `s` (counted, timed); `empty` when all
+    /// were zero.
+    Tegra::Texture::ASTC::Channels ClassifyStandin(const Storage& s, const u8* data, u64 size,
+                                                   bool& empty);
+    /// Chooses the format of smart stand-in `s` from the guest bytes under it before its image is
+    /// created (EnsureImage); BC3 when they cannot be read.
+    void ChooseSmartStandin(Storage& s);
+    /// Stand-in `s` (no image) as `standin`, its memory estimate updated.
+    void SetStandin(Storage& s, AstcStandin standin);
+    /// GPU time of the BC stand-in uploads (BcUploadTimes, timestamps per submission): false when
+    /// the graphics queue has no timestamps. CompleteBcTimes (completion thread) logs the uploads
+    /// of BC_TIMED_LOG_BYTES or more and adds every one to the window ProcessPresent logs.
+    bool bc_timing{false};
+    double bc_timestamp_period{1.0};
+    u64 bc_timestamp_mask{~u64{0}};
+    struct BcTimeWindow {
+        std::atomic<u64> uploads{};
+        std::atomic<u64> untimed{};
+        std::atomic<u64> bytes{};
+        std::atomic<u64> gpu_ns{};
+        std::atomic<u64> max_ns{};
+    } bc_window;
+    u64 bc_window_first_present{};
+    void CompleteBcTimes(const BcUploadTimes& times);
+    void LogBcTimeWindow(u64 present);
     /// Block-linear untiling on the GPU (nvn_untile_gpu.h), created like the ASTC decoder on a
     /// worker at startup; uploads before it is ready untile on the CPU. Null when creation failed.
     bool untile_gpu_enabled{false};

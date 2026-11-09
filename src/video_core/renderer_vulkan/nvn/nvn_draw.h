@@ -916,6 +916,7 @@ private:
         const Texture* texture{};
         u64 serial{};
         const Storage* storage{};
+        VkFormat storage_format{};
         u32 kind{~0u};
         bool compatible{};
         ViewKey key{};

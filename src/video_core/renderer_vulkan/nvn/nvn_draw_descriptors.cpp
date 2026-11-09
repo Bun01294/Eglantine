@@ -708,14 +708,17 @@ bool DrawContext::ViewKeyOf(const Texture& texture, const Storage& s, Shader::Te
     const u32 kind = static_cast<u32>(type) << 1 | (is_image ? 1u : 0u);
     const size_t hash = (reinterpret_cast<uintptr_t>(&texture) >> 4) * 31 + kind;
     ViewSlot& slot = view_slots[hash % view_slots.size()];
+    // A smart BC stand-in's storage can change format (Recorder::RefitStandin): it is in the key.
     if (slot.texture == &texture && slot.serial == texture.serial && slot.storage == &s &&
-        slot.kind == kind) {
+        slot.kind == kind && slot.storage_format == s.host.format) {
         key = slot.key;
         return slot.compatible;
     }
     const u32 level_base = texture.desc.view.set_levels ? texture.desc.view.base_level : 0;
     key = ViewKey{};
-    key.format = texture.host.format;
+    // A BC stand-in is viewed in its storage's BC format (each storage chooses its own), with the
+    // texture object's sRGB-ness.
+    key.format = s.host.bc_standin ? StandinViewFormat(texture.host, s.host) : texture.host.format;
     key.aspect = s.aspect;
     if (s.host.depth && s.host.stencil) {
         const bool want_stencil = texture.desc.stencil ||
@@ -737,8 +740,11 @@ bool DrawContext::ViewKeyOf(const Texture& texture, const Storage& s, Shader::Te
     const u32 layer_total = texture.desc.view.set_layers ? texture.desc.view.nlayers : total_layers;
     key.base_layer = (std::min)(layer_base, total_layers - 1);
     const u32 layer_count = (std::max)(1u, (std::min)(layer_total, total_layers - key.base_layer));
-    // A storage image view must have the identity swizzle (0 = IDENTITY).
-    key.swizzle = is_image ? 0 : PackSwizzle(TextureSwizzle(texture));
+    // A storage image view must have the identity swizzle (0 = IDENTITY). A BC4/BC5 stand-in holds
+    // the decoded (L, L, L, A) as R / RG: its swizzle maps that back under the guest's.
+    key.swizzle = is_image ? 0
+                           : PackSwizzle(ComposeStandinSwizzle(TextureSwizzle(texture),
+                                                               BcStandinOf(s.host)));
     bool compatible = true;
     switch (type) {
     case Shader::TextureType::Color1D:
@@ -798,13 +804,14 @@ bool DrawContext::ViewKeyOf(const Texture& texture, const Storage& s, Shader::Te
         }
     }
     if (s.host.bc_standin && !ViewsBcStandin(key.format, s.host.format)) {
-        // A view of another format than the BC stand-in's (a reinterpretation of the ASTC bytes)
-        // cannot address its blocks.
+        // A view of another format than the BC stand-in's (a reinterpretation of the ASTC bytes,
+        // an sRGB view of a BC4/BC5 one) cannot address its blocks.
         compatible = false;
     }
     slot.texture = &texture;
     slot.serial = texture.serial;
     slot.storage = &s;
+    slot.storage_format = s.host.format;
     slot.kind = kind;
     slot.compatible = compatible;
     slot.key = key;

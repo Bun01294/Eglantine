@@ -425,6 +425,19 @@ void Complete(const Readback& readback, std::span<const u8> pixels) {
                  : bytes == 2 ? VK_FORMAT_R8G8_UNORM
                  : bytes == 8 ? VK_FORMAT_R16G16B16A16_SFLOAT
                               : VK_FORMAT_R8G8B8A8_UNORM;
+        if (readback.luminance && (bytes == 1 || bytes == 2)) {
+            std::vector<u8> expanded(decoded.size() / bytes * 4);
+            for (size_t i = 0; i < decoded.size() / bytes; ++i) {
+                const u8 l = decoded[i * bytes];
+                expanded[i * 4] = l;
+                expanded[i * 4 + 1] = l;
+                expanded[i * 4 + 2] = l;
+                expanded[i * 4 + 3] = bytes == 2 ? decoded[i * bytes + 1] : u8{255};
+            }
+            decoded = std::move(expanded);
+            pixels = decoded;
+            format = VK_FORMAT_R8G8B8A8_UNORM;
+        }
     }
     std::vector<u8> rgba;
     const bool converted =

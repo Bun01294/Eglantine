@@ -226,12 +226,78 @@ bool Context::Impl::StorageNeedsCommands(Storage& s, bool will_overwrite, u64 se
     return false;
 }
 
+Tegra::Texture::ASTC::Channels Context::Impl::ClassifyStandin(const Storage& s, const u8* data,
+                                                              u64 size, bool& empty) {
+    const BlockInfo block = FormatBlockInfo(s.desc.format);
+    const auto begin = std::chrono::steady_clock::now();
+    const Tegra::Texture::ASTC::Channels channels = Tegra::Texture::ASTC::ClassifyChannels(
+        std::span<const u8>{data, static_cast<size_t>(size)}, block.width, block.height, &empty);
+    const u64 ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now() - begin)
+                                        .count());
+    const size_t bucket = empty ? 4 : static_cast<size_t>(channels);
+    for (SmartBcCounts* counts : {&smart_total, &smart_window}) {
+        counts->classes[bucket].fetch_add(1, std::memory_order_relaxed);
+        counts->scan_bytes.fetch_add(size, std::memory_order_relaxed);
+        counts->scan_ns.fetch_add(ns, std::memory_order_relaxed);
+    }
+    return channels;
+}
+
+void Context::Impl::ChooseSmartStandin(Storage& s) {
+    s.standin_empty = false;
+    s.standin_fresh = false;
+    s.standin_class = Tegra::Texture::ASTC::Channels::Rgba;
+    const auto pool_it = pools.find(s.pool_serial);
+    if (pool_it == pools.end()) {
+        return;
+    }
+    const Pool& pool = *pool_it->second;
+    if ((!pool.pending.load(std::memory_order_acquire) && pool.backing == Pool::Backing::None) ||
+        s.pool_offset >= pool.size) {
+        return;
+    }
+    const u64 size = (std::min)(s.layout.size, pool.size - s.pool_offset);
+    std::vector<u8> scratch;
+    const u8* data = GuestBytes(pool, s.pool_offset, size, scratch);
+    if (data == nullptr) {
+        return;
+    }
+    bool empty = false;
+    const Tegra::Texture::ASTC::Channels channels = ClassifyStandin(s, data, size, empty);
+    s.standin_fresh = true;
+    if (empty) {
+        s.standin_empty = true; // not loaded yet: BC3 until a whole upload brings blocks
+        return;
+    }
+    s.standin_class = channels;
+    SetStandin(s, SmartStandinFor(channels,
+                                  VideoCore::Surface::IsPixelFormatSRGB(s.host.pixel_format) ||
+                                      s.standin_srgb_view,
+                                  smart_bc));
+}
+
+void Context::Impl::SetStandin(Storage& s, AstcStandin standin) {
+    s.host = ToBcStandin(s.host, standin);
+    const u32 block_bytes = BcStandinBlockBytes(s.host);
+    u64 bytes = 0;
+    for (u32 level = 0; level < s.levels; ++level) {
+        bytes += BcBlocksSize((std::max)(s.extent.width >> level, 1u),
+                              (std::max)(s.extent.height >> level, 1u), 1, block_bytes);
+    }
+    s.vram_bytes = bytes * s.layers;
+}
+
 bool Context::Impl::EnsureImage(Storage& s) {
     if (s.image) {
         return true;
     }
     if (s.image_failed) {
         return false;
+    }
+    // The first image of a smart stand-in (Recorder::RefitStandin chooses for later ones).
+    if (s.smart_standin && !s.standin_pinned && s.origin == StorageOrigin::None) {
+        ChooseSmartStandin(s);
     }
     try {
         const VkImageCreateInfo image_info{
@@ -1112,7 +1178,8 @@ void Context::Impl::LogStorageCensus() {
         u64 count{};
         u64 bytes{};
     };
-    Kind sparse, targets, depth, astc, astc_bc, other, gpu_written;
+    Kind sparse, targets, depth, astc, other, gpu_written;
+    std::array<Kind, ASTC_STANDIN_COUNT> astc_bc{}; // by AstcStandin
     u64 sparse_bound = 0;
     std::vector<const Storage*> largest;
     const auto add = [&](const Storage& s) {
@@ -1127,8 +1194,9 @@ void Context::Impl::LogStorageCensus() {
         ++kind.count;
         kind.bytes += s.vram_bytes;
         if (s.host.bc_standin) {
-            ++astc_bc.count;
-            astc_bc.bytes += s.vram_bytes;
+            Kind& bc = astc_bc[static_cast<size_t>(BcStandinOf(s.host))];
+            ++bc.count;
+            bc.bytes += s.vram_bytes;
         }
         if (s.sparse) {
             sparse_bound += s.sparse->BoundBytes();
@@ -1151,15 +1219,46 @@ void Context::Impl::LogStorageCensus() {
     std::partial_sort(largest.begin(), largest.begin() + top, largest.end(),
                       [](const Storage* a, const Storage* b) { return a->vram_bytes > b->vram_bytes; });
     const auto mib = [](u64 bytes) { return bytes >> 20; };
+    // The BC stand-ins by format ("as BC3 <MiB> (<n>)", one entry per format held), else what
+    // new ones become.
+    std::string as_bc;
+    for (const AstcStandin bc : {AstcStandin::Bc1, AstcStandin::Bc3, AstcStandin::Bc4,
+                                 AstcStandin::Bc5, AstcStandin::Bc7}) {
+        const Kind& held = astc_bc[static_cast<size_t>(bc)];
+        if (held.count != 0) {
+            as_bc += fmt::format("{}as {} {} ({})", as_bc.empty() ? "" : ", ", AstcStandinName(bc),
+                                 mib(held.bytes), held.count);
+        }
+    }
+    if (as_bc.empty()) {
+        as_bc = fmt::format("as {} 0 (0)", AstcStandinName(astc_standin));
+    }
     LOG_INFO(Render_Vulkan,
              "[nvn] storage census: {} images, estimated MiB (count): sparse {} ({}, bound {}), depth {} "
-             "({}), colour targets {} ({}), compressed stand-ins {} ({}; as {} {} ({})), other {} "
+             "({}), colour targets {} ({}), compressed stand-ins {} ({}; {}), other {} "
              "({}); GPU-written {} ({}); cache {} MiB; sparse pages {} MiB",
              seen.size(), mib(sparse.bytes), sparse.count, mib(sparse_bound), mib(depth.bytes),
-             depth.count, mib(targets.bytes), targets.count, mib(astc.bytes), astc.count,
-             AstcStandinName(astc_standin), mib(astc_bc.bytes), astc_bc.count,
+             depth.count, mib(targets.bytes), targets.count, mib(astc.bytes), astc.count, as_bc,
              mib(other.bytes), other.count, mib(gpu_written.bytes), gpu_written.count,
              mib(storage_cache_bytes), sparse_pages ? mib(sparse_pages->UsedBytes()) : 0);
+    if (smart_bc.enabled) {
+        const auto total = [](const std::atomic<u64>& value) {
+            return value.load(std::memory_order_relaxed);
+        };
+        LOG_INFO(Render_Vulkan,
+                 "[nvn] smart BC so far: {} scans (L {}, LA {}, RGB {}, RGBA {}, all zero {}), "
+                 "{:.1f} MiB of ASTC in {:.1f} ms; {} re-classified to BC3, {} kept at BC3 by "
+                 "copies",
+                 total(smart_total.classes[0]) + total(smart_total.classes[1]) +
+                     total(smart_total.classes[2]) + total(smart_total.classes[3]) +
+                     total(smart_total.classes[4]),
+                 total(smart_total.classes[0]), total(smart_total.classes[1]),
+                 total(smart_total.classes[2]), total(smart_total.classes[3]),
+                 total(smart_total.classes[4]),
+                 static_cast<double>(total(smart_total.scan_bytes)) / 1048576.0,
+                 static_cast<double>(total(smart_total.scan_ns)) / 1e6, total(smart_total.refits),
+                 total(smart_total.pinned));
+    }
     {
         // The GPU-written images only the cache holds (no texture, no submission in flight), and
         // how many of the first ones a later GPU write replaced (TrimStorageCache drops those
@@ -1315,13 +1414,12 @@ void Context::Impl::LogStorageCensus() {
     }
     for (size_t i = 0; i < top; ++i) {
         const Storage& s = *largest[i];
-        LOG_INFO(Render_Vulkan, "[nvn] storage census: #{} {}x{}x{} lv {} fmt {:#x} flags {:#x} {} MiB{}{}{}",
+        LOG_INFO(Render_Vulkan, "[nvn] storage census: #{} {}x{}x{} lv {} fmt {:#x} flags {:#x} {} MiB{}{}{}{}",
                  i + 1, s.extent.width, s.extent.height, s.layers, s.levels, s.desc.format,
                  s.desc.flags, mib(s.vram_bytes), s.sparse ? " sparse" : "",
-                 s.host.bc_standin        ? (BcStandinBlockBytes(s.host) == 8 ? " stand-in BC1"
-                                                                                 : " stand-in BC3")
-                 : s.host.needs_transcode ? " stand-in"
-                                          : "",
+                 s.host.needs_transcode ? " stand-in" : "",
+                 s.host.bc_standin ? fmt::format(" {}", AstcStandinName(BcStandinOf(s.host)))
+                                   : std::string{},
                  s.origin == StorageOrigin::Gpu ? " gpu-written" : "");
     }
 }

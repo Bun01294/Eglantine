@@ -138,6 +138,7 @@ public:
             }
         }
         BeginSegment();
+        ApplyPendingStandins();
         draw.BeginSubmission(*this, EmptySubmission());
     }
 
@@ -476,11 +477,26 @@ public:
             // The BC blocks the stand-in holds, decoded as that BC format.
             const bool srgb = VideoCore::Surface::IsPixelFormatSRGB(storage.host.pixel_format);
             readback.bcn = true;
-            readback.pixel_format = bc_bytes == 8
-                                        ? (srgb ? VideoCore::Surface::PixelFormat::BC1_RGBA_SRGB
-                                                : VideoCore::Surface::PixelFormat::BC1_RGBA_UNORM)
-                                        : (srgb ? VideoCore::Surface::PixelFormat::BC3_SRGB
-                                                : VideoCore::Surface::PixelFormat::BC3_UNORM);
+            using VideoCore::Surface::PixelFormat;
+            switch (BcStandinOf(storage.host)) {
+            case AstcStandin::Bc1:
+                readback.pixel_format = srgb ? PixelFormat::BC1_RGBA_SRGB : PixelFormat::BC1_RGBA_UNORM;
+                break;
+            case AstcStandin::Bc7:
+                readback.pixel_format = srgb ? PixelFormat::BC7_SRGB : PixelFormat::BC7_UNORM;
+                break;
+            case AstcStandin::Bc4:
+                readback.pixel_format = PixelFormat::BC4_UNORM;
+                readback.luminance = true;
+                break;
+            case AstcStandin::Bc5:
+                readback.pixel_format = PixelFormat::BC5_UNORM;
+                readback.luminance = true;
+                break;
+            default:
+                readback.pixel_format = srgb ? PixelFormat::BC3_SRGB : PixelFormat::BC3_UNORM;
+                break;
+            }
             size = BcBlocksSize(width, height, 1, bc_bytes);
         } else if (VideoCore::Surface::IsPixelFormatBCn(storage.host.pixel_format)) {
             const BlockInfo block = FormatBlockInfo(storage.desc.format);
@@ -673,8 +689,29 @@ private:
     /// layers [0, chunk.layers) of the scratch (GENERAL layout), then they are encoded and copied
     /// into `s` at the chunk's level, layers and offset. `guest_contents`: the texels are the
     /// guest's bytes (an upload), not a GPU write. False when nothing could be recorded.
+    /// The flight's BcUploadTimes with room for one more upload (created on first use), null
+    /// without timestamps or when it is full (counted untimed).
+    BcUploadTimes* BcTimes();
     bool RecordBcUpload(Storage& s, std::span<const BcChunk> chunks, bool guest_contents,
                         const std::function<void(const BcChunk&, BcScratch&)>& fill);
+    /// A whole upload of smart stand-in `s` (nvn_format.h SmartBc) from guest bytes `data`: their
+    /// class must fit its format. A stand-in kept at BC3 while its bytes were zero takes the format
+    /// of the first blocks; one whose new bytes do not fit (alpha in BC1/BC4, colour in BC4/BC5)
+    /// is recreated as BC3 and stays so (logged once per texture, counted). A BC4/BC5 one with an
+    /// sRGB view (Storage::standin_srgb_view) changes to BC1/BC3. False when the new image could
+    /// not be created.
+    bool RefitStandin(Storage& s, const u8* data, u64 size);
+    /// Keeps smart stand-in `s` at BC3 for good (`op` copies or partially uploads it, which only
+    /// works within one format and must not lose texels to a later change of format): recreated
+    /// as BC3 when it is another format, its contents then uploaded again from the guest bytes by
+    /// the caller's EnsureContents. False when the new image could not be created.
+    bool PinStandin(Storage& s, std::string_view op);
+    /// Replaces the image of BC stand-in `s` by an empty one of `standin`'s format: the old image
+    /// and the views of every texture over it go after this submission.
+    bool Restandin(Storage& s, AstcStandin standin, bool deferred = false);
+    /// Applies the stand-in format changes a submission asked for (Storage::pending_standin): no
+    /// binding of the new submission can hold a key of the old format yet.
+    void ApplyPendingStandins();
     /// Untiles a block-linear storage that needs no decode on the GPU (nvn_untile_gpu.h): from its
     /// imported or GPU-only pool in place, else from a copy of the tiled bytes `data` in staging,
     /// into a device-local buffer copied into the image with the CPU path's regions. False (nothing
@@ -1905,6 +1942,9 @@ void Recorder::UploadStorage(Storage& s) {
     if (plan.pieces.empty() || plan.staging_size == 0) {
         return;
     }
+    if (s.host.bc_standin && !RefitStandin(s, data, size)) {
+        return; // no image to upload into (EnsureImage logged it)
+    }
     // Hash before the fill: bytes a decoder rewrites meanwhile must look changed at the next check
     // (the image holds what the fill read, the hash must not describe newer bytes).
     const bool cpu_visible = pool.IsVirtual() || (pool.flags & PoolFlag::CpuNoAccess) == 0;
@@ -2307,6 +2347,123 @@ void Recorder::UploadBcFromStaging(Storage& s, const UploadPlan& plan,
     }
 }
 
+bool Recorder::Restandin(Storage& s, AstcStandin standin, bool deferred) {
+    if (deferred) {
+        // The image keeps its format until the next submission (see Storage::pending_standin);
+        // its contents are re-uploaded once it is recreated, as this one's upload wrote the old one.
+        s.pending_standin = standin;
+        impl.pending_standins.push_back(s.shared_from_this());
+        return true;
+    }
+    if (s.image) {
+        // Earlier submissions and this one may still read the old image through its views.
+        auto old_image = std::make_shared<vk::Image>(std::move(s.image));
+        auto old_views = std::make_shared<std::vector<vk::ImageView>>(
+            impl.draw_resources ? impl.draw_resources->TakeStorageViews(s)
+                                : std::vector<vk::ImageView>{});
+        impl.retired.push_back({flight.seq, [old_image, old_views]() mutable {
+                                    old_views->clear();
+                                    *old_image = vk::Image{};
+                                }});
+        s.image = vk::Image{};
+        if (s.cached) {
+            impl.storage_cache_bytes -= (std::min)(impl.storage_cache_bytes, s.vram_bytes);
+        }
+    }
+    impl.SetStandin(s, standin);
+    s.current_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    s.contents_valid = false;
+    NoteTouched(s.shared_from_this()); // the cache trim of EnsureImage leaves it alone
+    return impl.EnsureImage(s);
+}
+
+bool Recorder::RefitStandin(Storage& s, const u8* data, u64 size) {
+    if (!s.smart_standin) {
+        return true;
+    }
+    const AstcStandin current = BcStandinOf(s.host);
+    if (s.standin_pinned) {
+        return current == AstcStandin::Bc3 || Restandin(s, AstcStandin::Bc3);
+    }
+    const bool srgb =
+        VideoCore::Surface::IsPixelFormatSRGB(s.host.pixel_format) || s.standin_srgb_view;
+    if (s.standin_fresh) {
+        s.standin_fresh = false; // EnsureImage classified these bytes a moment ago
+    } else {
+        bool empty = false;
+        const auto channels = impl.ClassifyStandin(s, data, size, empty);
+        if (!empty && s.standin_empty) {
+            // The first blocks of a stand-in created over zero bytes choose its format.
+            s.standin_empty = false;
+            s.standin_class = channels;
+            const AstcStandin chosen = SmartStandinFor(channels, srgb, impl.smart_bc);
+            return chosen == current || Restandin(s, chosen, true);
+        }
+        if (!empty && !StandinHolds(current, channels)) {
+            static constexpr std::array<const char*, 4> NAMES{"L", "LA", "RGB", "RGBA"};
+            const u64 refits = impl.smart_total.refits.fetch_add(1, std::memory_order_relaxed);
+            impl.smart_window.refits.fetch_add(1, std::memory_order_relaxed);
+            if (refits < 64) {
+                LOG_INFO(Render_Vulkan,
+                         "[nvn] smart BC: {} stand-in {}x{}x{} ({} levels, format {:#x}, pool "
+                         "{:#x} +{:#x}) was {}, new bytes are {}: recreated as BC3",
+                         AstcStandinName(current), s.extent.width, s.extent.height, s.layers,
+                         s.levels, s.desc.format, s.pool_serial, s.pool_offset,
+                         NAMES[static_cast<size_t>(s.standin_class)],
+                         NAMES[static_cast<size_t>(channels)]);
+            }
+            s.standin_pinned = true;
+            s.standin_class = Tegra::Texture::ASTC::Channels::Rgba;
+            return Restandin(s, AstcStandin::Bc3);
+        }
+    }
+    // An sRGB view made after the format was chosen (BuildTexture forced this upload).
+    if (s.standin_srgb_view && (current == AstcStandin::Bc4 || current == AstcStandin::Bc5)) {
+        return Restandin(s, SmartStandinFor(s.standin_class, true, impl.smart_bc), true);
+    }
+    return true;
+}
+
+void Recorder::ApplyPendingStandins() {
+    if (impl.pending_standins.empty()) {
+        return;
+    }
+    std::vector<std::weak_ptr<Storage>> pending{std::move(impl.pending_standins)};
+    impl.pending_standins.clear();
+    for (const std::weak_ptr<Storage>& weak : pending) {
+        const std::shared_ptr<Storage> storage = weak.lock();
+        if (!storage || !storage->pending_standin) {
+            continue;
+        }
+        const AstcStandin standin = *storage->pending_standin;
+        storage->pending_standin.reset();
+        Restandin(*storage, standin, false);
+    }
+}
+
+bool Recorder::PinStandin(Storage& s, std::string_view op) {
+    if (!s.smart_standin || s.standin_pinned) {
+        return true;
+    }
+    s.standin_pinned = true;
+    s.standin_empty = false;
+    s.standin_fresh = false;
+    s.standin_class = Tegra::Texture::ASTC::Channels::Rgba;
+    impl.smart_total.pinned.fetch_add(1, std::memory_order_relaxed);
+    impl.smart_window.pinned.fetch_add(1, std::memory_order_relaxed);
+    if (BcStandinOf(s.host) == AstcStandin::Bc3) {
+        return true;
+    }
+    LogOnce(fmt::format("smart BC: {} of a {} stand-in (format {:#x}) recreates it as BC3",
+                        op, AstcStandinName(BcStandinOf(s.host)), s.desc.format));
+    if (!s.image) {
+        impl.SetStandin(s, AstcStandin::Bc3);
+        return true;
+    }
+    // Only uploads wrote it: the caller's EnsureContents uploads the guest bytes again.
+    return Restandin(s, AstcStandin::Bc3);
+}
+
 bool Recorder::RecordBcUpload(Storage& s, std::span<const BcChunk> chunks, bool guest_contents,
                               const std::function<void(const BcChunk&, BcScratch&)>& fill) {
     BcGpuEncoder* const encoder = impl.BcEncoder();
@@ -2314,10 +2471,30 @@ bool Recorder::RecordBcUpload(Storage& s, std::span<const BcChunk> chunks, bool 
         return false;
     }
     const u32 block_bytes = BcStandinBlockBytes(s.host);
+    const AstcStandin kind = BcStandinOf(s.host);
+    if (kind == AstcStandin::Bc7 && !encoder->HasBc7()) {
+        return false;
+    }
     const bool saved = track_writes;
     track_writes = track_writes && !guest_contents;
     PrepareImages({{&s, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
     track_writes = saved;
+    // The upload's GPU time: a timestamp pair around its chunks (CompleteBcTimes).
+    BcUploadTimes* const times = BcTimes();
+    u32 query = 0;
+    if (times) {
+        query = static_cast<u32>(times->uploads.size() * 2);
+        times->uploads.push_back({
+            .width = s.extent.width,
+            .height = s.extent.height,
+            .layers = s.layers,
+            .levels = s.levels,
+            .format = s.desc.format,
+            .bytes = s.vram_bytes,
+            .kind = AstcStandinName(kind),
+        });
+        Cmd().WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *times->pool, query);
+    }
     bool recorded = false;
     for (const BcChunk& chunk : chunks) {
         const std::shared_ptr<BcScratch> scratch =
@@ -2359,9 +2536,17 @@ bool Recorder::RecordBcUpload(Storage& s, std::span<const BcChunk> chunks, bool 
                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, texels_written);
         const u32 blocks_x = (chunk.width + 3) / 4;
         const u32 blocks_y = (chunk.height + 3) / 4;
-        encoder->Record(Cmd(), *scratch->view, chunk.width, chunk.height, chunk.layers,
-                        block_bytes == 16, *scratch->blocks,
-                        BcBlocksSize(chunk.width, chunk.height, chunk.layers, block_bytes));
+        const u64 blocks_size = BcBlocksSize(chunk.width, chunk.height, chunk.layers, block_bytes);
+        if (kind == AstcStandin::Bc7) {
+            encoder->RecordBc7(Cmd(), *scratch->view, chunk.width, chunk.height, chunk.layers,
+                               impl.bc7_quality, *scratch->modes,
+                               BcBlocksSize(chunk.width, chunk.height, chunk.layers, 8),
+                               *scratch->blocks, blocks_size);
+        } else {
+            encoder->Record(Cmd(), *scratch->view, chunk.width, chunk.height, chunk.layers,
+                            BcBlocksOf(kind, s.smart_standin), s.smart_standin && impl.smart_bc.refine,
+                            *scratch->blocks, blocks_size);
+        }
         const VkMemoryBarrier blocks_written{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .pNext = nullptr,
@@ -2388,11 +2573,48 @@ bool Recorder::RecordBcUpload(Storage& s, std::span<const BcChunk> chunks, bool 
                                 region);
         recorded = true;
     }
+    if (times) {
+        Cmd().WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *times->pool, query + 1);
+    }
     if (recorded) {
         barrier_pending = true;
         impl.stats.astc_bc_encodes.fetch_add(1, std::memory_order_relaxed);
     }
     return recorded;
+}
+
+BcUploadTimes* Recorder::BcTimes() {
+    if (!impl.bc_timing) {
+        return nullptr;
+    }
+    if (!flight.bc_times) {
+        auto times = std::make_unique<BcUploadTimes>();
+        try {
+            times->pool = impl.device.GetLogical().CreateQueryPool({
+                .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                .queryCount = BcUploadTimes::CAPACITY * 2,
+                .pipelineStatistics = 0,
+            });
+        } catch (const vk::Exception&) {
+            impl.bc_timing = false;
+            return nullptr;
+        }
+        if (impl.device.IsHostQueryResetSupported()) {
+            impl.device.GetLogical().ResetQueryPool(*times->pool, 0, BcUploadTimes::CAPACITY * 2);
+        } else {
+            Cmd().ResetQueryPool(*times->pool, 0, BcUploadTimes::CAPACITY * 2);
+        }
+        times->uploads.reserve(BcUploadTimes::CAPACITY);
+        flight.bc_times = std::move(times);
+    }
+    if (flight.bc_times->uploads.size() >= BcUploadTimes::CAPACITY) {
+        impl.bc_window.untimed.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    return flight.bc_times.get();
 }
 
 bool Recorder::UploadUntileOnGpu(Storage& s, const UploadPlan& plan, Pool& pool, const u8* data,
@@ -3468,6 +3690,10 @@ bool Recorder::DecodeBufferToTexture(Storage& s, u32 level, u32 layer,
     impl.stats.decode_bytes.fetch_add(out_size, std::memory_order_relaxed);
     const bool covers = x == 0 && y == 0 && width == extent.width && height == extent.height &&
                         s.levels == 1 && s.layers == 1 && !is_3d;
+    if (s.host.bc_standin && !PinStandin(s, "CopyBufferToTexture")) {
+        Failed("CopyBufferToTexture", "the BC stand-in could not be recreated as BC3");
+        return false;
+    }
     EnsureContents(s, covers);
     if (s.host.bc_standin) {
         // 2D only (ToBcStandin): the slices are layers, decoded tightly one after the other.
@@ -3567,6 +3793,12 @@ void Recorder::CopyTextureToTexture(const VC::CopyTextureToTexturePayload& p) {
     u32 dst_layer{};
     if (!ResolveRef(p.src, src, src_owner, src_level, src_layer, "CopyTextureToTexture") ||
         !ResolveRef(p.dst, dst, dst_owner, dst_level, dst_layer, "CopyTextureToTexture")) {
+        return;
+    }
+    // Smart stand-ins of two classes hold different BC formats: copies are between BC3 ones.
+    if ((src->host.bc_standin && !PinStandin(*src, "CopyTextureToTexture")) ||
+        (dst->host.bc_standin && !PinStandin(*dst, "CopyTextureToTexture"))) {
+        Failed("CopyTextureToTexture", "a BC stand-in could not be recreated as BC3");
         return;
     }
     if (src->host.needs_transcode != dst->host.needs_transcode ||
@@ -5864,8 +6096,12 @@ void Context::Impl::ProcessSubmit(CmdSubmit&& submit) {
 }
 
 void Context::Impl::ProcessPresent(CmdPresent&& present) {
-    if (stats.presents.fetch_add(1, std::memory_order_relaxed) % 900 == 899) {
+    const u64 presented = stats.presents.fetch_add(1, std::memory_order_relaxed);
+    if (presented % 900 == 899) {
         LogStorageCensus();
+    }
+    if ((bc_timing || smart_bc.enabled) && presented % 60 == 59) {
+        LogBcTimeWindow(presented);
     }
     // Textures die and storages age without a new image being made: the trim looks at them here.
     TrimStorageCache(true);
