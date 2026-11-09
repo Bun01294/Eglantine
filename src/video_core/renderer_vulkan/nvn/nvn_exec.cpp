@@ -336,6 +336,7 @@ public:
         // copying their GPU-written contents back in from stale guest memory.
         condition_prefetch.Clear();
         host_barrier_needed = true;
+        flight.raw_writes = true;
         // A raw pointer reaches any range of the table: no submit-time uniform copy of them.
         impl.uniform_snapshots.NoteRawWrite(impl.raw_table.generation, impl.raw_table.entries,
                                             flight.seq);
@@ -1147,6 +1148,17 @@ bool Recorder::MirrorTakeCpuWrites(Pool& pool) {
     VC::GuestMemory* const memory = impl.guest.load(std::memory_order_acquire);
     if (memory == nullptr) {
         return false;
+    }
+    if (!pool.split_runs.empty()) {
+        // Raw stores reach a split pool's guest bytes past the tracker: once one completed, every
+        // page is hashed again before it is trusted.
+        const u64 raw_epoch = impl.split_raw_epoch.load(std::memory_order_acquire);
+        if (raw_epoch != pool.split_raw_epoch_seen) {
+            pool.split_raw_epoch_seen = raw_epoch;
+            for (Pool::MirrorPage& page : pool.mirror_pages) {
+                page.trusted = false;
+            }
+        }
     }
     if (pool.mirror_track == 0) {
         if (pool.mirror_track_tried) {

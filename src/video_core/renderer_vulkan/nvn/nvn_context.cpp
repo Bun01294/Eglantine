@@ -234,6 +234,7 @@ Context::Impl::Impl(const Device& device_, std::mutex& submit_mutex_,
         options.dispatch_order_by_barriers.value_or(Debug::Get().try_dispatch_order);
     flush_tracked = options.flush_tracked.value_or(Debug::Get().try_flush_tracked);
     mirror_hash_tracked = options.mirror_hash_tracked.value_or(!Debug::Get().mirror_hash_always);
+    raw_split_import.store(Debug::Get().raw_split_import, std::memory_order_relaxed);
     invalidate_wait_ms = options.invalidate_wait_ms.value_or(Debug::Get().try_invalidate_writeback);
     raw_keep_entries = options.raw_keep_entries.value_or(Debug::Get().try_raw_keep_entries);
     refused_shadow = options.refused_shadow.value_or(Debug::Get().try_refused_shadow);
@@ -1072,6 +1073,9 @@ void Context::Impl::CompleteMain() {
             // the work is done; the counter field was written by the GPU itself.
             counters_engine->Complete(*flight->counters, guest.load(std::memory_order_acquire));
         }
+        if (flight->raw_writes) {
+            split_raw_epoch.fetch_add(1, std::memory_order_release);
+        }
         if (flight->gpu_prof && gpu_profiler) {
             // Timestamps: read after the timeline value was reached, never on the replay thread.
             gpu_profiler->Complete(*flight->gpu_prof);
@@ -1359,6 +1363,8 @@ ContextStats Context::Stats() const {
         .pools_mirrored = s.pools_mirrored.load(relaxed),
         .pools_mirrored_discontiguous = s.pools_mirrored_discontiguous.load(relaxed),
         .pools_mirrored_no_import = s.pools_mirrored_no_import.load(relaxed),
+        .pools_split_imported = s.pools_split_imported.load(relaxed),
+        .split_runs = s.split_runs.load(relaxed),
         .mirror_uploads = s.mirror_uploads.load(relaxed),
         .mirror_upload_runs = s.mirror_upload_runs.load(relaxed),
         .mirror_upload_bytes = s.mirror_upload_bytes.load(relaxed),
@@ -1836,11 +1842,13 @@ std::string Context::DescribeState() const {
     }
     const auto& s = impl->stats;
     text += fmt::format(
-        " mem(storages new/reuse/evict={}/{}/{} uploads={} MB={} cpu check/change={}/{} "
+        " mem(storages new/reuse/evict={}/{}/{} split_import(pools/runs)={}/{} uploads={} MB={} "
+        "cpu check/change={}/{} "
         "hash_ms={} hash_MB={} (compressed {} dynamic {}) decode_ms={} decode_MB={} alias_xfer={} "
         "alias_seen={} virt={} astc gpu/fallback/bc={}/{}/{} untile gpu/direct/fallback={}/{}/{} "
         "untile_gpu_MB={} storage_cache(MB/superseded/aged/pressure_evicted)={}/{}/{}/{})",
         s.storages_created.load(), s.storages_reused.load(), s.storages_evicted.load(),
+        s.pools_split_imported.load(), s.split_runs.load(),
         s.uploads.load(), s.upload_bytes.load() >> 20, s.cpu_checks.load(), s.cpu_changes.load(),
         s.hash_ns.load() / 1'000'000, s.hash_bytes.load() >> 20,
         s.hash_bytes_compressed.load() >> 20, s.hash_bytes_dynamic.load() >> 20,
@@ -1916,6 +1924,9 @@ void Context::CollectStats(std::vector<VideoCommon::Nvn::SinkStat>& out) const {
     out.push_back({"pools_mirrored: guest storage is several host runs",
                    s.pools_mirrored_discontiguous});
     out.push_back({"pools_mirrored: host import unavailable or failed", s.pools_mirrored_no_import});
+    out.push_back({"pools_split_imported: several host runs, each imported (raw_split_import)",
+                   s.pools_split_imported});
+    out.push_back({"pools_split_imported: host runs imported", s.split_runs});
     out.push_back({"mirror uploads (range uses that copied pages)", s.mirror_uploads});
     out.push_back({"mirror uploads: copies (runs of pages)", s.mirror_upload_runs});
     out.push_back({"mirror uploads: KiB copied", s.mirror_upload_bytes >> 10});

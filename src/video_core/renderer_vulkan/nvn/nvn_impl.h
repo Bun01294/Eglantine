@@ -173,6 +173,20 @@ struct Pool {
     bool vram_mirror_refused{false};
     /// Virtual pools: runs by virtual offset, never overlapping.
     std::map<u64, VirtualRun> virtual_runs;
+    /// Mirror pools whose guest storage is several host runs (knob raw_split_import): each run
+    /// imported on its own, sorted by offset, covering the pool. Draws keep binding the mirror;
+    /// raw global memory reaches the guest bytes through these. Written under
+    /// Impl::backing_mutex before `pending` is cleared, never changed after.
+    struct SplitRun {
+        u64 offset{};
+        u64 size{};
+        ImportedBuffer imported;
+        u64 device_address{}; ///< 0 until the raw global table first needs it
+    };
+    std::vector<SplitRun> split_runs;
+    /// Impl::split_raw_epoch when this split pool's mirror pages were last made untrusted (a
+    /// completed raw store may have changed the guest bytes untracked). Replay thread.
+    u64 split_raw_epoch_seen{};
 
     [[nodiscard]] VkBuffer Handle() const noexcept {
         return backing == Backing::Imported ? *imported.buffer : *buffer;
@@ -389,6 +403,8 @@ struct InFlight {
     std::vector<std::shared_ptr<void>> keepalive;
     /// The raw global table the draws of this submission use (kept alive once through keepalive).
     const RawTableBuffer* raw_table_kept{nullptr};
+    /// A draw or dispatch of this submission stored to raw global memory (Impl::split_raw_epoch).
+    bool raw_writes{false};
     /// Host buffer chunks the draw path carved this submission's dynamic data from; returned to
     /// the free list by the completion thread.
     std::vector<std::shared_ptr<ArenaChunk>> arena;
@@ -661,6 +677,8 @@ struct Context::Impl {
         std::atomic<u64> pools_mirrored{};
         std::atomic<u64> pools_mirrored_discontiguous{}; ///< ... guest storage is several host runs
         std::atomic<u64> pools_mirrored_no_import{};     ///< ... host import unavailable or failed
+        std::atomic<u64> pools_split_imported{};         ///< ... several host runs, each imported
+        std::atomic<u64> split_runs{};                   ///< ... in this many runs
         std::atomic<u64> mirror_upload_bytes{};          ///< guest bytes copied into mirrors
         std::atomic<u64> mirror_upload_runs{};           ///< ... in this many copies
         std::atomic<u64> mirror_uploads{};               ///< UploadRange calls that copied anything
@@ -1191,6 +1209,13 @@ struct Context::Impl {
     /// construction): a dispatch after a dispatch waits for its shader writes only when a game
     /// barrier (or a command of the replay) came in between (Recorder::HostMarkDispatchWritten).
     bool dispatch_order_by_barriers{false};
+    /// EDEN_NX2_NVN_RAW_SPLIT_IMPORT (on unless =0; set at construction): a CPU-visible pool whose
+    /// guest storage is several host runs imports each run (BackPoolLocked, also on the backing
+    /// thread), so raw global memory reaches it.
+    std::atomic<bool> raw_split_import{true};
+    /// Bumped when a submission that stored to raw global memory completes: split pools' mirror
+    /// pages trusted before may be stale (Recorder::MirrorTakeCpuWrites).
+    std::atomic<u64> split_raw_epoch{0};
     /// BarrierMergeMask of ContextOptions::barrier_merge, else EDEN_NX2_TRY_BARRIER_MERGE (set at
     /// construction); 0 = off.
     u32 barrier_merge{0};
@@ -1358,6 +1383,10 @@ struct Context::Impl {
     /// Number of host runs (maximal ranges of consecutive host pages) in the guest range, and the
     /// offset of the first break; diagnostics for pools that cannot be imported whole.
     void CountHostRuns(u64 address, u64 size, u64& runs, u64& first_break) const;
+    /// Imports each host run of a CPU-visible pool's guest storage as its own buffer
+    /// (Pool::split_runs). False, with no runs kept, when a run cannot be imported. Under
+    /// backing_mutex.
+    bool ImportSplitRuns(Pool& pool, std::string& error);
 
     // --- submissions (nvn_exec.cpp) ---
     void ProcessSubmit(CmdSubmit&& submit);

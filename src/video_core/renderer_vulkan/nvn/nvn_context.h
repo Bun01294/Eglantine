@@ -189,6 +189,8 @@ struct ContextStats {
     u64 pools_mirrored{};
     u64 pools_mirrored_discontiguous{}; ///< ... guest storage is several host runs
     u64 pools_mirrored_no_import{};     ///< ... host import unavailable or failed
+    u64 pools_split_imported{};         ///< ... several host runs, each imported (raw global)
+    u64 split_runs{};                   ///< ... in this many runs
     u64 mirror_uploads{};               ///< range uses that copied guest pages into a mirror
     u64 mirror_upload_runs{};           ///< ... as this many copies
     u64 mirror_upload_bytes{};          ///< ... of this many bytes

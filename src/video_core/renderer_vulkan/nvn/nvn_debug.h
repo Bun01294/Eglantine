@@ -214,6 +214,9 @@ struct Config {
     /// EDEN_NX2_NVN_MIRROR_HASH_ALWAYS=1: mirror pools (no host import) hash every guest page of
     /// every range they use at each submission, as before the page tracker gated it (A/B).
     bool mirror_hash_always{false};
+    /// EDEN_NX2_NVN_RAW_SPLIT_IMPORT (default on, =0 off): import host-discontiguous CPU-visible
+    /// pools run by run so raw global loads/stores reach them (OoT's Kokiri pool).
+    bool raw_split_import{true};
     /// EDEN_NX2_TRY_INVALIDATE_WRITEBACK=<ms> (candidate, off; 1 = 250 ms): nvnMemoryPoolInvalidate
     /// MappedRange (the game's "I read what the GPU wrote now") waits, at most that long, until
     /// the submissions made before it that write its range have completed, so the CPU reads what
