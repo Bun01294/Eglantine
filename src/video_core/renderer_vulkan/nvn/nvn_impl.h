@@ -331,6 +331,11 @@ struct Storage : std::enable_shared_from_this<Storage> {
     bool standin_fresh{false};
     /// An sRGB texture view of it exists: no BC4/BC5 (luminance to BC1, luminance+alpha to BC3).
     bool standin_srgb_view{false};
+    /// A stand-in format change asked for during a submission (smart BC's classification at an
+    /// upload). Recreating the image now would leave the bindings already recorded this frame with
+    /// a view key of the old BC format (invalid usage: a view of another BC class than its image's
+    /// loses the device on NVIDIA), so the change is applied at the start of the next submission.
+    std::optional<AstcStandin> pending_standin;
     /// The class the format was chosen for (Rgba when kept at BC3).
     Tegra::Texture::ASTC::Channels standin_class{Tegra::Texture::ASTC::Channels::Rgba};
     /// Tile-granular backing of a large sparse texture in a virtual pool (nvn_sparse.h): the image
@@ -998,6 +1003,8 @@ struct Context::Impl {
     mutable std::array<ResolveSlot, 16> resolve_cache{};
     mutable u32 resolve_next{0};
     std::vector<Retired> retired;
+    /// Stand-ins whose format change waits for the next submission (Storage::pending_standin).
+    std::vector<std::weak_ptr<Storage>> pending_standins;
     /// Storages of one pool, for overlap resolution.
     struct PoolIndex {
         std::multimap<u64, Storage*> spans; ///< begin offset -> cached storage

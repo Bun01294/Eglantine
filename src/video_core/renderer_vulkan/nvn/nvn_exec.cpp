@@ -139,6 +139,7 @@ public:
             }
         }
         BeginSegment();
+        ApplyPendingStandins();
         draw.BeginSubmission(*this, EmptySubmission());
     }
 
@@ -704,7 +705,10 @@ private:
     bool PinStandin(Storage& s, std::string_view op);
     /// Replaces the image of BC stand-in `s` by an empty one of `standin`'s format: the old image
     /// and the views of every texture over it go after this submission.
-    bool Restandin(Storage& s, AstcStandin standin);
+    bool Restandin(Storage& s, AstcStandin standin, bool deferred = false);
+    /// Applies the stand-in format changes a submission asked for (Storage::pending_standin): no
+    /// binding of the new submission can hold a key of the old format yet.
+    void ApplyPendingStandins();
     /// Untiles a block-linear storage that needs no decode on the GPU (nvn_untile_gpu.h): from its
     /// imported or GPU-only pool in place, else from a copy of the tiled bytes `data` in staging, into a
     /// device-local buffer copied into the image with the CPU path's regions. False (nothing
@@ -2319,7 +2323,14 @@ void Recorder::UploadBcFromStaging(Storage& s, const UploadPlan& plan,
     }
 }
 
-bool Recorder::Restandin(Storage& s, AstcStandin standin) {
+bool Recorder::Restandin(Storage& s, AstcStandin standin, bool deferred) {
+    if (deferred) {
+        // The image keeps its format until the next submission (see Storage::pending_standin);
+        // its contents are re-uploaded once it is recreated, as this one's upload wrote the old one.
+        s.pending_standin = standin;
+        impl.pending_standins.push_back(s.shared_from_this());
+        return true;
+    }
     if (s.image) {
         // Earlier submissions and this one may still read the old image through its views.
         auto old_image = std::make_shared<vk::Image>(std::move(s.image));
@@ -2362,7 +2373,7 @@ bool Recorder::RefitStandin(Storage& s, const u8* data, u64 size) {
             s.standin_empty = false;
             s.standin_class = channels;
             const AstcStandin chosen = SmartStandinFor(channels, srgb, impl.smart_bc);
-            return chosen == current || Restandin(s, chosen);
+            return chosen == current || Restandin(s, chosen, true);
         }
         if (!empty && !StandinHolds(current, channels)) {
             static constexpr std::array<const char*, 4> NAMES{"L", "LA", "RGB", "RGBA"};
@@ -2384,9 +2395,26 @@ bool Recorder::RefitStandin(Storage& s, const u8* data, u64 size) {
     }
     // An sRGB view made after the format was chosen (BuildTexture forced this upload).
     if (s.standin_srgb_view && (current == AstcStandin::Bc4 || current == AstcStandin::Bc5)) {
-        return Restandin(s, SmartStandinFor(s.standin_class, true, impl.smart_bc));
+        return Restandin(s, SmartStandinFor(s.standin_class, true, impl.smart_bc), true);
     }
     return true;
+}
+
+void Recorder::ApplyPendingStandins() {
+    if (impl.pending_standins.empty()) {
+        return;
+    }
+    std::vector<std::weak_ptr<Storage>> pending{std::move(impl.pending_standins)};
+    impl.pending_standins.clear();
+    for (const std::weak_ptr<Storage>& weak : pending) {
+        const std::shared_ptr<Storage> storage = weak.lock();
+        if (!storage || !storage->pending_standin) {
+            continue;
+        }
+        const AstcStandin standin = *storage->pending_standin;
+        storage->pending_standin.reset();
+        Restandin(*storage, standin, false);
+    }
 }
 
 bool Recorder::PinStandin(Storage& s, std::string_view op) {

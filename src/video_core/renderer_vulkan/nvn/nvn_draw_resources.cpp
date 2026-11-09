@@ -434,6 +434,25 @@ void DrawResources::ReleaseSampler(u64 serial, u64 after_seq) {
 }
 
 VkImageView DrawResources::GetView(const Texture& texture, const ViewKey& key) {
+    // A stand-in changes BC format when a later upload classifies it differently (smart BC,
+    // RefitStandin recreates its image as BC1/BC4/BC5/BC3). A ViewKey made before that (a clear's,
+    // an attachment's, one memoised by a caller) still names the old format, and a view of another
+    // BC class than the image's is invalid usage: NVIDIA loses the device on it. Such a draw is
+    // left without the texture for this binding (the next binding pass rebuilds the key from the
+    // storage, ViewKeyOf) instead of creating the view.
+    const ViewKey& key_valid = key;
+    if (texture.storage && texture.storage->host.bc_standin &&
+        !ViewsBcStandin(key.format, texture.storage->host.format)) {
+        static std::atomic<u32> skipped{0};
+        if (skipped.fetch_add(1) < 16) {
+            LOG_WARNING(Render_Vulkan,
+                        "[nvn] stand-in view {:#x} left out: texture {:#x}, storage format {:#x} "
+                        "(a view key from before the stand-in's format changed)",
+                        static_cast<int>(key.format), texture.serial,
+                        static_cast<int>(texture.storage->host.format));
+        }
+        return VK_NULL_HANDLE;
+    }
     // The texture remembers its texture_views node (stable until TakeViews erases it).
     if (texture.view_slot == nullptr || texture.view_slot_epoch != views_epoch) {
         auto& fresh = const_cast<Texture&>(texture);
@@ -445,7 +464,7 @@ VkImageView DrawResources::GetView(const Texture& texture, const ViewKey& key) {
         views.storage = texture.storage;
     }
     for (auto& [existing, view] : views.views) {
-        if (existing == key) {
+        if (existing == key_valid) {
             return *view;
         }
     }
@@ -485,7 +504,7 @@ VkImageView DrawResources::GetView(const Texture& texture, const ViewKey& key) {
                 .layerCount = key.layers,
             },
         });
-        views.views.emplace_back(key, std::move(view));
+        views.views.emplace_back(key_valid, std::move(view));
         return *views.views.back().second;
     } catch (const vk::Exception& exception) {
         LOG_ERROR(Render_Vulkan,
