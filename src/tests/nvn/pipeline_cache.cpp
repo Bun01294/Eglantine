@@ -1705,7 +1705,7 @@ TEST_CASE("Translation switches: the hash covers what the recompiler reads and n
     REQUIRE(changes([](TranslationSwitches& s) { s.tensor_lowering = 2; }));
     REQUIRE(changes([](TranslationSwitches& s) { s.raw_coverage = true; }));
     REQUIRE(changes([](TranslationSwitches& s) { s.raw_global_fast = true; }));
-    REQUIRE(changes([](TranslationSwitches& s) { s.lean_global_memory = false; }));
+    REQUIRE(changes([](TranslationSwitches& s) { s.lean_global_memory = !s.lean_global_memory; }));
     REQUIRE(changes([](TranslationSwitches& s) { s.ro_mirror_exact = true; }));
     REQUIRE_FALSE(changes([](TranslationSwitches&) {}));
 }

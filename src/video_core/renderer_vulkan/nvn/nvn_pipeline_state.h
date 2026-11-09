@@ -62,7 +62,7 @@ struct TranslationSwitches {
     std::string tensor_mode;             ///< its value (selects the HMMA lowering)
     u8 tensor_lowering{};                ///< the title's VideoCommon::NativeTensorLowering
     bool raw_coverage{};                 ///< EDEN_NX2_RAW_COVERAGE=1 (the miss ring reports)
-    bool lean_global_memory{true};       ///< EDEN_NX2_LEAN_SSBO unset or not 0
+    bool lean_global_memory{false};      ///< EDEN_NX2_LEAN_SSBO set and not 0
     bool raw_global_fast{};              ///< EDEN_NX2_TRY_RAWGLOBAL_FAST=1 (last-hit translation)
     bool direct_unused_atomics{};        ///< EDEN_NX2_TRY_DIRECT_UNUSED_ATOMICS=1
     bool native_f32_atomics{};           ///< EDEN_NX2_TRY_NATIVE_F32_ATOMICS=1
