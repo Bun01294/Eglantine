@@ -97,11 +97,31 @@ Timeline::Query ParseQuery(const json& args);
 /// or no valid sample yet.
 json PerfJson(ToolContext& ctx);
 
+// memory_tools.cpp
 /// Ends memory watches and their sampling thread (server shutdown).
 void StopMemoryWork();
 // emulation_tools.cpp
-/// PNG of the capture layer (works paused/hidden), scaled to max_width.
+/// PNG of the capture layer (works paused/hidden), scaled to max_width. Empty under VTX-HLE,
+/// whose replay never renders that layer.
 std::optional<std::vector<u8>> RawCapturePng(ToolContext& ctx, u32 max_width, std::string& error);
+/// A presented-frame screenshot kept for when no new frame can be captured (paused).
+struct CachedScreenshot {
+    std::vector<u8> png;
+    u64 frame = 0; ///< Guest presents counted when it was taken.
+    std::chrono::steady_clock::time_point taken;
+};
+/// Stores `png` as the newest presented-frame screenshot.
+void RememberScreenshot(std::vector<u8> png, u64 frame);
+/// The newest screenshot CaptureScreenshot took, if any.
+[[nodiscard]] std::optional<CachedScreenshot> LastScreenshot();
+/// Host::CaptureScreenshotPng that also remembers the frame for FallbackFrame.
+std::optional<std::vector<u8>> CaptureScreenshot(ToolContext& ctx, u32 max_width,
+                                                 std::chrono::milliseconds timeout,
+                                                 std::string& error);
+/// An image when no frame is presented (paused): the capture layer, else the last presented
+/// screenshot. `source` names which one; nullopt (error set) when there is neither.
+std::optional<std::vector<u8>> FallbackFrame(ToolContext& ctx, u32 max_width, std::string& source,
+                                             std::string& error);
 
 /// Set while the server shuts down: long waits in tools check it and return early.
 inline std::atomic<bool> g_server_stopping{false};

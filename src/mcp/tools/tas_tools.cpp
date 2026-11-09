@@ -382,8 +382,7 @@ ToolResult TasPlay(ToolContext& ctx, const json& args) {
         while (next_checkpoint < checkpoints.size() && seen_running &&
                frame >= checkpoints[next_checkpoint]) {
             std::string shot_error;
-            if (const auto png = ctx.host->CaptureScreenshotPng(max_width, milliseconds{3000},
-                                                                shot_error)) {
+            if (const auto png = CaptureScreenshot(ctx, max_width, milliseconds{3000}, shot_error)) {
                 images.AddImage(*png, "image/png");
                 shots.push_back({{"requested_frame", checkpoints[next_checkpoint]},
                                  {"script_frame", std::get<1>(tas->GetStatus())}});

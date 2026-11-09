@@ -165,8 +165,7 @@ ToolResult Act(ToolContext& ctx, const json& args) {
         } else {
             std::string error;
             const u32 max_width = args.value("max_width", 960U);
-            if (const auto png = ctx.host->CaptureScreenshotPng(max_width, milliseconds{5000},
-                                                                error)) {
+            if (const auto png = CaptureScreenshot(ctx, max_width, milliseconds{5000}, error)) {
                 result.AddImage(*png, "image/png");
             } else {
                 out["screenshot_error"] = error;

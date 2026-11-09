@@ -413,3 +413,20 @@ TEST_CASE("MCP every built-in tool has a valid definition", "[mcp]") {
         REQUIRE(def.contains("inputSchema"));
     });
 }
+
+TEST_CASE("MCP frames fall back to the last presented screenshot", "[mcp]") {
+    ToolContext ctx; // no system: the capture layer is unavailable, as under VTX-HLE
+    RememberScreenshot({0x89, 'P', 'N', 'G'}, 1234);
+    const auto last = LastScreenshot();
+    REQUIRE(last);
+    REQUIRE(last->frame == 1234);
+    std::string source;
+    std::string error;
+    const auto png = FallbackFrame(ctx, 640, source, error);
+    REQUIRE(png);
+    REQUIRE(png->size() == 4);
+    REQUIRE(source.find("last presented screenshot (guest frame 1234") != std::string::npos);
+    // Without a host a screenshot fails cleanly and leaves the remembered frame alone.
+    REQUIRE_FALSE(CaptureScreenshot(ctx, 640, std::chrono::milliseconds{1}, error));
+    REQUIRE(LastScreenshot()->frame == 1234);
+}

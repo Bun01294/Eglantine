@@ -57,8 +57,8 @@ agent holds it, see `acquire_control`).
 | `mark` | Insert a labelled marker into the timeline |
 | `act` | Input (W, L) + wait (event / guest frames / ms) + capture (screenshot, timeline, controller, perf) in one call |
 | `pause`, `resume` (W, L) | Pause or resume emulation |
-| `frame_advance` (W, L), `capture_frames` | Run N frames then pause (+ capture-layer screenshot); a screenshot burst every N frames |
-| `screenshot` | PNG of the presented frame |
+| `frame_advance` (W, L), `capture_frames` | Run N frames then pause, with an image of the last advanced frame (`image_source` says where it came from); a screenshot burst every N frames (refused while paused) |
+| `screenshot` | PNG of the presented frame (while paused: the capture layer or the last presented screenshot, labelled) |
 | `press_buttons`, `set_stick`, `input_sequence`, `release_all` (W, L) | Virtual gamepad input (wall-clock) |
 | `tas_status`, `tas_read_script` | TAS engine state; read a script or the last recording |
 | `tas_write_script`, `tas_play`, `tas_stop`, `tas_record_start`, `tas_record_stop`, `tas_set_options` (W, L) | Frame-locked TAS scripts (write as steps or raw TAS-nx, play with screenshots at frames, record a human) |
@@ -75,6 +75,15 @@ FUKKO clients; in this build they report "not available in this build".
 MCP resources: `eglantine://tools/guide`, `eglantine://status`, `eglantine://timeline/summary`.
 Prompt: `compare_change`. While running, the server writes `<user dir>/mcp-server.json` (url,
 port, pid; never the token). Log events redact key-like hex.
+
+### Images while paused
+
+Renderers fill screenshot requests only when a frame is presented, and the VTX-HLE replay never
+renders the applet capture layer. So `frame_advance` captures its image as the last advanced
+frame is presented, before it pauses again (`image_source: "presented frame ..."`). If that fails
+it falls back to the capture layer (emulated GPU path) and then to the last presented screenshot
+any tool took, with its guest frame and age. `screenshot` uses the same fallback while paused;
+`capture_frames` refuses to run while paused.
 
 ### Not in this build
 

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <mutex>
 
 #include <fmt/format.h>
 
@@ -50,8 +51,20 @@ ToolResult Screenshot(ToolContext& ctx, const json& args) {
     const u32 max_width = args.value("max_width", 1280U);
     const auto timeout = std::chrono::milliseconds{args.value("timeout_ms", 5000)};
     std::string error;
-    const auto png = ctx.host->CaptureScreenshotPng(max_width, timeout, error);
+    const auto png = CaptureScreenshot(ctx, max_width, timeout, error);
     if (!png) {
+        // Paused: nothing is presented, so no screenshot request is ever filled.
+        if (ctx.system != nullptr && ctx.system->IsPaused()) {
+            std::string source;
+            std::string fallback_error;
+            if (const auto fallback = FallbackFrame(ctx, max_width, source, fallback_error)) {
+                ToolResult result;
+                result.AddImage(*fallback, "image/png");
+                result.AddText("paused, no frame presented; image: " + source);
+                return result;
+            }
+            error += "; " + fallback_error;
+        }
         return ToolResult::Error("screenshot failed: " + error);
     }
     ToolResult result;
@@ -62,12 +75,23 @@ ToolResult Screenshot(ToolContext& ctx, const json& args) {
 }
 
 /// Runs N frames then pauses again (resume, count presented frames, pause). The pause lands on
-/// the frame after the Nth presentation at best; expect +/- a frame or two.
+/// the frame after the Nth presentation at best; expect +/- a frame or two. The image is the Nth
+/// frame, captured as it is presented, before pausing: renderers (the VTX-HLE replay too) only
+/// fill screenshot requests on present, so none would arrive once paused. If that fails it falls
+/// back to the capture layer, then to the last presented screenshot, and says which it used.
 ToolResult FrameAdvance(ToolContext& ctx, const json& args) {
+    using std::chrono::milliseconds;
     if (!ctx.host) {
         return HostMissing();
     }
     const u64 frames = std::clamp<u64>(args.value("frames", u64{1}), 1, 600);
+    const bool want_image = args.value("screenshot", true);
+    const auto deadline = std::chrono::steady_clock::now() +
+                          milliseconds{std::clamp(args.value("timeout_ms", 10000), 100, 60000)};
+    const auto remaining = [&] {
+        return std::max(milliseconds{0}, std::chrono::duration_cast<milliseconds>(
+                                             deadline - std::chrono::steady_clock::now()));
+    };
     if (!ctx.system->IsPaused()) {
         if (std::string error = ctx.host->Pause(); !error.empty()) {
             return ToolResult::Error("pause failed: " + error);
@@ -77,20 +101,44 @@ ToolResult FrameAdvance(ToolContext& ctx, const json& args) {
     if (std::string error = ctx.host->Resume(); !error.empty()) {
         return ToolResult::Error("resume failed: " + error);
     }
-    const u64 got = WaitFrames(
-        frames, std::chrono::milliseconds{std::clamp(args.value("timeout_ms", 10000), 100, 60000)});
-    ctx.host->Pause();
-    ToolResult result = ToolResult::Structured(
-        json{{"requested", frames}, {"advanced", PresentedFrames() - start}, {"counted", got},
-             {"paused", true}});
-    if (args.value("screenshot", true)) {
-        std::string error;
-        // Paused: the renderer only fills screenshots on present, so use the capture layer.
-        if (const auto png = RawCapturePng(ctx, 640, error)) {
-            result.AddImage(*png, "image/png");
-        } else {
-            result.AddText("no screenshot: " + error);
+    u64 got = 0;
+    std::optional<std::vector<u8>> png;
+    std::string shot_error;
+    if (want_image) {
+        if (frames > 1) {
+            got = WaitFrames(frames - 1, remaining());
         }
+        // Filled when the next (the Nth) frame is presented.
+        png = CaptureScreenshot(ctx, 640, std::min(remaining(), milliseconds{5000}), shot_error);
+        got += png ? u64{1} : WaitFrames(1, remaining());
+    } else {
+        got = WaitFrames(frames, remaining());
+    }
+    ctx.host->Pause();
+    json out{{"requested", frames},
+             {"advanced", PresentedFrames() - start},
+             {"counted", got},
+             {"paused", true}};
+    std::string source;
+    if (want_image) {
+        if (png) {
+            source = "presented frame (the last advanced frame, captured before pausing)";
+        } else {
+            std::string fallback_error;
+            png = FallbackFrame(ctx, 640, source, fallback_error);
+            source = png ? fmt::format("{} (presented-frame screenshot failed: {})", source,
+                                       shot_error)
+                         : fmt::format("none (presented-frame screenshot failed: {}; {})",
+                                       shot_error, fallback_error);
+        }
+        out["image_source"] = source;
+    }
+    ToolResult result = ToolResult::Structured(std::move(out));
+    if (want_image) {
+        if (png) {
+            result.AddImage(*png, "image/png");
+        }
+        result.AddText("image: " + source);
     }
     return result;
 }
@@ -103,6 +151,11 @@ constexpr auto kCaptureBudget = std::chrono::seconds{60};
 ToolResult CaptureFrames(ToolContext& ctx, const json& args) {
     if (!ctx.host) {
         return HostMissing();
+    }
+    if (ctx.system != nullptr && ctx.system->IsPaused()) {
+        return ToolResult::Error(
+            "emulation is paused: capture_frames waits for presented frames and none come while "
+            "paused. Resume first, or step with frame_advance (it returns the frame it stops on).");
     }
     const u64 every = args.value("every_frames", u64{30});
     const int count = std::clamp(args.value("count", 4), 1, 12);
@@ -128,8 +181,8 @@ ToolResult CaptureFrames(ToolContext& ctx, const json& args) {
             }
         }
         std::string error;
-        if (const auto png = ctx.host->CaptureScreenshotPng(
-                width, std::min(std::chrono::milliseconds{3000}, remaining()), error)) {
+        if (const auto png = CaptureScreenshot(
+                ctx, width, std::min(std::chrono::milliseconds{3000}, remaining()), error)) {
             images.AddImage(*png, "image/png");
             frames.push_back(PresentedFrames());
         } else {
@@ -220,13 +273,67 @@ std::optional<std::vector<u8>> RawCapturePng(ToolContext& ctx, u32 max_width, st
     return EncodePng(*frame, max_width);
 }
 
+namespace {
+/// The newest presented-frame screenshot any tool took (CaptureScreenshot), for FallbackFrame.
+std::mutex g_last_screenshot_mutex;
+std::optional<CachedScreenshot> g_last_screenshot;
+} // namespace
+
+void RememberScreenshot(std::vector<u8> png, u64 frame) {
+    std::scoped_lock lock{g_last_screenshot_mutex};
+    g_last_screenshot = CachedScreenshot{
+        .png = std::move(png), .frame = frame, .taken = std::chrono::steady_clock::now()};
+}
+
+std::optional<CachedScreenshot> LastScreenshot() {
+    std::scoped_lock lock{g_last_screenshot_mutex};
+    return g_last_screenshot;
+}
+
+std::optional<std::vector<u8>> CaptureScreenshot(ToolContext& ctx, u32 max_width,
+                                                 std::chrono::milliseconds timeout,
+                                                 std::string& error) {
+    if (!ctx.host) {
+        error = "no frontend host is attached";
+        return std::nullopt;
+    }
+    auto png = ctx.host->CaptureScreenshotPng(max_width, timeout, error);
+    if (png) {
+        RememberScreenshot(*png, PresentedFrames());
+    }
+    return png;
+}
+
+std::optional<std::vector<u8>> FallbackFrame(ToolContext& ctx, u32 max_width, std::string& source,
+                                             std::string& error) {
+    // The VTX-HLE replay presents through its own chain and never renders the applet capture
+    // layer, so the capture layer is empty there; the emulated GPU path fills it.
+    std::string raw_error;
+    if (auto png = RawCapturePng(ctx, max_width, raw_error)) {
+        source = "capture layer (applet capture buffer)";
+        return png;
+    }
+    if (auto last = LastScreenshot()) {
+        const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - last->taken)
+                             .count();
+        source = fmt::format("last presented screenshot (guest frame {}, taken {} ms ago; capture "
+                             "layer: {})",
+                             last->frame, age, raw_error);
+        return std::move(last->png);
+    }
+    error = fmt::format("capture layer: {}; no presented screenshot taken yet", raw_error);
+    return std::nullopt;
+}
+
 void RegisterEmulationTools(ToolRegistry& registry) {
     registry.Add(Tool{
         .name = "frame_advance",
         .title = "Advance frames",
-        .description = "Pause (if needed), run N presented frames, pause again, and return a "
-                       "screenshot. Good for stepping through an effect or a glitch; accuracy is "
-                       "about a frame (pausing isn't frame-locked).",
+        .description = "Pause (if needed), run N presented frames, pause again, and return an "
+                       "image of the last advanced frame (image_source says where it came from). "
+                       "Good for stepping through an effect or a glitch; accuracy is about a "
+                       "frame (pausing isn't frame-locked).",
         .input_schema = {{"type", "object"},
                          {"properties",
                           {{"frames", {{"type", "integer"}, {"minimum", 1}, {"maximum", 600}}},
@@ -242,7 +349,8 @@ void RegisterEmulationTools(ToolRegistry& registry) {
         .name = "capture_frames",
         .title = "Capture a frame burst",
         .description = "Take count screenshots (max 12), one every every_frames presented frames: "
-                       "a cheap substitute for video when watching an animation or a glitch.",
+                       "a cheap substitute for video when watching an animation or a glitch. "
+                       "Refused while paused (use frame_advance).",
         .input_schema = {{"type", "object"},
                          {"properties",
                           {{"every_frames", {{"type", "integer"}, {"minimum", 1}, {"maximum", 3600}}},
@@ -278,7 +386,8 @@ void RegisterEmulationTools(ToolRegistry& registry) {
         .title = "Screenshot",
         .description = "PNG of the next presented frame (as displayed, including post-processing), "
                        "scaled to max_width (16:9). Fails if no frame is presented within "
-                       "timeout_ms, e.g. while paused or loading.",
+                       "timeout_ms (e.g. loading); while paused it returns the capture layer or "
+                       "the last presented screenshot and says which.",
         .input_schema = {{"type", "object"},
                          {"properties",
                           {{"max_width", {{"type", "integer"}, {"minimum", 160}, {"maximum", 3840}}},
