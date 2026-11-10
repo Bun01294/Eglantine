@@ -497,10 +497,12 @@ void DrawContext::Dispatch(const VC::DispatchPayload& p) {
         return;
     }
     // nvn_draw_dump: claimed only now, so every claimed section is written.
+    std::string probe_prefix; // nvn_draw_dump: path prefix of the image read-backs after the dispatch
     if (probe_active) [[unlikely]] {
         if (const auto ticket = VideoCommon::NvnDrawProbe::DumpRequested(probe_info)) {
             ProbeDispatchDump(*ticket, *compute, *control, p, indirect ? &arguments : nullptr,
                               program_hash, probe_skip);
+            probe_prefix = fmt::format("{}-{}", ticket->path, ticket->index + 1);
         }
     }
     const Debug::Config& backing_config = Debug::Get();
@@ -606,6 +608,11 @@ void DrawContext::Dispatch(const VC::DispatchPayload& p) {
     // The shader may have written buffers and images: later commands order after them (a later
     // dispatch only behind a game barrier with dispatch ordering by barriers, as on NVN).
     host->HostMarkDispatchWritten();
+    if (!probe_prefix.empty()) [[unlikely]] {
+        // What the dumped dispatch bound, as the GPU has it after the dispatch.
+        ProbeNoteImages(probe_prefix, u64{2048} * 2048);
+        ProbeFlushImages();
+    }
     if (pathdiff) [[unlikely]] {
         PathDiffEnd(std::move(*pathdiff));
     }

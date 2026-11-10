@@ -1320,6 +1320,9 @@ void DrawContext::EndPass(BreakCause cause) {
         if (Debug::Tracing()) {
             DebugOnPassEnd();
         }
+        if (!probe_images.empty()) [[unlikely]] {
+            ProbeFlushImages();
+        }
         ++counters.pass_breaks;
         ++counters.break_causes[static_cast<size_t>(cause)];
         host->HostMarkWritten();

@@ -88,6 +88,9 @@ struct Config {
     u32 dump_max{400};
     u32 dump_width{}; ///< only targets of this width (0: any)
     u32 dump_thumb{}; ///< EDEN_NX2_NVN_DUMP_THUMB: TGA width cap (0: full size)
+    /// EDEN_NX2_NVN_DUMP_DIVISOR=n: float targets are divided by n in the TGA (HDR values above 1
+    /// stay distinguishable); the logged statistics are unscaled.
+    u32 dump_divisor{1};
     u32 face{};
     bool no_depth{};
     /// EDEN_NX2_NVN_DUMP_COUNT=n: n consecutive frames from each DUMP_FRAME number are selected.

@@ -1059,6 +1059,20 @@ private:
     DrawPlan draw_plan; ///< the plan of the draw being prepared (capacity kept between draws)
     std::array<u32, 2> fallback_logged{}; ///< DescReason bits logged once, per bind point
 
+    /// nvn_draw_dump: read-backs of the textures a dumped draw or dispatch bound, recorded once no
+    /// pass is open (a draw's at the end of its pass, a dispatch's right after it). Each writes a
+    /// TGA next to the dump and a "[nvn] dump" statistics line.
+    struct ProbeImage {
+        std::shared_ptr<Storage> storage;
+        u32 level;
+        u32 layer;
+        std::string path;
+    };
+    std::vector<ProbeImage> probe_images;
+    /// Notes the bindings of `draw_plan` with at most `max_texels` texels (path `prefix`-b<n>-...).
+    void ProbeNoteImages(const std::string& prefix, u64 max_texels);
+    void ProbeFlushImages();
+
     // ---- diagnostics (nvn_draw_debug.cpp; used only when Debug::Tracing()) ----
     struct DebugTargetStat {
         u64 draws{};
