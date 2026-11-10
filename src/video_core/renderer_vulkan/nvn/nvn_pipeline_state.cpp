@@ -1390,6 +1390,9 @@ TranslationSwitches CurrentTranslationSwitches() {
     if (const char* value = std::getenv("EDEN_NX2_LEAN_SSBO")) {
         switches.lean_global_memory = value[0] != '0';
     }
+    if (const char* value = std::getenv("EDEN_NX2_STRONG_GLOBAL_FENCE")) {
+        switches.strong_global_fence = value[0] == '1';
+    }
     switches.raw_coverage = VideoCommon::RawCoverageEnabled();
     switches.raw_global_fast = VideoCommon::RawGlobalFastEnabled();
     switches.direct_unused_atomics =
@@ -1432,6 +1435,9 @@ u64 HashTranslationSwitches(const TranslationSwitches& switches) {
     std::string key = text;
     if (!switches.lean_global_memory) {
         key += " lean_global=0";
+    }
+    if (switches.strong_global_fence) {
+        key += " strong_fence=1";
     }
     if (switches.resolution_scaling_active) {
         key += fmt::format(" scale={}/{}/{:08x}/{:08x}", switches.resolution_up_scale,

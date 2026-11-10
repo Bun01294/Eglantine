@@ -69,6 +69,7 @@ struct TranslationSwitches {
     bool atomic_reserve{};               ///< EDEN_NX2_TRY_ATOMIC_RESERVE=1
     bool ro_mirror_exact{};              ///< EDEN_NX2_TRY_RO_MIRROR_EXACT=1 (raw stores reach RO mirrors)
     bool storage_raw_write_through{};   ///< EDEN_NX2_TRY_STORAGE_RAW_WRITE_THROUGH
+    bool strong_global_fence{};          ///< EDEN_NX2_STRONG_GLOBAL_FENCE=1 (LDG/STG .STRONG.GPU)
     [[nodiscard]] bool operator==(const TranslationSwitches&) const = default;
 };
 /// A pipeline-key suffix for currently enabled TRY switches; zero preserves pre-toggle keys.
