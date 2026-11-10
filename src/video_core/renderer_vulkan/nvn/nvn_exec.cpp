@@ -1907,6 +1907,8 @@ void Recorder::UploadStorage(Storage& s) {
         const auto begin = std::chrono::steady_clock::now();
         s.guest_hash = HashGuestBytes(data, size);
         s.sample_hash = SampleGuestBytes(data, size);
+        s.cpu_trusted_gen = 0;
+        s.page_hashes.clear();
         impl.stats.hash_ns.fetch_add(
             static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                  std::chrono::steady_clock::now() - begin)

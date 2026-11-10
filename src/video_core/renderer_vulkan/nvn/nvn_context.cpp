@@ -236,6 +236,8 @@ Context::Impl::Impl(const Device& device_, std::mutex& submit_mutex_,
     mirror_hash_tracked = options.mirror_hash_tracked.value_or(!Debug::Get().mirror_hash_always);
     raw_split_import.store(Debug::Get().raw_split_import, std::memory_order_relaxed);
     tex_hash_tracked = mirror_hash_tracked && !Debug::Get().tex_hash_always;
+    tex_page_hash = tex_hash_tracked && Debug::Get().tex_page_hash;
+    tex_flush_trusted = tex_hash_tracked && Debug::Get().tex_flush_trusted;
     invalidate_wait_ms = options.invalidate_wait_ms.value_or(Debug::Get().try_invalidate_writeback);
     raw_keep_entries = options.raw_keep_entries.value_or(Debug::Get().try_raw_keep_entries);
     refused_shadow = options.refused_shadow.value_or(Debug::Get().try_refused_shadow);
@@ -1956,14 +1958,15 @@ std::string Context::DescribeState() const {
     const auto& s = impl->stats;
     text += fmt::format(
         " mem(storages new/reuse/evict={}/{}/{} split_import(pools/runs)={}/{} uploads={} MB={} "
-        "cpu check/trusted/change={}/{}/{} "
+        "cpu check/trusted/pages/change={}/{}/{}/{} pages_rehashed={} "
         "hash_ms={} hash_MB={} (compressed {} dynamic {}) decode_ms={} decode_MB={} alias_xfer={} "
         "alias_seen={} virt={} astc gpu/fallback/bc={}/{}/{} untile gpu/direct/fallback={}/{}/{} "
         "untile_gpu_MB={} storage_cache(MB/superseded/aged/pressure_evicted)={}/{}/{}/{})",
         s.storages_created.load(), s.storages_reused.load(), s.storages_evicted.load(),
         s.pools_split_imported.load(), s.split_runs.load(),
         s.uploads.load(), s.upload_bytes.load() >> 20, s.cpu_checks.load(),
-        s.cpu_checks_trusted.load(), s.cpu_changes.load(), s.hash_ns.load() / 1'000'000, s.hash_bytes.load() >> 20,
+        s.cpu_checks_trusted.load(), s.cpu_checks_pages.load(), s.cpu_changes.load(),
+        s.cpu_pages_rehashed.load(), s.hash_ns.load() / 1'000'000, s.hash_bytes.load() >> 20,
         s.hash_bytes_compressed.load() >> 20, s.hash_bytes_dynamic.load() >> 20,
         s.decode_ns.load() / 1'000'000, s.decode_bytes.load() >> 20, s.alias_transfers.load(),
         s.alias_overlaps_seen.load(), s.virtual_maps.load(), s.astc_gpu_uploads.load(),

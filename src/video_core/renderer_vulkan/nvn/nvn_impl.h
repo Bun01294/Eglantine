@@ -321,6 +321,12 @@ struct Storage : std::enable_shared_from_this<Storage> {
     /// later `page_write_gen`, the CPU did not write it and a check needs no hash
     /// (Impl::tex_hash_tracked).
     u32 cpu_trusted_gen{0};
+    /// CityHash64 of the storage's part of each pool page (Pool::MIRROR_PAGE grid, first page at
+    /// pool_offset / MIRROR_PAGE), taken with the full hash that set `cpu_trusted_gen`: a check
+    /// after a tracked write rehashes only the written pages. Empty: not taken.
+    std::vector<u64> page_hashes;
+    /// A tracked write once came after the trust: only such storages keep page hashes.
+    bool wants_page_hashes{false};
     /// The guest wrote the storage itself (WriteTexels): upload again whatever the origin.
     bool force_upload{false};
     u64 last_used_seq{0};
@@ -795,6 +801,8 @@ struct Context::Impl {
         std::atomic<u64> upload_bytes{};
         std::atomic<u64> cpu_checks{};           ///< hash checks of CPU-sourced storages
         std::atomic<u64> cpu_checks_trusted{};   ///< checks the page tracker answered (no hash)
+        std::atomic<u64> cpu_checks_pages{};     ///< checks answered by rehashing written pages
+        std::atomic<u64> cpu_pages_rehashed{};   ///< pages those checks hashed
         std::atomic<u64> cpu_changes{};          ///< ... that found changed guest bytes
         std::atomic<u64> host_write_uploads{};   ///< GPU-only pool ranges a host write re-uploaded
         std::atomic<u64> decode_ns{};            ///< ASTC/BCn decode time
@@ -1270,6 +1278,11 @@ struct Context::Impl {
     /// a CPU-sourced texture whose pages the page tracker saw unwritten since its last full hash is
     /// not hashed again (DetectGuestChange).
     bool tex_hash_tracked{false};
+    /// On with `tex_hash_tracked` unless EDEN_NX2_NVN_TEX_PAGE_HASH=0: a texture whose pages were
+    /// written since it was trusted rehashes only those pages (Storage::page_hashes).
+    bool tex_page_hash{false};
+    /// A tracked guest flush lets CPU-sourced storages keep going by the page tracker.
+    bool tex_flush_trusted{false};
     /// EDEN_NX2_TRY_INVALIDATE_WRITEBACK (ContextOptions / nvn_debug.h): milliseconds a guest
     /// invalidate waits for the GPU's unfinished writes to its range; 0 = off (nothing is noted).
     u32 invalidate_wait_ms{0};

@@ -189,6 +189,60 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
         schedule_unchanged();
         return;
     }
+    // The storage's part of pool page `page`, hashed (data = the storage's first byte).
+    const u64 first_page = s.pool_offset / Pool::MIRROR_PAGE;
+    const u64 last_page = (s.pool_offset + size - 1) / Pool::MIRROR_PAGE;
+    const auto page_hash = [&](const u8* data, u64 page) {
+        const u64 begin = (std::max)(page * Pool::MIRROR_PAGE, s.pool_offset);
+        const u64 end = (std::min)((page + 1) * Pool::MIRROR_PAGE, s.pool_offset + size);
+        return Common::CityHash64(reinterpret_cast<const char*>(data + (begin - s.pool_offset)),
+                                  static_cast<size_t>(end - begin));
+    };
+    if (tracked && !forced && s.cpu_trusted_gen != 0) {
+        s.wants_page_hashes = true;
+    }
+    // Some pages were written since the bytes were trusted: compare those pages only. Their old
+    // hashes describe the contents (an upload drops them), so a page that differs means the
+    // contents are stale, and equal pages mean the bytes are the trusted ones again.
+    if (tracked && !forced && s.cpu_trusted_gen != 0 &&
+        s.page_hashes.size() == last_page - first_page + 1 &&
+        last_page < pool.page_write_gen.size()) {
+        std::vector<u8> page_scratch;
+        const auto page_begin = std::chrono::steady_clock::now();
+        if (const u8* bytes = GuestBytes(pool, s.pool_offset, size, page_scratch)) {
+            bool differs = false;
+            u64 rehashed = 0;
+            for (u64 page = first_page; page <= last_page; ++page) {
+                if (pool.page_write_gen[static_cast<size_t>(page)] <= s.cpu_trusted_gen) {
+                    continue;
+                }
+                ++rehashed;
+                if (page_hash(bytes, page) != s.page_hashes[static_cast<size_t>(page - first_page)]) {
+                    differs = true;
+                    break;
+                }
+            }
+            stats.hash_ns.fetch_add(static_cast<u64>(
+                                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now() - page_begin)
+                                            .count()),
+                                    std::memory_order_relaxed);
+            stats.hash_bytes.fetch_add(rehashed * Pool::MIRROR_PAGE, std::memory_order_relaxed);
+            stats.cpu_pages_rehashed.fetch_add(rehashed, std::memory_order_relaxed);
+            if (!differs) {
+                stats.cpu_checks_pages.fetch_add(1, std::memory_order_relaxed);
+                s.cpu_trusted_gen = tracked_gen;
+                schedule_unchanged();
+                return;
+            }
+            stats.cpu_changes.fetch_add(1, std::memory_order_relaxed);
+            s.cpu_trusted_gen = 0;
+            s.page_hashes.clear();
+            s.dynamic = true;
+            s.force_upload = true;
+            return;
+        }
+    }
     // A texture the CPU keeps writing parts of (a glyph atlas) shows new content only in a few
     // lines the signature may not sample: small uncompressed ones and ones that changed before
     // are compared in full at every check. Block-compressed data is rewritten whole (a streamed
@@ -247,9 +301,18 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
             s.next_full_tick = tick + FULL_VERIFY_PRESENTS;
             // Taken before the bytes were read: a write since shows with a later generation.
             s.cpu_trusted_gen = (!changed && tracked) ? tracked_gen : 0;
+            s.page_hashes.clear();
+            if (s.cpu_trusted_gen != 0 && tex_page_hash && s.wants_page_hashes) {
+                s.page_hashes.resize(static_cast<size_t>(last_page - first_page + 1));
+                for (u64 page = first_page; page <= last_page; ++page) {
+                    s.page_hashes[static_cast<size_t>(page - first_page)] = page_hash(data, page);
+                }
+                hashed += size;
+            }
         }
         if (changed) {
             s.cpu_trusted_gen = 0;
+            s.page_hashes.clear();
         }
     }
     const u64 check_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -333,6 +396,10 @@ bool Context::Impl::StorageNeedsCommands(Storage& s, bool will_overwrite, u64 se
             return true;
         }
     }
+    // Nothing newer overlaps: what Recorder::ResolveOverlaps records when it finds no source, so
+    // the next check skips the scan until another GPU write to the pool.
+    s.sync_gen = write_clock;
+    s.pool_gen_seen = index.write_gen;
     return false;
 }
 
@@ -927,7 +994,13 @@ void Context::Impl::NotifyCpuWriteNow(u64 address, u64 size, bool host_write) {
         }
         if (storage.origin == StorageOrigin::Cpu) {
             // The bytes may have changed: look at them at the next use, whatever the back-off says.
-            storage.force_check = true;
+            // A guest flush with `flush_tracked` has its stores in the page tracker, so the check
+            // may still go by it (as a mirror's trusted pages do); anything else hashes in full.
+            if (flush_tracked && !host_write && tex_hash_tracked && tex_flush_trusted) {
+                storage.next_check_tick = 0;
+            } else {
+                storage.force_check = true;
+            }
         }
     }
 }
@@ -1753,6 +1826,8 @@ void Context::Impl::FlushTextureNow(CmdFlushTexture& command) {
     s.origin = StorageOrigin::Cpu;
     s.guest_hash = HashGuestBytes(storage_bytes, storage_size);
     s.sample_hash = SampleGuestBytes(storage_bytes, storage_size);
+    s.cpu_trusted_gen = 0;
+    s.page_hashes.clear();
     s.unchanged_checks = 0;
     s.next_check_tick = 0;
     s.next_full_tick = PollTick() + FULL_VERIFY_PRESENTS;
