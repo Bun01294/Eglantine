@@ -25,6 +25,12 @@ constexpr u32 ProgramBank = 1;      ///< c1: the program's own constant segment 
 constexpr u32 HandleBank = 2;       ///< c2: texture/sampler/image handle tables
 constexpr u32 FirstUniformBank = 3; ///< c3..: uniform buffers bound by the game (slot = bank - 3)
 
+/// NVN2 shaders read the push-constant block as constant bank 24 (root table 0 of the hardware,
+/// 256 bytes; Maxwell3D::RootTables on the emulated path). The Ampere lowering turns bank 24 into
+/// bank 17, the last one the recompiler has, which games do not bind (uniform slot 14).
+constexpr u32 PushConstantBank = 17;
+constexpr u32 PushConstantBankSize = 0x100;
+
 /// Handle tables inside the handle bank. Every entry is 8 bytes; the handle is the first word.
 constexpr u32 HandleStride = 8;
 constexpr u32 CombinedHandleBase = 0x20; ///< 41 combined texture+sampler handles (slots 0..40)

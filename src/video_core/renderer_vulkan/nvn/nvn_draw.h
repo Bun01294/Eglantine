@@ -1002,6 +1002,9 @@ private:
     };
     std::array<BankCache, BIND_STAGES> driver_banks;
     std::array<BankCache, BIND_STAGES> handle_banks;
+    /// The push-constant block as the bank shaders read it from (VC::PushConstantBank), graphics
+    /// and compute.
+    std::array<BankCache, 2> push_banks;
     /// The open pass's framebuffer in the game's pixels (viewports, scissors and the render area
     /// are the game's numbers).
     VkExtent2D framebuffer_extent{};

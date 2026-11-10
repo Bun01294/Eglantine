@@ -1275,6 +1275,29 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                     break;
                 default: {
                     const u32 slot = binding.slot + i;
+                    const size_t block = binding.stage == VC::ShaderStage::Compute ? 1 : 0;
+                    if (slot + VC::FirstUniformBank == VC::PushConstantBank &&
+                        !push_constants[block].empty() &&
+                        (slot >= stages[stage].uniform.size() ||
+                         stages[stage].uniform[slot].size == 0)) {
+                        // The push constants, where the shader reads them when the game bound
+                        // no uniform buffer there (as the emulated path serves root table 0).
+                        BankCache& cache = push_banks[block];
+                        const u64 seq = host->HostFlight().seq;
+                        if (cache.seq != seq || cache.a != push_gen[block]) {
+                            u8* pointer = nullptr;
+                            cache.ref = AllocArena(VC::PushConstantBankSize, 256, &pointer);
+                            std::memset(pointer, 0, VC::PushConstantBankSize);
+                            std::memcpy(pointer, push_constants[block].data(),
+                                        (std::min<size_t>)(push_constants[block].size(),
+                                                           VC::PushConstantBankSize));
+                            cache.seq = seq;
+                            cache.a = push_gen[block];
+                        }
+                        scratch_buffers.push_back(
+                            {cache.ref.buffer, cache.ref.offset, VC::PushConstantBankSize});
+                        break;
+                    }
                     const SinkSite site{stage, slot};
                     scratch_buffers.push_back(buffer_info(
                         slot < stages[stage].uniform.size() ? stages[stage].uniform[slot]
@@ -1307,12 +1330,8 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
             const size_t first = scratch_images.size();
             bool binding_scaled = false;
             for (u32 i = 0; i < count; ++i) {
-                VC::HandleRef texture_ref = binding.texture;
-                VC::HandleRef sampler_ref = binding.sampler;
-                texture_ref.slot += i;
-                texture_ref.byte_offset += i * VC::HandleStride;
-                sampler_ref.slot += i;
-                sampler_ref.byte_offset += i * VC::HandleStride;
+                const VC::HandleRef texture_ref = VC::HandleElement(binding.texture, i);
+                const VC::HandleRef sampler_ref = VC::HandleElement(binding.sampler, i);
                 const u32 texture_word =
                     ReadBindingHandleWord(layout, binding, texture_ref,
                                           is_image ? VC::HandleWordKind::Image

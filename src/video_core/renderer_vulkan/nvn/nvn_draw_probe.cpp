@@ -265,12 +265,8 @@ void DrawContext::AppendBindingDump(std::string& text, const PipelineBase& pipe)
         case VC::DescriptorKind::StorageImage: {
             const bool is_image = binding.kind == VC::DescriptorKind::StorageImage;
             for (u32 i = 0; i < binding.count; ++i) {
-                VC::HandleRef texture_ref = binding.texture;
-                VC::HandleRef sampler_ref = binding.sampler;
-                texture_ref.slot += i;
-                texture_ref.byte_offset += i * VC::HandleStride;
-                sampler_ref.slot += i;
-                sampler_ref.byte_offset += i * VC::HandleStride;
+                const VC::HandleRef texture_ref = VC::HandleElement(binding.texture, i);
+                const VC::HandleRef sampler_ref = VC::HandleElement(binding.sampler, i);
                 const u32 texture_word =
                     ReadBindingHandleWord(layout, binding, texture_ref,
                                           is_image ? VC::HandleWordKind::Image
