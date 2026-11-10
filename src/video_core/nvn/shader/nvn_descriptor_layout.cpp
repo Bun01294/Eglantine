@@ -304,6 +304,11 @@ DescriptorLayout BuildDescriptorLayout(std::span<const StageInfo> stages,
 
         // 5. Textures.
         for (const Shader::TextureDescriptor& desc : info.texture_descriptors) {
+            if (desc.bindless) {
+                // In the table's set, not numbered with the draw's descriptors (as EmitSPIRV).
+                layout.uses_bindless_table = true;
+                continue;
+            }
             auto entry = Make(binding, DescriptorKind::CombinedImageSampler,
                               DescriptorRole::Texture, stage, desc.count);
             entry.type = desc.type;

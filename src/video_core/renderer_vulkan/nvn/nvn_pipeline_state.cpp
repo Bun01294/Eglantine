@@ -973,6 +973,7 @@ Shader::HostTranslateInfo MakeHostInfo(const Device& device, const Shader::Profi
         .support_geometry_shader_passthrough = device.IsNvGeometryShaderPassthroughSupported(),
         .support_conditional_barrier = device.SupportsConditionalBarriers(),
         .single_lane_geometry_subgroups = !profile.SupportsSubgroupStage(Shader::Stage::Geometry),
+        .nvn_bindless_table = device.IsBindlessTableSupported(),
         .nvn_raw_global_memory = profile.support_raw_global_memory,
         .raw_coverage = profile.support_raw_global_memory && VideoCommon::RawCoverageEnabled(),
         .raw_global_last_hit =

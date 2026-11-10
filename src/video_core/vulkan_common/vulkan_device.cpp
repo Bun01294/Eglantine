@@ -30,6 +30,7 @@
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "shader_recompiler/bindless_table.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -734,12 +735,17 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         descriptor_indexing.shaderStorageBufferArrayNonUniformIndexing = false;
         descriptor_indexing.shaderInputAttachmentArrayNonUniformIndexing = false;
         descriptor_indexing.descriptorBindingUniformBufferUpdateAfterBind = false;
-        descriptor_indexing.descriptorBindingSampledImageUpdateAfterBind = false;
+        // VTX-HLE's bindless texture table is updated while earlier frames may still be in
+        // flight (bindless_table.h); nothing else uses the update-after-bind bits.
+        const bool bindless_table = Settings::ResolveNvnHle().hle;
+        descriptor_indexing.descriptorBindingSampledImageUpdateAfterBind =
+            bindless_table && descriptor_indexing.descriptorBindingSampledImageUpdateAfterBind;
         descriptor_indexing.descriptorBindingStorageImageUpdateAfterBind = false;
         descriptor_indexing.descriptorBindingStorageBufferUpdateAfterBind = false;
         descriptor_indexing.descriptorBindingUniformTexelBufferUpdateAfterBind = false;
         descriptor_indexing.descriptorBindingStorageTexelBufferUpdateAfterBind = false;
-        descriptor_indexing.descriptorBindingUpdateUnusedWhilePending = false;
+        descriptor_indexing.descriptorBindingUpdateUnusedWhilePending =
+            bindless_table && descriptor_indexing.descriptorBindingUpdateUnusedWhilePending;
         descriptor_indexing.descriptorBindingVariableDescriptorCount = false;
         descriptor_indexing.runtimeDescriptorArray = false;
     }
@@ -1373,6 +1379,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
         properties.descriptor_buffer.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT;
         SetNext(next, properties.descriptor_buffer);
+    }
+    if (extensions.descriptor_indexing || instance_version >= VK_API_VERSION_1_2) {
+        properties.descriptor_indexing.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES;
+        SetNext(next, properties.descriptor_indexing);
     }
     if (extensions.subgroup_size_control || features.subgroup_size_control.subgroupSizeControl) {
         properties.subgroup_size_control.sType =
@@ -2134,6 +2145,30 @@ void Device::ShutdownGPULogging() {
     if (GPU::Logging::GPULogger::GetInstance().IsInitialized()) {
         GPU::Logging::GPULogger::GetInstance().Shutdown();
     }
+}
+
+} // namespace Vulkan
+
+namespace Vulkan {
+
+bool Device::IsBindlessTableSupported() const {
+    const auto& indexing = features.descriptor_indexing;
+    const auto& limits = properties.descriptor_indexing;
+    // One set holds a texture array per image type and class plus the sampler array: the update
+    // after bind limits count the whole set and each stage.
+    constexpr u32 images = Shader::BINDLESS_TEXTURE_CAPACITY * Shader::BINDLESS_CLASS_COUNT *
+                           Shader::BINDLESS_TYPE_COUNT;
+    return Settings::ResolveNvnHle().hle && indexing.shaderSampledImageArrayNonUniformIndexing &&
+           indexing.descriptorBindingPartiallyBound &&
+           indexing.descriptorBindingSampledImageUpdateAfterBind &&
+           indexing.descriptorBindingUpdateUnusedWhilePending &&
+           features.features.shaderSampledImageArrayDynamicIndexing &&
+           limits.maxPerStageDescriptorUpdateAfterBindSampledImages >= images &&
+           limits.maxDescriptorSetUpdateAfterBindSampledImages >= images &&
+           limits.maxPerStageDescriptorUpdateAfterBindSamplers >=
+               Shader::BINDLESS_SAMPLER_CAPACITY &&
+           limits.maxDescriptorSetUpdateAfterBindSamplers >= Shader::BINDLESS_SAMPLER_CAPACITY &&
+           limits.maxPerStageUpdateAfterBindResources >= images + Shader::BINDLESS_SAMPLER_CAPACITY;
 }
 
 } // namespace Vulkan

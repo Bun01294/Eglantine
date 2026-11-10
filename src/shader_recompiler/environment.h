@@ -72,6 +72,8 @@ struct ConstBufferAddr {
     u32 count;
     bool has_secondary;
     u32 handle_program{~0U}; ///< index in Info::handle_programs for a handle computed per draw
+    bool bindless{};         ///< the handle (`handle`) is only known at run time
+    IR::U32 handle;          ///< with `bindless`: the guest handle word, as the shader computes it
 };
 
 /// Window of 16-byte {u64 address, u32 size, u32 pad} buffer descriptors in the driver bank (c0)

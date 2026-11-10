@@ -2556,6 +2556,11 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
         ++counters.draws_skipped;
         return false;
     }
+    if (active->descriptors.uses_bindless_table && !BindlessPrepare(plan)) {
+        ++counters.draws_skipped;
+        host->HostUnsupported("Draw", "the bindless texture table cannot be created");
+        return false;
+    }
     // Vertex layout of this draw (rebuilt only when the words or the pipeline's attribute reads
     // changed) and the streams whose buffers it binds. The streams are exactly the bindings the
     // pipeline (static) or the dynamic vertex input (below) declares. Task/mesh pipelines have

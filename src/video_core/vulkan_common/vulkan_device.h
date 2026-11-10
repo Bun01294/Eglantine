@@ -1062,6 +1062,11 @@ FN_MAX_LIMIT_LIST
         return extensions.astc_decode_mode;
     }
 
+    /// VTX-HLE's bindless texture table (shader_recompiler/bindless_table.h): the device updates
+    /// sampled-image and sampler descriptors after binding while unused, indexes them with
+    /// non-uniform values, and holds the table's descriptors in one set.
+    bool IsBindlessTableSupported() const;
+
     /// Returns true if descriptor bindings is partially bound.
     bool IsDescriptorBindingPartiallyBoundSupported() const {
         return features.descriptor_indexing.descriptorBindingPartiallyBound;
@@ -1393,6 +1398,7 @@ private:
         VkPhysicalDeviceDepthStencilResolveProperties depth_stencil_resolve{};
         VkPhysicalDeviceCustomBorderColorPropertiesEXT custom_border_color{};
         VkPhysicalDeviceCooperativeMatrixPropertiesKHR cooperative_matrix{};
+        VkPhysicalDeviceDescriptorIndexingProperties descriptor_indexing{};
 
         VkPhysicalDeviceProperties properties{};
     };

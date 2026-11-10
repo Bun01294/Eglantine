@@ -31,6 +31,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "shader_recompiler/bindless_table.h"
 #include "video_core/renderer_vulkan/nvn/nvn_barrier_track.h"
 #include "video_core/renderer_vulkan/nvn/nvn_debug.h"
 #include "video_core/nvn/record.h"
@@ -728,6 +729,47 @@ private:
     // ---- descriptors (nvn_draw_descriptors.cpp) ----
     bool BuildDescriptors(PipelineBase& pipeline, DrawPlan& plan, bool graphics);
     bool PrepareOutsidePass(DrawPlan& plan);
+    // ---- bindless texture table (nvn_bindless.cpp) ----
+    /// The replay's table of every texture and sampler the game registered, for shaders that
+    /// read a handle at run time (shader_recompiler/bindless_table.h).
+    struct BindlessState {
+        bool failed{false};
+        vk::DescriptorSetLayout layout;
+        vk::DescriptorPool pool;
+        VkDescriptorSet set{VK_NULL_HANDLE};
+        /// The stand-in of each texture array and what each entry holds now.
+        std::array<VkImageView, Shader::BINDLESS_BINDING_COUNT> dummy{};
+        std::array<std::vector<VkImageView>, Shader::BINDLESS_BINDING_COUNT> written;
+        std::vector<VkSampler> written_samplers;
+        /// The storages of the entries that hold an image (their layouts are checked per draw).
+        std::vector<std::shared_ptr<Storage>> storages;
+        u64 synced_seq{~u64{0}};
+        const void* synced_textures{};
+        const void* synced_samplers{};
+        u32 synced_count{};
+        u32 synced_sampler_count{};
+        u32 sync_logs{};
+        /// Textures registered without an image yet are created (and their data loaded) as draws
+        /// need the table, within a budget per submission; a change makes the entries refresh
+        /// before the set is bound.
+        bool dirty{false};
+        u64 prime_seq{~u64{0}};
+        u64 prime_bytes{};
+        u32 prime_count{};
+        u32 prime_cursor{1};
+        u32 primed_total{};
+    } bindless;
+    /// Creates the table on first use; false when the device cannot hold it.
+    bool BindlessReady();
+    /// Brings the table up to the submission's pool registrations (once per submission).
+    void BindlessSync(bool force = false);
+    /// Adds to `plan` the registered textures that have no image yet, up to the submission's
+    /// budget (creating one needs a pass break, and its memory counts).
+    void BindlessPrime(DrawPlan& plan);
+    /// Syncs the table and adds to `plan` the layout changes its images need.
+    bool BindlessPrepare(DrawPlan& plan);
+    /// Binds the table's set for the pipeline's layout.
+    void BindlessBind(PipelineBase& pipeline, VkPipelineBindPoint bind_point);
     /// Phase B of the descriptors: creates the image views the plan resolved and patches the
     /// image infos (the images exist and are in layout by now).
     void FinishImages(DrawPlan& plan);
@@ -998,6 +1040,7 @@ private:
         u64 e{};
         u64 f{}; ///< the raw coverage ring written into the bank
         u64 g{}; ///< the read-only mirror table written into the bank (generation + 1, 0: none)
+        u64 h{}; ///< the bases of the bound texture and sampler pools (bindless_table.h)
         BufferRef ref;
     };
     std::array<BankCache, BIND_STAGES> driver_banks;

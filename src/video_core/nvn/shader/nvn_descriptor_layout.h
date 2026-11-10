@@ -140,6 +140,9 @@ struct DescriptorLayout {
     /// A compute program that must run 32 threads per subgroup (the compact tensor helper
     /// shuffles across the warp): its pipeline asks for a required subgroup size of 32.
     bool requires_guest_warp{};
+    /// A stage samples through the replay's bindless table (set Shader::BINDLESS_SET): the
+    /// pipeline layout carries that set and the draw binds it.
+    bool uses_bindless_table{};
     u32 unsupported_count{};
 
     /// True when the pipeline needs push constants (rescaling or render area).

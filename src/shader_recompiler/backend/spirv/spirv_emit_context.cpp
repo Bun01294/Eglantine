@@ -23,6 +23,7 @@
 #include "common/div_ceil.h"
 #include "common/env_gate.h"
 #include "shader_recompiler/backend/nvn_storage_descriptor.h"
+#include "shader_recompiler/bindless_table.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
@@ -2385,6 +2386,50 @@ void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_in
     for (const TextureDescriptor& desc : info.texture_descriptors) {
         const Id image_type{ImageType(*this, desc)};
         const Id sampled_type{TypeSampledImage(image_type)};
+        if (desc.bindless) {
+            // The replay's table of this type, in its own set (bindless_table.h): the descriptors
+            // of the draw (set 0) do not number it.
+            if (!bindless_samplers.value) {
+                bindless_sampler_type = TypeSampler();
+                const Id array_type{
+                    TypeArray(bindless_sampler_type, Const(BINDLESS_SAMPLER_CAPACITY))};
+                bindless_sampler_pointer_type = TypePointer(spv::StorageClass::UniformConstant,
+                                                            bindless_sampler_type);
+                bindless_samplers = AddGlobalVariable(
+                    TypePointer(spv::StorageClass::UniformConstant, array_type),
+                    spv::StorageClass::UniformConstant);
+                Decorate(bindless_samplers, spv::Decoration::Binding, BINDLESS_SAMPLER_BINDING);
+                Decorate(bindless_samplers, spv::Decoration::DescriptorSet, BINDLESS_SET);
+                Name(bindless_samplers, "bindless_samplers");
+                if (profile.supported_spirv >= 0x00010400) {
+                    interfaces.push_back(bindless_samplers);
+                }
+            }
+            const Id array_type{TypeArray(image_type, Const(BINDLESS_TEXTURE_CAPACITY))};
+            const Id id{AddGlobalVariable(TypePointer(spv::StorageClass::UniformConstant,
+                                                      array_type),
+                                          spv::StorageClass::UniformConstant)};
+            Decorate(id, spv::Decoration::Binding,
+                     BindlessTextureBinding(desc.type,
+                                            BindlessClass(desc.is_integer, desc.is_depth)));
+            Decorate(id, spv::Decoration::DescriptorSet, BINDLESS_SET);
+            Name(id, NameOf(stage, desc, "bindless_tex"));
+            textures.push_back({
+                .id = id,
+                .sampled_type = sampled_type,
+                .pointer_type = TypePointer(spv::StorageClass::UniformConstant, image_type),
+                .image_type = image_type,
+                .count = BINDLESS_TEXTURE_CAPACITY,
+                .is_multisample = desc.is_multisample,
+                .is_integer = desc.is_integer,
+                .bindless = true,
+            });
+            if (profile.supported_spirv >= 0x00010400) {
+                interfaces.push_back(id);
+            }
+            ++scaling_index;
+            continue;
+        }
         const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, sampled_type)};
         const Id desc_type{DescType(*this, sampled_type, pointer_type, desc.count)};
         const Id id{AddGlobalVariable(desc_type, spv::StorageClass::UniformConstant)};

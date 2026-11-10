@@ -14,6 +14,8 @@
 #include <string>
 #include <string_view>
 
+#include <fmt/format.h>
+
 #include "common/common_types.h"
 #include "shader_recompiler/stage.h"
 
@@ -307,21 +309,23 @@ struct HandleClassification {
         };
         const bool in_texture = in_table(compute->texture_offset, compute->texture_count);
         const bool in_image = in_table(compute->image_offset, compute->image_count);
-        if (want == HandleWant::Texture && in_texture) {
-            if ((offset - compute->texture_offset) % HandleStride != 0) {
+        // A handle word is an index into the pool whichever table holds it: a shader may sample
+        // (texture op) a handle of its image table, or run image ops on one of its texture table.
+        const bool texture_table = in_texture;
+        if (in_texture || in_image) {
+            const u32 base = texture_table ? compute->texture_offset : compute->image_offset;
+            if ((offset - base) % HandleStride != 0) {
                 return unsupported("misaligned compute handle offset");
             }
-            return {HandleSource::ComputeTexture, (offset - compute->texture_offset) / HandleStride,
+            return {texture_table ? HandleSource::ComputeTexture : HandleSource::ComputeImage,
+                    (offset - base) / HandleStride,
                     {}};
         }
-        if (want == HandleWant::Image && in_image) {
-            if ((offset - compute->image_offset) % HandleStride != 0) {
-                return unsupported("misaligned compute handle offset");
-            }
-            return {HandleSource::ComputeImage, (offset - compute->image_offset) / HandleStride,
-                    {}};
-        }
-        return unsupported("compute handle outside the texture/image tables");
+        return unsupported(fmt::format(
+            "compute handle outside the texture/image tables (textures {}x at {:#x}, images {}x at "
+            "{:#x})",
+            compute->texture_count, compute->texture_offset, compute->image_count,
+            compute->image_offset));
     }
     if (bank == ProgramBank) {
         return unsupported("handle read from the program constant bank");

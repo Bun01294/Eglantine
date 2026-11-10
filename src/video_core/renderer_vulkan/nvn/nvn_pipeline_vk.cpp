@@ -12,6 +12,7 @@
 #include <fmt/format.h>
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "video_core/renderer_vulkan/nvn/nvn_bindless.h"
 #include "video_core/renderer_vulkan/nvn/nvn_pipeline_impl.h"
 
 namespace Vulkan::Nvn {
@@ -203,6 +204,19 @@ PipelineCache::Impl::LayoutObjects PipelineCache::Impl::CreateLayoutObjects(
             .pBindings = bindings.data(),
         });
     }
+    if (descriptors.uses_bindless_table) {
+        // The table is set BINDLESS_SET: set 0 must exist even when the draw has no descriptors.
+        if (bindings.empty()) {
+            out.set_layout = device.GetLogical().CreateDescriptorSetLayout({
+                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .bindingCount = 0,
+                .pBindings = nullptr,
+            });
+        }
+        out.bindless_layout = MakeBindlessSetLayout(device);
+    }
     VkPushConstantRange range{
         .stageFlags = push_stages,
         .offset = 0,
@@ -215,13 +229,15 @@ PipelineCache::Impl::LayoutObjects PipelineCache::Impl::CreateLayoutObjects(
                      static_cast<u32>(sizeof(RenderAreaLayout));
         out.push_constant_size = range.size;
     }
-    const VkDescriptorSetLayout set_handle = *out.set_layout;
+    const std::array<VkDescriptorSetLayout, 2> set_handles{
+        *out.set_layout, out.bindless_layout ? *out.bindless_layout : VK_NULL_HANDLE};
+    const u32 set_count = out.bindless_layout ? 2u : (set_handles[0] != VK_NULL_HANDLE ? 1u : 0u);
     out.layout = device.GetLogical().CreatePipelineLayout({
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .setLayoutCount = set_handle != VK_NULL_HANDLE ? 1u : 0u,
-        .pSetLayouts = set_handle != VK_NULL_HANDLE ? &set_handle : nullptr,
+        .setLayoutCount = set_count,
+        .pSetLayouts = set_count != 0 ? set_handles.data() : nullptr,
         .pushConstantRangeCount = range.size != 0 ? 1u : 0u,
         .pPushConstantRanges = range.size != 0 ? &range : nullptr,
     });
@@ -243,6 +259,7 @@ VC::DescriptorLayout PipelineCache::Impl::MergeLayouts(
         merged.uses_raw_global_memory |= slice.uses_raw_global_memory;
         merged.stores_raw_global_memory |= slice.stores_raw_global_memory;
         merged.requires_guest_warp |= slice.requires_guest_warp;
+        merged.uses_bindless_table |= slice.uses_bindless_table;
         raw_stores_not_through |=
             slice.stores_raw_global_memory && !slice.raw_stores_written_through;
         merged.unsupported_count += slice.unsupported_count;
@@ -251,9 +268,16 @@ VC::DescriptorLayout PipelineCache::Impl::MergeLayouts(
     merged.raw_stores_written_through = merged.stores_raw_global_memory && !raw_stores_not_through;
     if (!merged.AllSupported()) {
         std::set<std::string> issues;
-        for (const VC::DescriptorBinding& binding : merged.bindings) {
-            if (!binding.supported) {
-                issues.insert(binding.issue);
+        for (const StageArtifact* stage : stages) {
+            if (stage == nullptr) {
+                continue;
+            }
+            for (const VC::DescriptorBinding& binding : stage->record->layout.bindings) {
+                if (!binding.supported) {
+                    issues.insert(fmt::format("{} [{} program {:016x}]", binding.issue,
+                                              StageNameOf(stage->record->stage),
+                                              stage->record->program_hash));
+                }
             }
         }
         for (const std::string& issue : issues) {
@@ -424,6 +448,7 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
         }
         pipeline->layout = std::move(layout.layout);
         pipeline->set_layout = std::move(layout.set_layout);
+        pipeline->bindless_layout = std::move(layout.bindless_layout);
         pipeline->push_descriptors = layout.push_descriptors;
         pipeline->push_constant_size = layout.push_constant_size;
         pipeline->push_constant_stages = push_stages;
@@ -489,6 +514,7 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::AssembleCompute(
             *vk_cache);
         pipeline->layout = std::move(layout.layout);
         pipeline->set_layout = std::move(layout.set_layout);
+        pipeline->bindless_layout = std::move(layout.bindless_layout);
         pipeline->push_descriptors = layout.push_descriptors;
         pipeline->push_constant_size = layout.push_constant_size;
         pipeline->push_constant_stages = VK_SHADER_STAGE_COMPUTE_BIT;

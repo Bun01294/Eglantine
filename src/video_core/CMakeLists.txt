@@ -265,6 +265,7 @@ add_library(video_core STATIC
     renderer_vulkan/nvn/nvn_draw_clear.cpp
     renderer_vulkan/nvn/nvn_draw_debug.cpp
     renderer_vulkan/nvn/nvn_draw_probe.cpp
+    renderer_vulkan/nvn/nvn_bindless.cpp
     renderer_vulkan/nvn/nvn_draw_descriptors.cpp
     renderer_vulkan/nvn/nvn_draw_indirect.cpp
     renderer_vulkan/nvn/nvn_draw_log.cpp

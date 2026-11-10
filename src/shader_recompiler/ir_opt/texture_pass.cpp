@@ -19,9 +19,11 @@
 #include <limits>
 #include <boost/container/small_vector.hpp>
 
+#include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/env_gate.h"
+#include "shader_recompiler/bindless_table.h"
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
 #include "shader_recompiler/frontend/ir/breadth_first_search.h"
@@ -774,6 +776,8 @@ bool BuildHandleNode(const IR::Value& value, std::vector<u32>& code, int& budget
 
 // Programs built while making the texture instructions of the pass running on this thread.
 thread_local std::vector<std::vector<u32>>* g_handle_programs{};
+// The program being made may look run-time handles up in the host's bindless table.
+thread_local bool g_bindless_allowed{};
 
 std::optional<u32> TryGetConstant(IR::Value& value, Environment& env) {
     const IR::Inst* inst = value.InstRecursive();
@@ -936,6 +940,27 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const H
             int budget = 4096;
             g_handle_failure = IR::Opcode::Void;
             if (!g_handle_programs || !BuildHandleProgram(inst.Arg(0), code, budget, block)) {
+                if (g_bindless_allowed && !IsStorageImageOpcode(IndexedInstruction(inst))) {
+                    // The handle depends on more than one draw can name (a light or material
+                    // record read per pixel): the host's bindless table is indexed with it.
+                    return TextureInst{
+                        .cbuf = ConstBufferAddr{
+                            .index = 0,
+                            .offset = 0,
+                            .shift_left = 0,
+                            .secondary_index = 0,
+                            .secondary_offset = 0,
+                            .secondary_shift_left = 0,
+                            .dynamic_offset = {},
+                            .count = 1,
+                            .has_secondary = false,
+                            .bindless = true,
+                            .handle = IR::U32{inst.Arg(0)},
+                        },
+                        .inst = &inst,
+                        .block = block,
+                    };
+                }
                 // Not computable for a whole draw (a handle that changes in a loop): keep the
                 // earlier search through loads, which at least gives the shader a texture.
                 const std::optional<ConstBufferAddr> legacy{IR::BreadthFirstSearch(inst.Arg(0),
@@ -946,6 +971,9 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const H
                     throw NotImplementedException("Failed to track bindless texture constant buffer (stopped at {}, budget {})",
                                                   g_handle_failure, budget);
                 }
+                LOG_WARNING(Shader, "Bindless texture handle is not computable per draw (stopped at {}, budget {}); "
+                                    "falling back to constant buffer c{}[{:#x}]",
+                            g_handle_failure, budget, legacy->index, legacy->offset);
                 return TextureInst{.cbuf = *legacy, .inst = &inst, .block = block};
             }
             auto& programs{*g_handle_programs};
@@ -1056,7 +1084,8 @@ public:
                    desc.secondary_cbuf_offset == existing.secondary_cbuf_offset &&
                    desc.secondary_shift_left == existing.secondary_shift_left &&
                    desc.count == existing.count && desc.size_shift == existing.size_shift &&
-                   desc.handle_program == existing.handle_program;
+                   desc.handle_program == existing.handle_program &&
+                   desc.bindless == existing.bindless;
         })};
         // TODO: Read this from TIC
         texture_descriptors[index].is_multisample |= desc.is_multisample;
@@ -1168,6 +1197,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
     env.track_cache.clear();
     TextureInstVector to_replace;
     g_handle_programs = &program.info.handle_programs;
+    g_bindless_allowed = host_info.nvn_bindless_table && program.stage != Stage::Compute;
     for (IR::Block* const block : program.post_order_blocks) {
         env.track_cache.clear();
         for (IR::Inst& inst : block->Instructions()) {
@@ -1211,8 +1241,15 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
     // A handle program has no descriptor to read a type from, and ImageQueryDimensions carries
     // none: it takes the type of another instruction using the same handle.
     std::unordered_map<u32, TextureType> handle_program_types;
+    std::unordered_map<const IR::Inst*, TextureType> bindless_types;
     for (const TextureInst& texture_inst : to_replace) {
         const IR::Opcode opcode{IndexedInstruction(*texture_inst.inst)};
+        if (texture_inst.cbuf.bindless && opcode != IR::Opcode::ImageQueryDimensions &&
+            !texture_inst.cbuf.handle.IsImmediate()) {
+            bindless_types.try_emplace(
+                texture_inst.cbuf.handle.InstRecursive(),
+                texture_inst.inst->Flags<IR::TextureInstInfo>().type.Value());
+        }
         if (texture_inst.cbuf.handle_program != ~0U && opcode != IR::Opcode::ImageQueryDimensions &&
             !IsStorageImageOpcode(opcode)) {
             handle_program_types.try_emplace(
@@ -1231,7 +1268,13 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
         bool is_rect_sample{false};
         switch (inst->GetOpcode()) {
         case IR::Opcode::ImageQueryDimensions:
-            if (const auto it{handle_program_types.find(cbuf.handle_program)};
+            if (cbuf.bindless) {
+                const auto it{cbuf.handle.IsImmediate() ? bindless_types.end()
+                                                        : bindless_types.find(
+                                                              cbuf.handle.InstRecursive())};
+                flags.type.Assign(it != bindless_types.end() ? it->second
+                                                             : TextureType::Color2D);
+            } else if (const auto it{handle_program_types.find(cbuf.handle_program)};
                 it != handle_program_types.end()) {
                 flags.type.Assign(it->second);
             } else {
@@ -1244,7 +1287,8 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                 break;
             }
             // Normalized once the descriptor is known (below).
-            is_rect_sample = ReadTextureTypeCached(env, cbuf) == TextureType::Color2DRect;
+            is_rect_sample =
+                !cbuf.bindless && ReadTextureTypeCached(env, cbuf) == TextureType::Color2DRect;
             break;
         case IR::Opcode::ImageFetch:
             if (flags.type == TextureType::Color2D || flags.type == TextureType::Color2DRect ||
@@ -1256,7 +1300,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
             if (flags.type != TextureType::Color1D) {
                 break;
             }
-            if (ReadTextureTypeCached(env, cbuf) == TextureType::Buffer) {
+            if (!cbuf.bindless && ReadTextureTypeCached(env, cbuf) == TextureType::Buffer) {
                 // Replace with the bound texture type only when it's a texture buffer
                 // If the instruction is 1D and the bound type is 2D, don't change the code and let
                 // the rasterizer robustness handle it
@@ -1337,7 +1381,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                 // Depth-compare sampling returns a float in Vulkan, so its image must be float
                 // even when a garbage or unknown descriptor reads as an integer format.
                 static const bool depth_float_fix{Common::EnvGate("EGLANTINE_DEPTH_FLOAT_FIX")};
-                const bool is_integer{(!depth_float_fix || flags.is_depth == 0) &&
+                const bool is_integer{!cbuf.bindless && (!depth_float_fix || flags.is_depth == 0) &&
                                       is_texture_pixel_format_integer(cbuf)};
                 index = descriptors.Add(TextureDescriptor{
                     .type = flags.type,
@@ -1354,6 +1398,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                     .count = count,
                     .size_shift = size_shift,
                     .handle_program = cbuf.handle_program,
+                    .bindless = cbuf.bindless,
                 });
                 flags.is_integer.Assign(is_integer ? 1 : 0);
             }
@@ -1362,7 +1407,25 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
         flags.descriptor_index.Assign(index);
         inst->SetFlags(flags);
 
-        if (count > 1) {
+        if (cbuf.bindless) {
+            // The table's index: the game's handle moved into the replay's global id space with
+            // the bases of the bound pools (an id of 0 stays 0, as RebaseHandleWord).
+            const auto insert_point{IR::Block::InstructionList::s_iterator_to(*inst)};
+            IR::IREmitter ir{*texture_inst.block, insert_point};
+            const IR::U32 texture_id{ir.BitwiseAnd(cbuf.handle, ir.Imm32(0xFFFFF))};
+            const IR::U32 sampler_id{ir.ShiftRightLogical(cbuf.handle, ir.Imm32(20))};
+            const IR::U32 texture_base{
+                ir.GetCbuf(ir.Imm32(0), ir.Imm32(BINDLESS_DRIVER_TEXTURE_BASE))};
+            const IR::U32 sampler_base{
+                ir.GetCbuf(ir.Imm32(0), ir.Imm32(BINDLESS_DRIVER_SAMPLER_BASE))};
+            const IR::U32 zero{ir.Imm32(0)};
+            const IR::U32 rebased_texture{ir.Select(ir.IEqual(texture_id, zero), zero,
+                                                    ir.IAdd(texture_id, texture_base))};
+            const IR::U32 rebased_sampler{ir.Select(ir.IEqual(sampler_id, zero), zero,
+                                                    ir.IAdd(sampler_id, sampler_base))};
+            inst->SetArg(0, ir.BitwiseOr(ir.BitwiseAnd(rebased_texture, ir.Imm32(0xFFFFF)),
+                                         ir.ShiftLeftLogical(rebased_sampler, ir.Imm32(20))));
+        } else if (count > 1) {
             const auto insert_point{IR::Block::InstructionList::s_iterator_to(*inst)};
             IR::IREmitter ir{*texture_inst.block, insert_point};
             const IR::U32 shift{ir.Imm32(size_shift)};
