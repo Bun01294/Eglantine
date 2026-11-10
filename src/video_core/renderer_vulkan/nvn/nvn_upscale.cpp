@@ -29,6 +29,9 @@
 #include "common/settings.h"
 #include "video_core/renderer_vulkan/nvn/nvn_draw.h"
 #include "video_core/renderer_vulkan/nvn/nvn_format.h"
+#ifdef EGLANTINE_STREAMLINE
+#include "video_core/renderer_vulkan/nvn/nvn_game_dlss.h"
+#endif
 #include "video_core/renderer_vulkan/present/fsr.h"
 #include "video_core/surface.h"
 #include "video_core/upscaler.h"
@@ -93,12 +96,224 @@ void NoteUpscale(Context::Impl& impl, const auto& job, const char* stage) {
 
 bool DrawContext::EvaluateDlss(const UpscaleJob& job, bool dlaa,
                                const VideoCore::Upscaler::Rect* input_rect_override) {
-    // Eglantine has no NVIDIA DLSS runtime on this path: the caller's FSR1 / bilinear stage
-    // writes the output.
+#ifdef EGLANTINE_STREAMLINE
+    // DLSS needs the game's depth and motion vectors (a network replacement has neither).
+    if (impl.game_dlss_failed || job.host_inputs || job.depth.texture == nullptr ||
+        job.motion_vectors.texture == nullptr || !GameDlss::Available()) {
+        return false;
+    }
+    const VideoCore::Upscaler::Rect input_rect =
+        input_rect_override != nullptr ? *input_rect_override : job.input_rect;
+    const VkExtent2D render{input_rect.width, input_rect.height};
+    const VkExtent2D output{job.output_rect.width, job.output_rect.height};
+    const auto image_of = [&](const UpscaleImage& image, u32 width, u32 height) {
+        GameDlss::Image out{};
+        if (image.texture == nullptr) {
+            return out;
+        }
+        const Storage& storage = *image.texture->storage;
+        const VkImageAspectFlags aspect =
+            (storage.aspect & VK_IMAGE_ASPECT_DEPTH_BIT) != 0
+                ? VkImageAspectFlags{VK_IMAGE_ASPECT_DEPTH_BIT}
+                : VkImageAspectFlags{VK_IMAGE_ASPECT_COLOR_BIT};
+        const ViewKey key{
+            .format = ViewFormat(*image.texture, image.format),
+            .type = VK_IMAGE_VIEW_TYPE_2D,
+            .aspect = aspect,
+            .base_level = image.level,
+            .levels = 1,
+            .base_layer = image.layer,
+            .layers = 1,
+        };
+        out.view = resources.GetView(*image.texture, key);
+        if (!out.view) {
+            return out;
+        }
+        out.image = *storage.image;
+        out.format = key.format;
+        out.width = LevelSize(image.texture->desc.width, image.level);
+        out.height = LevelSize(image.texture->desc.height, image.level);
+        out.x = image.x;
+        out.y = image.y;
+        out.rect_width = width;
+        out.rect_height = height;
+        return out;
+    };
+    GameDlss::Request request{};
+    request.color = image_of(job.input, render.width, render.height);
+    request.color.x = input_rect.x;
+    request.color.y = input_rect.y;
+    request.depth = image_of(job.depth, render.width, render.height);
+    request.motion_vectors =
+        image_of(job.motion_vectors, job.motion_width != 0 ? job.motion_width : render.width,
+                 job.motion_height != 0 ? job.motion_height : render.height);
+    request.exposure = image_of(job.exposure, 1, 1);
+    request.bias = image_of(job.bias, render.width, render.height);
+    if (request.color.image == VK_NULL_HANDLE || request.depth.image == VK_NULL_HANDLE ||
+        request.motion_vectors.image == VK_NULL_HANDLE) {
+        return false;
+    }
+
+    // DLSS writes its own RGBA16F image (the game's output may be of any format and only a
+    // rectangle of it is written); it is copied into the output rectangle below.
+    constexpr VkFormat TargetFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+    constexpr VkImageUsageFlags TargetUsage =
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    constexpr VkImageSubresourceRange TargetRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    Context::Impl::GameDlssViewport& state = impl.game_dlss[job.viewport];
+    const u32 evaluation = impl.game_dlss_evaluations++;
+    bool reset = job.reset;
+    const bool new_target = !state.target || state.output.width != output.width ||
+                            state.output.height != output.height;
+    if (new_target || state.render.width != render.width || state.render.height != render.height) {
+        LOG_INFO(Render_Vulkan,
+                 "[nvn] game DLSS (Streamline) network {}: {}x{} -> {}x{}{}{}{}, motion vectors "
+                 "{}x{}",
+                 job.viewport, render.width, render.height, output.width, output.height,
+                 dlaa ? " DLAA" : "", job.hdr_color ? " HDR" : " LDR",
+                 job.depth_inverted ? " inverted depth" : "", request.motion_vectors.rect_width,
+                 request.motion_vectors.rect_height);
+        reset = true;
+    }
+    if (new_target) {
+        auto target = std::make_shared<Context::Impl::GameDlssTarget>();
+        target->image = impl.allocator->CreateImage(VkImageCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = TargetFormat,
+            .extent = {output.width, output.height, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = TargetUsage,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = nullptr,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        });
+        target->view = impl.device.GetLogical().CreateImageView(VkImageViewCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .image = *target->image,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = TargetFormat,
+            .components{},
+            .subresourceRange = TargetRange,
+        });
+        state.target = std::move(target);
+    }
+    state.render = render;
+    state.output = output;
+    state.last_evaluation = evaluation;
+    // Networks the game finalized long ago (each Initialize is a new viewport).
+    if (impl.game_dlss.size() > 8) {
+        for (auto it = impl.game_dlss.begin(); it != impl.game_dlss.end();) {
+            if (evaluation - it->second.last_evaluation > 600) {
+                GameDlss::FreeViewport(it->first);
+                it = impl.game_dlss.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    const std::shared_ptr<Context::Impl::GameDlssTarget> target = impl.game_dlss[job.viewport].target;
+    host->HostFlight().keepalive.push_back(target);
+
+    const auto target_barrier = [&](VkAccessFlags src_access, VkAccessFlags dst_access,
+                                    VkImageLayout old_layout) {
+        return VkImageMemoryBarrier{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = src_access,
+            .dstAccessMask = dst_access,
+            .oldLayout = old_layout,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = *target->image,
+            .subresourceRange = TargetRange,
+        };
+    };
+    for (const UpscaleImage* image :
+         {&job.input, &job.depth, &job.motion_vectors, &job.exposure, &job.bias}) {
+        if (image->texture != nullptr) {
+            host->HostTransition(*image->texture->storage, VK_IMAGE_LAYOUT_GENERAL);
+        }
+    }
+    host->HostFlushBarrier();
+    const vk::CommandBuffer cmd = host->HostCmd();
+    // The target's previous contents are never read: DLSS writes all of it.
+    cmd.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        0,
+                        target_barrier(0, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                       VK_IMAGE_LAYOUT_UNDEFINED));
+
+    request.output.image = *target->image;
+    request.output.view = *target->view;
+    request.output.format = TargetFormat;
+    request.output.usage = TargetUsage;
+    request.output.width = output.width;
+    request.output.height = output.height;
+    request.output.rect_width = output.width;
+    request.output.rect_height = output.height;
+    request.viewport = job.viewport;
+    request.frame_index = evaluation;
+    request.jitter[0] = job.jitter[0];
+    request.jitter[1] = job.jitter[1];
+    request.motion_scale[0] = job.motion_scale[0];
+    request.motion_scale[1] = job.motion_scale[1];
+    request.pre_exposure = job.pre_exposure;
+    request.dlaa = dlaa;
+    request.reset = reset;
+    request.depth_inverted = job.depth_inverted;
+    request.hdr_color = job.hdr_color;
+    // HDR colour without an exposure texture: DLSS measures the exposure itself.
+    request.auto_exposure =
+        job.auto_exposure || (job.hdr_color && request.exposure.image == VK_NULL_HANDLE);
+    request.motion_vectors_jittered = job.motion_vectors_jittered;
+    const bool evaluated = GameDlss::Evaluate(*cmd, request);
+    // DLSS bound its own pipelines and descriptors on the command buffer.
+    bound_pipeline = VK_NULL_HANDLE;
+    if (!evaluated) {
+        // One failure is the device's or the runtime's: the fallback stage writes from now on.
+        impl.game_dlss_failed = true;
+        return false;
+    }
+
+    cmd.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                        target_barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                                       VK_IMAGE_LAYOUT_GENERAL));
+    Texture& output_texture = *job.output.texture;
+    host->HostTransition(*output_texture.storage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    host->HostFlushBarrier();
+    const VkImageBlit region{
+        .srcSubresource = VkImageSubresourceLayers{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        .srcOffsets = {{0, 0, 0},
+                       {static_cast<s32>(output.width), static_cast<s32>(output.height), 1}},
+        .dstSubresource = VkImageSubresourceLayers{VK_IMAGE_ASPECT_COLOR_BIT, job.output.level,
+                                                   job.output.layer, 1},
+        .dstOffsets = {{static_cast<s32>(job.output_rect.x), static_cast<s32>(job.output_rect.y),
+                        0},
+                       {static_cast<s32>(job.output_rect.x + output.width),
+                        static_cast<s32>(job.output_rect.y + output.height), 1}},
+    };
+    host->HostCmd().BlitImage(*target->image, VK_IMAGE_LAYOUT_GENERAL, *output_texture.storage->image,
+                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region, VK_FILTER_NEAREST);
+    host->HostTransition(*output_texture.storage, VK_IMAGE_LAYOUT_GENERAL);
+    host->HostNoteTouched(output_texture.storage);
+    return true;
+#else
+    // No NVIDIA DLSS runtime in this build: the caller's FSR1 / bilinear stage writes the output.
     static_cast<void>(job);
     static_cast<void>(dlaa);
     static_cast<void>(input_rect_override);
     return false;
+#endif
 }
 
 bool DrawContext::UpscaleWithoutDlss(const UpscaleJob& job, bool use_fsr) {

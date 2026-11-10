@@ -693,6 +693,21 @@ struct Context::Impl {
     std::optional<VkExtent2D> final_fsr_extent;
     std::optional<HostImporter> importer;
     bool dlss_depth_missing_logged{};
+    /// The image DLSS writes for one game network (Streamline viewport) before it is copied into
+    /// the game's output rectangle. Replay thread only.
+    struct GameDlssTarget {
+        vk::Image image;
+        vk::ImageView view;
+    };
+    struct GameDlssViewport {
+        std::shared_ptr<GameDlssTarget> target;
+        VkExtent2D render{};
+        VkExtent2D output{};
+        u32 last_evaluation{};
+    };
+    std::unordered_map<u32, GameDlssViewport> game_dlss;
+    u32 game_dlss_evaluations{};
+    bool game_dlss_failed{};
     /// Replay thread only: an own-upscale dispatch (DK's NDSR) or the game's own DLSS evaluation
     /// already replaced this frame's upscale stage.
     bool ndsr_upscaled_since_present{};
