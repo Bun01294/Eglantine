@@ -1239,6 +1239,7 @@ void Recorder::DrawElementsIndirect(u64 cmd_va, u32 mode, u32 index_type, u64 in
     payload->mode = mode;
     payload->index_type = index_type;
     payload->instance_count = 1;
+    payload->count = impl->BufferBytesFrom(index_address);
     payload->index_address = index_address;
     payload->indirect = indirect;
     payload->max_draws = 1;
@@ -1252,6 +1253,7 @@ void Recorder::MultiDrawElementsIndirectCount(u64 cmd_va, u32 mode, u32 index_ty
     payload->mode = mode;
     payload->index_type = index_type;
     payload->instance_count = 1;
+    payload->count = impl->BufferBytesFrom(index_address);
     payload->index_address = index_address;
     payload->indirect = indirect;
     payload->count_address = count_address;

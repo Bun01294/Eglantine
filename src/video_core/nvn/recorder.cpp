@@ -1574,6 +1574,11 @@ bool Recorder::BufferInitialize(u64 buffer_va, u64 memory_pool_va, u64 offset, u
         return false;
     }
     buffer->pool_serial = pool->serial;
+    {
+        const std::scoped_lock lock{impl->buffer_spans_mutex};
+        const u64 begin = pool->address + offset;
+        impl->buffer_spans.push_back({begin, begin + size, buffer->serial});
+    }
     const u64 fields[2] = {offset, size};
     return impl->GuestWrite(buffer_va + GUEST_BUFFER_OFFSET_OFFSET, fields, sizeof(fields));
 }
@@ -1581,8 +1586,25 @@ bool Recorder::BufferInitialize(u64 buffer_va, u64 memory_pool_va, u64 offset, u
 void Recorder::BufferFinalize(u64 buffer_va) {
     if (const BufferObject* buffer =
             impl->Lookup(impl->buffers, ObjectKind::Buffer, buffer_va, __func__)) {
+        {
+            const std::scoped_lock lock{impl->buffer_spans_mutex};
+            std::erase_if(impl->buffer_spans, [&](const Impl::BufferSpan& span) {
+                return span.serial == buffer->serial;
+            });
+        }
         impl->Release(ObjectKind::Buffer, buffer_va, buffer->serial);
     }
+}
+
+u32 Recorder::Impl::BufferBytesFrom(u64 address) {
+    const std::scoped_lock lock{buffer_spans_mutex};
+    u64 end = 0;
+    for (const BufferSpan& span : buffer_spans) {
+        if (span.begin <= address && address < span.end) {
+            end = (std::max)(end, span.end);
+        }
+    }
+    return static_cast<u32>((std::min<u64>)(end != 0 ? end - address : 0, 0xFFFF'FFFFu));
 }
 
 std::optional<BufferInfo> Recorder::GetBuffer(u64 buffer_va) {

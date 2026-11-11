@@ -264,7 +264,8 @@ void DrawContext::DrawIndexedIndirect(const VC::DrawIndexedPayload& p) {
         return;
     }
     // The index range an indirect draw can reach is not known: everything from the base address
-    // to the end of its pool.
+    // to the end of the game's buffer object (p.count), or of its pool when no object holds it.
+    // Bounding it matters for a mirror pool, whose whole range is hashed and uploaded before use.
     BufferRef index;
     if (!ResolveBuffer(p.index_address, 1, false, index) || index.pool == nullptr) {
         host->HostFailed(call.op, fmt::format("index buffer {:#x} is not in a pool",
@@ -272,6 +273,9 @@ void DrawContext::DrawIndexedIndirect(const VC::DrawIndexedPayload& p) {
         return;
     }
     index.range = index.pool->size - index.pool_offset;
+    if (p.count != 0) {
+        index.range = (std::min<u64>)(index.range, p.count);
+    }
     if (Debug::Tracing()) {
         dbg_call = {};
         dbg_call.indexed = true;
