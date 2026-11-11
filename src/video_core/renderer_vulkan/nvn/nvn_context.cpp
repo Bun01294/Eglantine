@@ -910,6 +910,27 @@ MeshIndirectGpu* Context::Impl::MeshIndirect() {
     return mesh_indirect.get();
 }
 
+QuadIndirectGpu* Context::Impl::QuadIndirect() {
+    if (!quad_indirect && !quad_indirect_failed) {
+        if (!QuadIndirectGpu::Supported(device)) {
+            quad_indirect_failed = true;
+            LOG_ERROR(Render_Vulkan, "[nvn] indirect draws of quads need push descriptors "
+                                     "(2 or more): they are skipped");
+            return nullptr;
+        }
+        try {
+            quad_indirect = std::make_unique<QuadIndirectGpu>(
+                device, CreateHostBuffer(u64{QUAD_INDIRECT_MAX_QUADS} * 6 * sizeof(u32),
+                                         VK_BUFFER_USAGE_INDEX_BUFFER_BIT, MemoryUsage::Upload));
+        } catch (const std::exception& exception) {
+            quad_indirect_failed = true;
+            LOG_ERROR(Render_Vulkan, "[nvn] quad indirect argument conversion unavailable: {}",
+                      exception.what());
+        }
+    }
+    return quad_indirect.get();
+}
+
 VertexStageGpu* Context::Impl::VertexStage() {
     if (!vertex_stage && !vertex_stage_failed) {
         if (!VertexStageGpu::Supported(device)) {

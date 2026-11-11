@@ -38,6 +38,7 @@
 #include "video_core/renderer_vulkan/nvn/nvn_astc_gpu.h"
 #include "video_core/renderer_vulkan/nvn/nvn_bc_encode.h"
 #include "video_core/renderer_vulkan/nvn/nvn_mesh_indirect.h"
+#include "video_core/renderer_vulkan/nvn/nvn_quad_indirect.h"
 #include "video_core/renderer_vulkan/nvn/nvn_untile_gpu.h"
 #include "video_core/renderer_vulkan/nvn/nvn_vertex_stage_gpu.h"
 #include "video_core/renderer_vulkan/nvn/nvn_diag_textures.h"
@@ -1156,6 +1157,10 @@ struct Context::Impl {
     std::unique_ptr<MeshIndirectGpu> mesh_indirect;
     bool mesh_indirect_failed{false};
     [[nodiscard]] MeshIndirectGpu* MeshIndirect();
+    /// Indirect QUADS argument conversion (nvn_quad_indirect.h), created the same way.
+    std::unique_ptr<QuadIndirectGpu> quad_indirect;
+    bool quad_indirect_failed{false};
+    [[nodiscard]] QuadIndirectGpu* QuadIndirect();
     /// Vertex staging copies by shader (nvn_vertex_stage_gpu.h), created at the first staged pass
     /// on the replay thread; null when the device cannot run it (vkCmdCopyBuffer then).
     std::unique_ptr<VertexStageGpu> vertex_stage;

@@ -48,6 +48,7 @@ set(SHADER_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/nvn_alias_transfer.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/nvn_counter.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/nvn_mesh_indirect.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/nvn_quad_indirect.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/nvn_vertex_stage.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/nvn_wb_merge.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/opengl_convert_s8d24.comp

@@ -275,6 +275,8 @@ add_library(video_core STATIC
     renderer_vulkan/nvn/nvn_line_guard.h
     renderer_vulkan/nvn/nvn_mesh_indirect.cpp
     renderer_vulkan/nvn/nvn_mesh_indirect.h
+    renderer_vulkan/nvn/nvn_quad_indirect.cpp
+    renderer_vulkan/nvn/nvn_quad_indirect.h
     renderer_vulkan/nvn/nvn_pass_state.h
     renderer_vulkan/nvn/nvn_pathdiff.cpp
     renderer_vulkan/nvn/nvn_pipeline_cache.cpp
