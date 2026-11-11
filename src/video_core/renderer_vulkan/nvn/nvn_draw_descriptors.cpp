@@ -366,6 +366,13 @@ std::optional<u32> DrawContext::ReadBindingHandleWord(const VC::DescriptorLayout
 
 namespace {
 
+/// A texture buffer: a view of a pool range with no image (and so no storage).
+bool IsTextureBuffer(const Texture& texture) {
+    const s32 target = texture.desc.view.set_target ? texture.desc.view.target : texture.desc.target;
+    return target == static_cast<s32>(TexTarget::Buffer) &&
+           texture.host.format != VK_FORMAT_UNDEFINED;
+}
+
 /// What the shader translation needs to know about the texture behind a handle.
 TextureInfo InfoOfTexture(const Texture& texture) {
     const s32 target = texture.desc.view.set_target ? texture.desc.view.target : texture.desc.target;
@@ -494,7 +501,7 @@ std::unique_ptr<TextureOracle> DrawContext::FreezeOracle(
             return;
         }
         const std::shared_ptr<Texture> texture = TextureOfId(id);
-        if (texture && texture->storage) {
+        if (texture && (texture->storage || IsTextureBuffer(*texture))) {
             frozen->textures.emplace(id, InfoOfTexture(*texture));
         }
     };
@@ -580,7 +587,7 @@ TextureInfo DrawContext::QueryTexture(u32 stage, const VC::NvnHandleRecord& reco
         return {};
     }
     const std::shared_ptr<Texture>& texture = TextureOfId(VC::TextureIdOf(*word));
-    if (!texture || !texture->storage) {
+    if (!texture || (!texture->storage && !IsTextureBuffer(*texture))) {
         return {};
     }
     return InfoOfTexture(*texture);
@@ -848,6 +855,7 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
     scratch_writes.clear();
     scratch_buffers.clear();
     scratch_images.clear();
+    scratch_views.clear();
     size_t total = 0;
     for (const VC::DescriptorBinding& binding : layout.bindings) {
         total += binding.count;
@@ -855,6 +863,7 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
     scratch_writes.reserve(layout.bindings.size());
     scratch_buffers.reserve(total);
     scratch_images.reserve(total);
+    scratch_views.reserve(total);
 
     prof_zero_size = false;
     std::array<BufferRef, BIND_STAGES> driver_bank{};
@@ -1562,16 +1571,103 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
             write.pImageInfo = &scratch_images[first];
             break;
         }
+        case VC::DescriptorKind::UniformTexelBuffer: {
+            // A texture buffer the shader fetches texels from (Hyrule Warriors' light lists).
+            const size_t first = scratch_views.size();
+            bool usable = true;
+            for (u32 i = 0; i < count; ++i) {
+                VC::HandleRef texture_ref = binding.texture;
+                texture_ref.slot += i;
+                texture_ref.byte_offset += i * VC::HandleStride;
+                const u32 texture_word =
+                    ReadBindingHandleWord(layout, binding, texture_ref, VC::HandleWordKind::Texture)
+                        .value_or(0);
+                const std::shared_ptr<Texture>& texture =
+                    TextureOfId(VC::TextureIdOf(texture_word));
+                const bool is_buffer = texture && IsTextureBuffer(*texture);
+                if (!is_buffer) {
+                    note(DescReason::TexelBuffer);
+                }
+                const VkBufferView view = TexelBufferView(is_buffer ? texture.get() : nullptr);
+                usable &= view != VK_NULL_HANDLE;
+                scratch_views.push_back(view);
+            }
+            if (!usable) {
+                ++counters.descriptors_unsupported;
+                host->HostFailed("Draw", "no arena space for a texture buffer");
+                continue;
+            }
+            write.pTexelBufferView = &scratch_views[first];
+            break;
+        }
         default:
-            // Texel buffers: no VkBufferView support yet.
+            // Storage texel buffers: not supported yet.
             ++counters.descriptors_unsupported;
             note(DescReason::TexelBuffer);
-            host->HostUnsupported("Draw", "texel buffer descriptors are not supported");
+            host->HostUnsupported("Draw", "storage texel buffer descriptors are not supported");
             continue;
         }
         scratch_writes.push_back(write);
     }
     return true;
+}
+
+VkBufferView DrawContext::TexelBufferView(const Texture* texture) {
+    InFlight& flight = host->HostFlight();
+    if (texel_views_seq != flight.seq) {
+        texel_views.clear();
+        texel_views_seq = flight.seq;
+    }
+    // The bytes as the CPU sees them now, like a uniform buffer's; no texture: 256 bytes of zeros.
+    u64 address = 0;
+    u64 size = 256;
+    VkFormat format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    const u8* source = nullptr;
+    if (texture != nullptr) {
+        const VC::TextureDesc& desc = texture->desc;
+        const u64 bytes =
+            u64{desc.width} * VideoCore::Surface::BytesPerBlock(texture->host.pixel_format);
+        if (const auto it = impl.pools.find(desc.pool_serial); it != impl.pools.end() && bytes != 0) {
+            const u64 guest = it->second->address + desc.pool_offset;
+            source = impl.GuestPointer(guest, bytes);
+            if (source != nullptr) {
+                address = guest;
+                size = bytes;
+                format = texture->host.format;
+            }
+        }
+        if (source == nullptr) {
+            NoteFallback(true, DescReason::TexelBuffer);
+        }
+    }
+    for (const TexelView& entry : texel_views) {
+        if (entry.address == address && entry.size == size && entry.format == format) {
+            return entry.view;
+        }
+    }
+    u8* pointer = nullptr;
+    const BufferRef copy = AllocArena(size, 256, &pointer);
+    if (!copy.buffer) {
+        return VK_NULL_HANDLE;
+    }
+    if (source != nullptr) {
+        std::memcpy(pointer, source, size);
+    } else {
+        std::memset(pointer, 0, size);
+    }
+    auto view = std::make_shared<vk::BufferView>(impl.device.GetLogical().CreateBufferView({
+        .sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .buffer = copy.buffer,
+        .format = format,
+        .offset = copy.offset,
+        .range = size,
+    }));
+    const VkBufferView handle = **view;
+    flight.keepalive.push_back(std::move(view));
+    texel_views.push_back({address, size, format, handle});
+    return handle;
 }
 
 bool DrawContext::IsBoundTarget(const Storage* storage) const {
