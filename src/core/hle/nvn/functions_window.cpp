@@ -11,12 +11,14 @@
 #include "common/boot_counter.h"
 #include "common/diag_request.h"
 #include "common/frame_stats.h"
+#include "common/game_presets.h"
 #include "common/hdr.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_hardware_timer.h"
+#include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/nvn/hle_call.h"
@@ -382,12 +384,6 @@ void nvnWindowGetPresentInterval(Call& c) {
     c.ret.SetU32(static_cast<u32>(it != c.runtime.windows.end() ? it->second.present_interval : 1));
 }
 
-/// The interval the display slots and the pacing use: what the game set (Eglantine has no
-/// display VRR capability, so the window interval always applies).
-s32 AppliedPresentInterval(s32 requested) {
-    return requested;
-}
-
 void nvnWindowSetPresentInterval(Call& c) {
     const u64 window = c.args.NextPointer();
     const s32 interval = c.args.NextS32();
@@ -595,18 +591,23 @@ void LogPresentStats(std::chrono::steady_clock::time_point entered,
 
 /// The pacing inputs of the settings now (and of the guest's video playback).
 PresentPaceInputs PaceInputsFor(Call& c, s32 present_interval) {
+    const bool video = c.system != nullptr && c.system->GetNVDECActive();
+    const Kernel::KProcess* const process = c.system ? c.system->ApplicationProcess() : nullptr;
+    const bool mkw_adaptive = process &&
+                              process->GetProgramId() == Settings::MarioKartWorldProgramId &&
+                              process->IsMkwDynamicFpsPatchApplied() &&
+                              !Settings::values.mkw_30fps.GetValue();
     return {
-        .present_interval = AppliedPresentInterval(present_interval),
+        .present_interval = AdaptivePresentInterval(present_interval, mkw_adaptive, video),
         .frame_rate_cap = Settings::FrameRateCap(),
         .use_speed_limit = Settings::values.use_speed_limit.GetValue(),
         .speed_limit_percent = Settings::SpeedLimit(),
-        .video_framerate = Settings::values.use_video_framerate.GetValue() &&
-                           c.system != nullptr && c.system->GetNVDECActive(),
+        .video_framerate = Settings::values.use_video_framerate.GetValue() && video,
     };
 }
 
-void PacePresent(Call& c, s32 present_interval) {
-    const PacePlan plan = PlanPresentPacing(PaceInputsFor(c, present_interval));
+void PacePresent(Call& c, const PresentPaceInputs& pace) {
+    const PacePlan plan = PlanPresentPacing(pace);
     if (plan.mode == PaceMode::SpeedLimiter) {
         c.system->SpeedLimiter().DoSpeedLimiting(c.system->CoreTiming().GetGlobalTimeUs());
         return;
@@ -630,8 +631,8 @@ void PacePresent(Call& c, s32 present_interval) {
 }
 
 /// EDEN_NX2_MAX_FRAMES_IN_FLIGHT (present_pacing.h PresentDepthLimit): the present returns once
-/// the present `n` frames earlier has completed on the GPU. Unset defaults to 1; `self` waits for
-/// this present itself (n = 0); 0 or off opts out.
+/// the present `n` frames earlier has completed on the GPU. Unset defaults to 1.
+/// `self` waits for this present itself (n = 0); 0 or off opts out.
 void WaitPresentDepth(Call& c, u64 seq) {
     u64 target = 0;
     {
@@ -692,12 +693,13 @@ void nvnQueuePresentTexture(Call& c) {
         }
         return;
     }
-    s32 present_interval{1};
+    PresentPaceInputs pace;
     {
         std::scoped_lock lock{c.runtime.window_mutex};
-        if (const auto it = c.runtime.windows.find(window); it != c.runtime.windows.end()) {
+        const auto it = c.runtime.windows.find(window);
+        pace = PaceInputsFor(c, it != c.runtime.windows.end() ? it->second.present_interval : 1);
+        if (it != c.runtime.windows.end()) {
             Runtime::WindowState& state = it->second;
-            present_interval = state.present_interval;
             state.acquired_mask &= ~(1u << slot);
             ++state.presents;
             // The frame is shown at the next display slot after the previous one (interval
@@ -705,9 +707,7 @@ void nvnQueuePresentTexture(Call& c) {
             // frame's texture.
             const u64 now = HostNanoseconds();
             const u64 period = ScaledDisplayPeriodNs(
-                DisplayPeriodNs *
-                    static_cast<u64>(std::max(AppliedPresentInterval(state.present_interval), 0)),
-                PaceInputsFor(c, state.present_interval));
+                DisplayPeriodNs * static_cast<u64>(std::max(pace.present_interval, 0)), pace);
             const u64 display = state.last_display_ns == 0 ? now : std::max(state.last_display_ns + period, now);
             if (state.displayed_slot >= 0 && state.displayed_slot != slot &&
                 state.displayed_slot < 4) {
@@ -729,7 +729,7 @@ void nvnQueuePresentTexture(Call& c) {
     WaitPresentDepth(c, present_seq);
     if (c.system != nullptr) {
         const auto entered = std::chrono::steady_clock::now();
-        PacePresent(c, present_interval);
+        PacePresent(c, pace);
         const auto paced = std::chrono::steady_clock::now();
         Common::FrameStats::AddStall(
             Common::FrameStats::Cause::GuestPace,

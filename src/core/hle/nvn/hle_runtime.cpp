@@ -221,6 +221,10 @@ bool Runtime::EnsureRecorder(Core::System& system) {
     }
     gate->SetFailureCallback(
         [this, &system](std::string reason) { OnSinkFailure(system, std::move(reason)); });
+    if (system.GetApplicationProcessProgramID() == Settings::MarioKartWorldProgramId) {
+        recorder->SetCommandListBatching(true);
+        LOG_INFO(Core, "[nvn] Mario Kart World: batching command-list copies at submit");
+    }
     {
         // Uniform snapshot at submit: on (strict) for Ocarina of Time, the variable overrides it
         // for any title (0 off, 2 raw-reachable pages left to the CPU-written test,
@@ -228,22 +232,28 @@ bool Runtime::EnsureRecorder(Core::System& system) {
         using VideoCommon::Nvn::UniformSnapshotMode;
         const char* const value = std::getenv("EDEN_NX2_NVN_UBO_SNAPSHOT");
         const bool forced = value != nullptr && *value != '\0';
+        const u64 title = system.GetApplicationProcessProgramID();
+        const char* default_reason = "default";
         UniformSnapshotMode mode = UniformSnapshotMode::Off;
         if (forced) {
             mode = std::strcmp(value, "0") == 0   ? UniformSnapshotMode::Off
                    : std::strcmp(value, "2") == 0 ? UniformSnapshotMode::CpuOnly
                                                   : UniformSnapshotMode::Strict;
-        } else if (system.GetApplicationProcessProgramID() == Settings::OcarinaOfTimeProgramId) {
+        } else if (title == Settings::OcarinaOfTimeProgramId) {
             mode = UniformSnapshotMode::Strict;
+            default_reason = "Ocarina of Time";
+        } else if (title == Settings::MarioKartWorldProgramId) {
+            // Exposure and other per-frame uniforms must reflect the bytes at guest submit.
+            mode = UniformSnapshotMode::Strict;
+            default_reason = "Mario Kart World";
         }
-        const bool on = mode != UniformSnapshotMode::Off;
         recorder->SetUniformSnapshot(mode);
         LOG_INFO(Core, "[nvn] uniform snapshot at submit: {} ({})",
                  mode == UniformSnapshotMode::Strict    ? "on, strict"
                  : mode == UniformSnapshotMode::CpuOnly ? "on, CPU-written test only"
                                                         : "off",
                  forced ? fmt::format("EDEN_NX2_NVN_UBO_SNAPSHOT={}", value)
-                        : std::string{on ? "Ocarina of Time" : "default"});
+                        : default_reason);
     }
     {
         // Byte cap of the lists recorded at synthetic command memory: off unless set (dropping
