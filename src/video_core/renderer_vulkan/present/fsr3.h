@@ -40,6 +40,13 @@ public:
                      VkExtent2D input_image_extent,
                      const Common::Rectangle<f32>& crop_rect);
 
+    VkImageView Record(const Device& device, vk::CommandBuffer cmdbuf, size_t image_index,
+                       VkImage source_image, VkImageView source_image_view,
+                       VkExtent2D input_image_extent, const Common::Rectangle<f32>& crop_rect);
+    [[nodiscard]] std::shared_ptr<void> TakeRecordResources() {
+        return std::move(m_record_descriptor_sets);
+    }
+
 private:
     // ΓöÇΓöÇ resource creation helpers ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     void CreateImages(const Device& device);
@@ -89,6 +96,12 @@ private:
     // Previous-frame history for temporal accumulation
     vk::Image m_prev_frame_image;
     vk::ImageView m_prev_frame_view;
+    struct RecordDescriptorSets {
+        vk::DescriptorPool pool;
+        vk::DescriptorSets sets;
+    };
+    std::shared_ptr<RecordDescriptorSets> m_record_descriptor_sets;
+    bool m_record_images_ready{};
     bool m_images_ready{};
     bool m_has_prev_frame{};
     u32 m_frame_counter{};

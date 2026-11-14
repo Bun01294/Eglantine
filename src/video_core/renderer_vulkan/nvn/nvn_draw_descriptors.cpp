@@ -804,9 +804,10 @@ bool DrawContext::ViewKeyOf(const Texture& texture, const Storage& s, Shader::Te
         }
     }
     if (s.host.bc_standin && !ViewsBcStandin(key.format, s.host.format)) {
-        // A view of another format than the BC stand-in's (a reinterpretation of the ASTC bytes,
-        // an sRGB view of a BC4/BC5 one) cannot address its blocks.
-        compatible = false;
+        // An sRGB view of a BC4/BC5 stand-in requires an upload in an sRGB-capable format.
+        // Keep it in the plan so the upload can run before FinishImages resolves the view.
+        compatible = compatible && !is_image && key.format == VK_FORMAT_UNDEFINED &&
+                     s.standin_srgb_view;
     }
     slot.texture = &texture;
     slot.serial = texture.serial;
@@ -1154,6 +1155,7 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                                 cache.f != coverage_ring || cache.g != alias_generation) {
                                 u8* pointer = nullptr;
                                 cache.ref = AllocArena(DRIVER_BANK_SIZE, 256, &pointer);
+                                ++counters.driver_bank_uploads;
                                 FillDriverBank(stage, stages[stage], push_constants[0], mesh_dims,
                                                pointer);
                                 if (raw_table != nullptr) {
@@ -1184,6 +1186,7 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                         if (cache.seq != seq || cache.a != handle_gen[stage]) {
                             u8* pointer = nullptr;
                             cache.ref = AllocArena(VC::HandleBankEnd, 256, &pointer);
+                            ++counters.handle_bank_uploads;
                             FillHandleBank(stages[stage], pointer);
                             cache.seq = seq;
                             cache.a = handle_gen[stage];
@@ -1873,8 +1876,17 @@ void DrawContext::FinishImages(DrawPlan& plan) {
     for (const DrawPlan::ImageBinding& binding : plan.bindings) {
         VkDescriptorImageInfo& info = scratch_images[binding.index];
         const Storage& storage = *binding.texture->storage;
-        const VkImageView view =
-            storage.image ? resources.GetView(*binding.texture, binding.key) : VK_NULL_HANDLE;
+        ViewKey key = binding.key;
+        if (!binding.is_image && storage.host.bc_standin &&
+            !ViewsBcStandin(key.format, storage.host.format)) {
+            // Preparing the upload can replace the backing after this descriptor was planned.
+            key.format = StandinViewFormat(binding.texture->host, storage.host);
+            key.swizzle = PackSwizzle(ComposeStandinSwizzle(TextureSwizzle(*binding.texture),
+                                                          BcStandinOf(storage.host)));
+        }
+        const VkImageView view = storage.image && key.format != VK_FORMAT_UNDEFINED
+                                     ? resources.GetView(*binding.texture, key)
+                                     : VK_NULL_HANDLE;
         if (view) {
             info.imageView = view;
             // Two uses of one image in different layouts merge to GENERAL (DrawPlan::UseImage):

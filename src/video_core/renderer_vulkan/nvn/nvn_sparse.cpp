@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <tuple>
 #include <utility>
 
 #include "common/logging.h"
@@ -25,6 +26,50 @@ u32 CeilDiv(u32 value, u32 divisor) {
 }
 
 } // Anonymous namespace
+
+// Row batching follows mkw-recomp's 30af22de9062367d3831d3787d136a6f43ebe275
+// (runtime/gfx/vk/tex/vk_sparse.c). Vulkan lays out the blocks of a bind x first.
+void CompactSparseImageBinds(std::vector<VkSparseImageMemoryBind>& binds, u32 granule_x,
+                             u32 granule_y) {
+    if (binds.size() < 2 || granule_x == 0 || granule_y == 0) {
+        return;
+    }
+    const auto position = [](const VkSparseImageMemoryBind& bind) {
+        return std::tuple{bind.subresource.aspectMask,
+                          bind.subresource.arrayLayer,
+                          bind.subresource.mipLevel,
+                          bind.offset.z,
+                          bind.offset.y,
+                          bind.offset.x};
+    };
+    std::ranges::sort(binds, {}, position);
+    size_t count = 0;
+    for (const VkSparseImageMemoryBind bind : binds) {
+        if (count != 0) {
+            auto& previous = binds[count - 1];
+            const bool same_row =
+                previous.subresource.aspectMask == bind.subresource.aspectMask &&
+                previous.subresource.arrayLayer == bind.subresource.arrayLayer &&
+                previous.subresource.mipLevel == bind.subresource.mipLevel &&
+                previous.offset.y == bind.offset.y && previous.offset.z == bind.offset.z &&
+                previous.extent.height == bind.extent.height &&
+                previous.extent.height <= granule_y && previous.extent.depth == 1 &&
+                bind.extent.depth == 1 && previous.extent.width % granule_x == 0 &&
+                static_cast<s64>(previous.offset.x) + previous.extent.width == bind.offset.x;
+            const bool same_memory =
+                previous.memory == bind.memory && previous.flags == bind.flags &&
+                (bind.memory == VK_NULL_HANDLE ||
+                 previous.memoryOffset + (previous.extent.width / granule_x) * SPARSE_TILE_BYTES ==
+                     bind.memoryOffset);
+            if (same_row && same_memory) {
+                previous.extent.width += bind.extent.width;
+                continue;
+            }
+        }
+        binds[count++] = bind;
+    }
+    binds.resize(count);
+}
 
 // ---- SparsePagePool ---------------------------------------------------------------------------
 
@@ -52,6 +97,9 @@ u32 SparsePagePool::Allocate(u32 memory_type_bits) {
             const u32 page = free_[i];
             free_[i] = free_.back();
             free_.pop_back();
+            if (blocks_[page / PagesPerBlock].used_pages++ == 0) {
+                --empty_blocks_;
+            }
             used_ += PageBytes;
             return page;
         }
@@ -62,14 +110,22 @@ u32 SparsePagePool::Allocate(u32 memory_type_bits) {
         .memoryTypeBits = memory_type_bits,
     };
     Block block;
-    block.allocation = allocator_.AllocateSparseMemory(requirements, block.where.memory,
-                                                       block.where.offset);
+    block.allocation =
+        allocator_.AllocateSparseMemory(requirements, block.where.memory, block.where.offset);
     if (block.allocation == VK_NULL_HANDLE) {
         return NoPage;
     }
     block.type_bits = memory_type_bits;
-    const u32 first = static_cast<u32>(blocks_.size()) * PagesPerBlock;
-    blocks_.push_back(block);
+    block.used_pages = 1;
+    const auto vacant = std::ranges::find_if(
+        blocks_, [](const Block& candidate) { return candidate.allocation == VK_NULL_HANDLE; });
+    const u32 index = static_cast<u32>(vacant - blocks_.begin());
+    const u32 first = index * PagesPerBlock;
+    if (vacant == blocks_.end()) {
+        blocks_.push_back(block);
+    } else {
+        *vacant = block;
+    }
     for (u32 i = PagesPerBlock; i-- > 1;) {
         free_.push_back(first + i);
     }
@@ -83,8 +139,34 @@ void SparsePagePool::Free(u32 page) {
     }
     std::scoped_lock lock{mutex_};
     free_.push_back(page);
+    if (--blocks_[page / PagesPerBlock].used_pages == 0) {
+        ++empty_blocks_;
+    }
     used_ -= PageBytes;
     ++free_generation_;
+}
+
+void SparsePagePool::TrimUnusedBlocks() {
+    std::scoped_lock lock{mutex_};
+    if (empty_blocks_ <= CachedBlockLimit) {
+        return;
+    }
+    u32 kept = 0;
+    for (Block& block : blocks_) {
+        if (block.allocation == VK_NULL_HANDLE || block.used_pages != 0) {
+            continue;
+        }
+        if (kept++ < CachedBlockLimit) {
+            continue;
+        }
+        allocator_.FreeSparseMemory(block.allocation);
+        block = {};
+        --empty_blocks_;
+    }
+    std::erase_if(free_, [&](u32 page) {
+        return blocks_[page / PagesPerBlock].allocation == VK_NULL_HANDLE;
+    });
+    ++free_generation_; // a failed allocation may fit after releasing another format's blocks
 }
 
 SparsePagePool::Where SparsePagePool::Get(u32 page) const {
@@ -96,6 +178,13 @@ SparsePagePool::Where SparsePagePool::Get(u32 page) const {
 u64 SparsePagePool::UsedBytes() const {
     std::scoped_lock lock{mutex_};
     return used_;
+}
+
+u64 SparsePagePool::ReservedBytes() const {
+    std::scoped_lock lock{mutex_};
+    return static_cast<u64>(std::ranges::count_if(
+               blocks_, [](const Block& block) { return block.allocation != VK_NULL_HANDLE; })) *
+           PageBytes * PagesPerBlock;
 }
 
 bool SparsePagePool::HasRoom() const {
@@ -159,6 +248,7 @@ SparseBacking::~SparseBacking() {
             pool_->Free(page);
         }
     }
+    pool_->TrimUnusedBlocks();
 }
 
 bool SparseBacking::Attach(Context::Impl& impl, const Storage& s, const char*& reason) {
@@ -186,11 +276,14 @@ bool SparseBacking::Attach(Context::Impl& impl, const Storage& s, const char*& r
         reason = "no 2D sparse block shape";
         return false;
     }
-    const VkMemoryRequirements memory = impl.device.GetLogical().GetImageMemoryRequirements(*s.image);
+    const VkMemoryRequirements memory =
+        impl.device.GetLogical().GetImageMemoryRequirements(*s.image);
     granule_x_ = props.imageGranularity.width;
     granule_y_ = props.imageGranularity.height;
     const u64 granule_bytes =
-        s.host.needs_transcode
+        s.host.bc_standin ? static_cast<u64>(CeilDiv(granule_x_, 4)) * CeilDiv(granule_y_, 4) *
+                                BcStandinBlockBytes(s.host)
+        : s.host.needs_transcode
             ? static_cast<u64>(granule_x_) * granule_y_ * DecodedTexelBytes(s.host)
             : static_cast<u64>(granule_x_) * granule_y_ * layout_.block.bytes /
                   (layout_.block.width * layout_.block.height);
@@ -237,7 +330,8 @@ bool SparseBacking::Attach(Context::Impl& impl, const Storage& s, const char*& r
             for (u32 x = 0; x < CeilDiv(width, granule_x_); ++x) {
                 tail_host_tiles_.push_back({level, x * granule_x_, y * granule_y_,
                                             (std::min)(granule_x_, width - x * granule_x_),
-                                            (std::min)(granule_y_, height - y * granule_y_), slot++});
+                                            (std::min)(granule_y_, height - y * granule_y_),
+                                            slot++});
             }
         }
     }
@@ -250,22 +344,36 @@ bool SparseBacking::Attach(Context::Impl& impl, const Storage& s, const char*& r
         return false;
     }
     if (!impl.sparse_pages) {
-        // 40% of the device-local heaps (not the texture cache's smaller allowance), but no more
-        // than 12 GiB and no less than 1 GiB: the decoded stand-ins of compressed formats are
-        // several times their guest size.
-        const VkPhysicalDeviceMemoryProperties2 properties =
-            impl.device.GetPhysical().GetMemoryProperties();
+        const auto properties = impl.device.GetPhysical().GetMemoryProperties().memoryProperties;
         u64 local = 0;
-        for (u32 i = 0; i < properties.memoryProperties.memoryHeapCount; ++i) {
-            const VkMemoryHeap& heap = properties.memoryProperties.memoryHeaps[i];
-            if ((heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
+        for (u32 i = 0; i < properties.memoryHeapCount; ++i) {
+            const auto& heap = properties.memoryHeaps[i];
+            if (heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
                 local += heap.size;
             }
         }
-        impl.sparse_pages = std::make_shared<SparsePagePool>(
-            *impl.allocator, (std::clamp)(local / 5 * 2, u64{1} << 30, u64{12} << 30));
+        // MKW also respects the usable budget and simulated heap limit. Keep physical memory
+        // as the fallback on devices without VK_EXT_memory_budget.
+        if (impl.mario_kart_world) {
+            const u64 budget = impl.device.GetDeviceMemoryBudget();
+            if (budget != 0) {
+                local = (std::min)(local, budget);
+            }
+        }
+        const u64 device_budget = impl.options.sparse_device_budget_bytes.value_or(
+            (std::clamp)(local / 5 * 2, u64{1} << 30, u64{12} << 30));
+        impl.sparse_pages = std::make_shared<SparsePagePool>(*impl.allocator, device_budget);
     }
     pool_ = impl.sparse_pages;
+    // MKW's foliage/lightmap atlas copies write the coarse levels without MapVirtual for
+    // their guest tail bytes. Keep host backing for these levels, as mkw-recomp does in
+    // runtime/gfx/vk/tex/vk_sparse.c (tail_alloc), rather than discarding those GPU writes.
+    persistent_tails_ = impl.mario_kart_world && layout_.HasTail();
+    if (persistent_tails_) {
+        for (u32 layer = 0; layer < layout_.layers; ++layer) {
+            Queue(tail_flags_[layer], layer, true);
+        }
+    }
     return true;
 }
 
@@ -362,7 +470,7 @@ bool SparseBacking::BindUnit(Context::Impl& impl, const Storage& s, bool tail, u
                              std::vector<VkSparseMemoryBind>& opaque_binds) {
     static_cast<void>(impl);
     const u32 layer = tail ? id : layout_.Tile(id).layer;
-    std::vector<HostTile> tiles;
+    std::span<const HostTile> tiles;
     u32 slots = 0;
     u32* pages = nullptr;
     std::vector<u32>* tail_vector = nullptr;
@@ -377,7 +485,8 @@ bool SparseBacking::BindUnit(Context::Impl& impl, const Storage& s, bool tail, u
         slots = static_cast<u32>(tail_vector->size());
         pages = tail_vector->data();
     } else {
-        HostTilesOfTile(id, tiles);
+        HostTilesOfTile(id, tile_scratch_);
+        tiles = tile_scratch_;
         slots = host_per_x_ * host_per_y_;
         pages = &tile_pages_[static_cast<size_t>(id) * slots];
     }
@@ -454,7 +563,8 @@ bool SparseBacking::Prepare(Context::Impl& impl, const Storage& s, Uploads& uplo
         std::vector<u32> keep;
         for (const u32 id : pending) {
             u8& flags = flags_vector[id];
-            const bool want = (flags & Mapped) != 0;
+            const bool mapped = (flags & Mapped) != 0;
+            const bool want = mapped || (tail && persistent_tails_);
             const bool have = (flags & Bound) != 0;
             if (want && !have) {
                 if (exhausted || !pool_->HasRoom() ||
@@ -480,18 +590,27 @@ bool SparseBacking::Prepare(Context::Impl& impl, const Storage& s, Uploads& uplo
                 ++unbinds;
             }
             flags &= static_cast<u8>(~Queued);
-            if (want && (flags & Dirty) != 0) {
+            if (mapped && (flags & Dirty) != 0) {
                 (tail ? uploads.tails : uploads.tiles).push_back(id);
             }
         }
         pending = std::move(keep);
     };
-    process(false, pending_tiles_, tile_flags_);
-    process(true, pending_tails_, tail_flags_);
+    if (persistent_tails_) {
+        // Reserve the small coarse levels before spending the budget on the detailed tiles.
+        process(true, pending_tails_, tail_flags_);
+        process(false, pending_tiles_, tile_flags_);
+    } else {
+        process(false, pending_tiles_, tile_flags_);
+        process(true, pending_tails_, tail_flags_);
+    }
     starved_ = static_cast<u32>(pending_tiles_.size() + pending_tails_.size());
     starved_only_ = starved_ != 0;
     starved_generation_ = generation;
     if (!image_binds.empty() || !opaque_binds.empty()) {
+        if (impl.mario_kart_world) {
+            CompactSparseImageBinds(image_binds, granule_x_, granule_y_);
+        }
         const VkSparseImageMemoryBindInfo image_info{
             .image = *s.image,
             .bindCount = static_cast<u32>(image_binds.size()),
@@ -502,11 +621,20 @@ bool SparseBacking::Prepare(Context::Impl& impl, const Storage& s, Uploads& uplo
             .bindCount = static_cast<u32>(opaque_binds.size()),
             .pBinds = opaque_binds.data(),
         };
+        // On MKW, the GPU can still be reading the atlas while the guest streams new tiles.
+        // Wait for earlier work before changing residency, then wait for this bind below.
+        const bool wait_for_atlas_use =
+            impl.mario_kart_world && impl.mkw_last_submit_semaphore != VK_NULL_HANDLE;
+        const VkTimelineSemaphoreSubmitInfo timeline{
+            .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+            .waitSemaphoreValueCount = 1,
+            .pWaitSemaphoreValues = &impl.mkw_last_submit_value,
+        };
         const VkBindSparseInfo info{
             .sType = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO,
-            .pNext = nullptr,
-            .waitSemaphoreCount = 0,
-            .pWaitSemaphores = nullptr,
+            .pNext = wait_for_atlas_use ? &timeline : nullptr,
+            .waitSemaphoreCount = wait_for_atlas_use ? 1u : 0u,
+            .pWaitSemaphores = wait_for_atlas_use ? &impl.mkw_last_submit_semaphore : nullptr,
             .bufferBindCount = 0,
             .pBufferBinds = nullptr,
             .imageOpaqueBindCount = opaque_binds.empty() ? 0U : 1U,
@@ -558,6 +686,12 @@ bool SparseBacking::Prepare(Context::Impl& impl, const Storage& s, Uploads& uplo
         pool_->Free(page);
     }
     deferred_free_.clear();
+    pool_->TrimUnusedBlocks();
+    for (const auto& [tail, id] : bound_now) {
+        if (tail && persistent_tails_ && (tail_flags_[id] & Mapped) == 0) {
+            uploads.zero_tails.push_back(id);
+        }
+    }
     for (const u32 id : uploads.tiles) {
         tile_flags_[id] &= static_cast<u8>(~Dirty);
     }

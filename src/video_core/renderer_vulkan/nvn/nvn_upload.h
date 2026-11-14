@@ -81,13 +81,15 @@ void RunParallel(size_t count, const std::function<void(size_t)>& fn);
 
 /// A signature of ~16 KiB of `data`, spread evenly over it (the whole of it when it is small).
 /// Equal bytes give equal signatures; a signature that differs proves the bytes differ.
-[[nodiscard]] u64 SampleGuestBytes(const u8* data, u64 size);
+/// batch_lines hashes one gathered copy of the same sampled lines (a different signature).
+[[nodiscard]] u64 SampleGuestBytes(const u8* data, u64 size, bool batch_lines = false);
 
 /// SampleGuestBytes (the same value for the same bytes) of `size` bytes that are only reachable
 /// through `read(offset, count, destination)`, which has to fill `count` bytes: it is asked for the
 /// sampled lines only (the whole range when `size` is small), so a gathered (virtual pool) storage
 /// is not copied for a signature.
 [[nodiscard]] u64 SampleGuestBytesBy(
-    u64 size, const std::function<void(u64 offset, u64 count, u8* destination)>& read);
+    u64 size, const std::function<void(u64 offset, u64 count, u8* destination)>& read,
+    bool batch_lines = false);
 
 } // namespace Vulkan::Nvn

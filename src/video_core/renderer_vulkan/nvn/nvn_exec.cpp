@@ -34,9 +34,15 @@
 #include "video_core/renderer_vulkan/nvn/nvn_impl.h"
 #include "video_core/renderer_vulkan/nvn/nvn_settings_notice.h"
 #include "video_core/renderer_vulkan/nvn/nvn_sparse.h"
+#include "video_core/renderer_vulkan/nvn/nvn_submit_policy.h"
 #include "video_core/renderer_vulkan/nvn/nvn_upload.h"
+#include "video_core/renderer_vulkan/present/filters.h"
 #include "video_core/renderer_vulkan/present/fsr.h"
+#include "video_core/renderer_vulkan/present/fsr3.h"
 #include "video_core/renderer_vulkan/present/layer.h"
+#include "video_core/renderer_vulkan/present/sgsr.h"
+#include "video_core/renderer_vulkan/present/util.h"
+#include "video_core/renderer_vulkan/present/window_adapt_pass.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/shader_log.h"
 #include "video_core/textures/decoders.h"
@@ -672,23 +678,21 @@ private:
     /// mapped since the last use, takes it back from the unmapped ones, and uploads the mapped
     /// tiles whose bytes changed. `will_overwrite`: binds only.
     void SyncSparse(Storage& s, bool will_overwrite);
-    /// Decodes an ASTC storage on the GPU, straight from its imported pool (nvn_astc_gpu.h):
-    /// records the dispatches and leaves the image in GENERAL layout. False (nothing recorded)
-    /// when the storage or its pool cannot take that path; the caller then decodes on the CPU.
-    bool UploadAstcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool);
-    /// The levels UploadAstcOnGpu decodes, false when the storage or its pool cannot take the GPU
-    /// path (nothing recorded).
-    bool AstcGpuLevels(Storage& s, const UploadPlan& plan, Pool& pool,
+    /// Decodes ASTC on the GPU from imported guest memory or staged compressed bytes.
+    /// Returns false when the CPU must decode it instead.
+    bool UploadAstcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool, const u8* data, u64 size);
+    bool AstcGpuLevels(const Storage& s, const UploadPlan& plan, u64 input_offset,
                        const AstcGpuDecoder& decoder, std::vector<AstcGpuDecoder::Level>& levels);
     /// UploadAstcOnGpu for a BC stand-in: decodes into the BC scratch, chunk by chunk, and encodes.
-    bool UploadAstcBcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool);
+    bool UploadAstcBcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool, const u8* data,
+                           u64 size);
     /// A BC stand-in's RGBA8 texels decoded by the CPU into `staging` (`plan`'s pieces): copied
     /// into the BC scratch, encoded and copied into the image.
     void UploadBcFromStaging(Storage& s, const UploadPlan& plan, const StagingRange& staging);
     /// Records every chunk of a BC stand-in upload: `fill` writes the chunk's RGBA8 texels into
     /// layers [0, chunk.layers) of the scratch (GENERAL layout), then they are encoded and copied
     /// into `s` at the chunk's level, layers and offset. `guest_contents`: the texels are the
-    /// guest's bytes (an upload), not a GPU write. False when nothing could be recorded.
+    /// guest's bytes (an upload), not a GPU write. False unless every chunk was recorded.
     /// The flight's BcUploadTimes with room for one more upload (created on first use), null
     /// without timestamps or when it is full (counted untimed).
     BcUploadTimes* BcTimes();
@@ -783,11 +787,9 @@ private:
     void FlushAndWait();
     /// Submits segments[submitted_segments..]; `binary_signals` go on the last one.
     void SubmitSegments(std::span<const VkSemaphore> binary_signals);
-    /// Whether the present draws through the presentation passes (window adapting filter,
-    /// anti-aliasing, post-processing) rather than the plain blit; logs once why not when the
-    /// settings ask for them and they cannot run.
-    [[nodiscard]] bool UsePresentPasses(const Layout::FramebufferLayout& layout,
-                                        const Frame& frame);
+    bool RecordWindowFilter(Texture& texture, VkFormat source_format, const Frame& frame,
+                            const PixelRect& crop, const PixelRect& picture);
+    void WarnUnsupportedPresentPasses(bool applied_filter);
     /// Acquires `count` more frames, records the generated frames into them and lists them in
     /// presentation order.
     void GenerateFrames(size_t count, const Frame& frame, std::vector<Frame*>& generated);
@@ -1146,13 +1148,14 @@ void Recorder::PrepareImagesSpan(std::span<const std::pair<Storage*, VkImageLayo
 StagingRange Recorder::AllocStaging(u64 size, u64 alignment) {
     chunk_used = (chunk_used + alignment - 1) / alignment * alignment;
     if (flight.staging.empty() || chunk_used + size > chunk_size) {
-        chunk_size = (std::max)(size, STAGING_CHUNK);
-        // Storage use: the GPU untile reads tiled bytes from staging (UploadUntileOnGpu).
+        const u64 new_size = (std::max)(size, STAGING_CHUNK);
+        // GPU untile and ASTC decode can read the staged GOBs directly.
         vk::Buffer chunk = impl.CreateHostBuffer(
-            chunk_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            new_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             MemoryUsage::Upload, AllocationKind::Staging);
-        chunk_pointer = chunk.Mapped().data();
         flight.staging.push_back(std::move(chunk));
+        chunk_size = new_size;
+        chunk_pointer = flight.staging.back().Mapped().data();
         chunk_used = 0;
     }
     const StagingRange range{*flight.staging.back(), chunk_used, chunk_pointer + chunk_used};
@@ -1192,8 +1195,10 @@ bool Recorder::MirrorTakeCpuWrites(Pool& pool) {
         const u64 raw_epoch = impl.split_raw_epoch.load(std::memory_order_acquire);
         if (raw_epoch != pool.split_raw_epoch_seen) {
             pool.split_raw_epoch_seen = raw_epoch;
-            for (Pool::MirrorPage& page : pool.mirror_pages) {
-                page.trusted = false;
+            if (!impl.mario_kart_world) {
+                for (Pool::MirrorPage& page : pool.mirror_pages) {
+                    page.trusted = false;
+                }
             }
         }
     }
@@ -1270,10 +1275,12 @@ bool Recorder::MirrorNeedsUpload(Pool& pool, u64 offset, u64 size) {
     bool dirty = false;
     for (u64 index = first; index <= last / Pool::MIRROR_PAGE; ++index) {
         Pool::MirrorPage& page = pool.mirror_pages[static_cast<size_t>(index)];
-        if (page.valid && page.checked == stamp) {
+        const bool current_epoch = !impl.mario_kart_world || pool.split_runs.empty() ||
+                                   page.raw_epoch == pool.split_raw_epoch_seen;
+        if (page.valid && page.checked == stamp && current_epoch) {
             continue;
         }
-        if (page.valid && page.trusted) {
+        if (page.valid && page.trusted && current_epoch) {
             ++trusted;
             continue;
         }
@@ -1281,6 +1288,7 @@ bool Recorder::MirrorNeedsUpload(Pool& pool, u64 offset, u64 size) {
         ++hashed;
         if (page.valid && page.hash == GuestPageHash(pool, index)) {
             page.checked = stamp;
+            page.raw_epoch = pool.split_raw_epoch_seen;
             page.trusted = settled;
             continue;
         }
@@ -1313,10 +1321,12 @@ void Recorder::UploadRange(Pool& pool, u64 offset, u64 size) {
     std::vector<std::pair<u64, u64>> parts;
     for (u64 index = first; index <= last / Pool::MIRROR_PAGE; ++index) {
         Pool::MirrorPage& page = pool.mirror_pages[static_cast<size_t>(index)];
-        if (page.valid && page.checked == stamp) {
+        const bool current_epoch = !impl.mario_kart_world || pool.split_runs.empty() ||
+                                   page.raw_epoch == pool.split_raw_epoch_seen;
+        if (page.valid && page.checked == stamp && current_epoch) {
             continue;
         }
-        if (page.valid && page.trusted) {
+        if (page.valid && page.trusted && current_epoch) {
             ++trusted;
             continue;
         }
@@ -1327,6 +1337,7 @@ void Recorder::UploadRange(Pool& pool, u64 offset, u64 size) {
         page.hash = hash;
         page.valid = true;
         page.checked = stamp;
+        page.raw_epoch = pool.split_raw_epoch_seen;
         page.trusted = settled;
         if (!changed) {
             continue;
@@ -1734,7 +1745,7 @@ std::optional<u64> GuestSignatureOf(Context::Impl& impl, const Storage& s) {
     if (data == nullptr) {
         return std::nullopt;
     }
-    return SampleGuestBytes(data, size);
+    return SampleGuestBytes(data, size, impl.mario_kart_world);
 }
 
 /// EDEN_NX2_NVN_LEGACY_FIRST_UPLOAD=1: overlapping GPU-written storages are copied over a texture
@@ -1952,7 +1963,7 @@ void Recorder::UploadStorage(Storage& s) {
     if (cpu_visible) {
         const auto begin = std::chrono::steady_clock::now();
         s.guest_hash = HashGuestBytes(data, size);
-        s.sample_hash = SampleGuestBytes(data, size);
+        s.sample_hash = SampleGuestBytes(data, size, impl.mario_kart_world);
         impl.stats.hash_ns.fetch_add(
             static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                  std::chrono::steady_clock::now() - begin)
@@ -1967,8 +1978,8 @@ void Recorder::UploadStorage(Storage& s) {
     bool on_gpu = false;
     if ((s.astc_gpu || s.host.bc_standin) && impl.astc_gpu_enabled &&
         plan.decode == UploadPlan::Decode::Astc) {
-        on_gpu =
-            s.host.bc_standin ? UploadAstcBcOnGpu(s, plan, pool) : UploadAstcOnGpu(s, plan, pool);
+        on_gpu = s.host.bc_standin ? UploadAstcBcOnGpu(s, plan, pool, data, size)
+                                   : UploadAstcOnGpu(s, plan, pool, data, size);
         if (on_gpu && Debug::Get().astc_verify && !s.host.bc_standin) {
             VerifyAstcGpu(s, plan, data, size);
         }
@@ -2045,6 +2056,7 @@ void Recorder::UploadStorage(Storage& s) {
     // From here on the contents are the guest's bytes at this moment. A CPU-accessible pool can
     // change them behind our back: remember what they were, to notice. A GPU-only pool's bytes
     // are the game's initial fill and never change again.
+    s.contents_valid = true; // RefitStandin may have replaced the image above.
     s.origin = cpu_visible ? StorageOrigin::Cpu : StorageOrigin::Gpu;
     s.watch_valid = false;
     s.unchanged_checks = 0;
@@ -2070,8 +2082,48 @@ void Recorder::SyncSparse(Storage& s, bool will_overwrite) {
     }
     const Common::FrameStats::Scope stall{Common::FrameStats::Cause::TextureUpload};
     SparseBacking::Uploads uploads;
-    if (!sparse.Prepare(impl, s, uploads) || will_overwrite ||
-        (uploads.tiles.empty() && uploads.tails.empty())) {
+    if (!sparse.Prepare(impl, s, uploads)) {
+        return;
+    }
+    // Unmapped coarse levels have real memory on MKW. Initialize it once on residency,
+    // before partial GPU copies can leave arbitrary old allocation contents visible.
+    if (!uploads.zero_tails.empty() && s.aspect == VK_IMAGE_ASPECT_COLOR_BIT) {
+        const auto& sparse_layout = sparse.Layout();
+        const BlockInfo block = s.host.bc_standin ? BlockInfo{BcStandinBlockBytes(s.host), 4, 4}
+                                : s.host.needs_transcode
+                                    ? BlockInfo{DecodedTexelBytes(s.host), 1, 1}
+                                    : sparse_layout.block;
+        for (u32 layer : uploads.zero_tails) {
+            u64 bytes = 0;
+            std::vector<VkBufferImageCopy> regions;
+            for (u32 level = static_cast<u32>(sparse_layout.level.size()); level < s.levels;
+                 ++level) {
+                const u32 width = (std::max)(s.extent.width >> level, 1u);
+                const u32 height = (std::max)(s.extent.height >> level, 1u);
+                bytes = (bytes + 15) / 16 * 16;
+                regions.push_back({.bufferOffset = bytes,
+                                   .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1},
+                                   .imageExtent = {width, height, 1}});
+                bytes += u64{(width + block.width - 1) / block.width} *
+                         ((height + block.height - 1) / block.height) * block.bytes;
+            }
+            if (bytes != 0) {
+                const StagingRange staging = AllocStaging(bytes, 16);
+                std::memset(staging.pointer, 0, static_cast<size_t>(bytes));
+                for (auto& region : regions) {
+                    region.bufferOffset += staging.offset;
+                }
+                const bool saved = track_writes;
+                track_writes = false;
+                PrepareImages({{&s, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
+                track_writes = saved;
+                Cmd().CopyBufferToImage(staging.buffer, *s.image,
+                                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, regions);
+                barrier_pending = true;
+            }
+        }
+    }
+    if (will_overwrite || (uploads.tiles.empty() && uploads.tails.empty())) {
         return;
     }
     const auto pool_it = impl.pools.find(s.pool_serial);
@@ -2179,8 +2231,34 @@ void Recorder::SyncSparse(Storage& s, bool will_overwrite) {
         track_writes = false;
         PrepareImages({{&s, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
         track_writes = saved;
-        Cmd().CopyBufferToImage(staging.buffer, *s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                regions);
+        if (s.host.bc_standin) {
+            std::vector<BcChunk> chunks;
+            chunks.reserve(regions.size());
+            for (const auto& region : regions) {
+                chunks.push_back({region.imageSubresource.mipLevel,
+                                  region.imageSubresource.baseArrayLayer, 1,
+                                  region.imageExtent.width, region.imageExtent.height,
+                                  static_cast<u32>(region.imageOffset.x),
+                                  static_cast<u32>(region.imageOffset.y)});
+            }
+            size_t next = 0;
+            if (!RecordBcUpload(s, chunks, true, [&](const BcChunk&, BcScratch& scratch) {
+                    VkBufferImageCopy region = regions[next++];
+                    region.imageSubresource.mipLevel = 0;
+                    region.imageSubresource.baseArrayLayer = 0;
+                    region.imageOffset = {0, 0, 0};
+                    Cmd().CopyBufferToImage(staging.buffer, *scratch.image, VK_IMAGE_LAYOUT_GENERAL,
+                                            region);
+                })) {
+                // Prepare cleared the dirty flags; failed uploads must be retried.
+                sparse.MarkAllDirty();
+                s.contents_valid = false;
+                return;
+            }
+        } else {
+            Cmd().CopyBufferToImage(staging.buffer, *s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                    regions);
+        }
         barrier_pending = true;
     }
     // From here on the contents are the guest's bytes (a texture the GPU wrote keeps its origin).
@@ -2189,15 +2267,11 @@ void Recorder::SyncSparse(Storage& s, bool will_overwrite) {
     }
 }
 
-bool Recorder::AstcGpuLevels(Storage& s, const UploadPlan& plan, Pool& pool,
+bool Recorder::AstcGpuLevels(const Storage& s, const UploadPlan& plan, u64 input_offset,
                              const AstcGpuDecoder& decoder,
                              std::vector<AstcGpuDecoder::Level>& levels) {
-    // Only an imported pool is readable by the GPU as the guest's own bytes; one still being
-    // backed is not waited for (the CPU path does not need its buffer).
-    if (pool.pending.load(std::memory_order_acquire) || pool.backing != Pool::Backing::Imported ||
-        plan.linear || s.type != VK_IMAGE_TYPE_2D || s.samples != VK_SAMPLE_COUNT_1_BIT ||
-        s.layers == 0 || s.layout.size > pool.size - s.pool_offset ||
-        s.layout.layer_size > 0xFFFFFFFFull || (s.layout.layer_size & 15) != 0) {
+    if (plan.linear || s.type != VK_IMAGE_TYPE_2D || s.samples != VK_SAMPLE_COUNT_1_BIT ||
+        s.layers == 0 || s.layout.layer_size > 0xFFFFFFFFull || (s.layout.layer_size & 15) != 0) {
         return false;
     }
     const BlockInfo block = FormatBlockInfo(s.desc.format);
@@ -2208,7 +2282,7 @@ bool Recorder::AstcGpuLevels(Storage& s, const UploadPlan& plan, Pool& pool,
             continue;
         }
         if (piece.slices != 1 ||
-            ((s.pool_offset + piece.guest_offset) % decoder.OffsetAlignment()) != 0) {
+            ((input_offset + piece.guest_offset) % decoder.OffsetAlignment()) != 0) {
             return false;
         }
         levels.push_back({
@@ -2229,33 +2303,84 @@ bool Recorder::AstcGpuLevels(Storage& s, const UploadPlan& plan, Pool& pool,
     return !levels.empty() && plan.pieces.size() == levels.size() * s.layers;
 }
 
-bool Recorder::UploadAstcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool) {
+bool Recorder::UploadAstcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool, const u8* data,
+                               u64 size) {
     AstcGpuDecoder* const decoder = impl.AstcDecoder();
-    std::vector<AstcGpuDecoder::Level> levels;
-    if (!decoder || !AstcGpuLevels(s, plan, pool, *decoder, levels)) {
+    if (!decoder || size != s.layout.size) {
         return false;
     }
-    // The shader reads the pool's bytes through host memory: storage shadows over them first (the
-    // barrier of PrepareImages orders their copies before the dispatches).
-    if (draw.HasShadows()) {
-        draw.FlushShadowsOverlapping(pool, s.pool_offset, s.layout.size);
+    std::vector<AstcGpuDecoder::Level> levels;
+    VkBuffer input{};
+    u64 input_offset{};
+    u64 input_size = size;
+    if (!pool.pending.load(std::memory_order_acquire) && pool.backing == Pool::Backing::Imported &&
+        AstcGpuLevels(s, plan, s.pool_offset, *decoder, levels)) {
+        input = pool.Handle();
+        input_offset = s.pool_offset;
+        input_size = pool.size - s.pool_offset;
+        // PrepareImages orders writes from overlapping storage shadows before the decode.
+        if (draw.HasShadows()) {
+            draw.FlushShadowsOverlapping(pool, s.pool_offset, s.layout.size);
+        }
+    } else {
+        // MKW streams ASTC 8x8 textures into its lighting atlases. Stage the compressed GOBs
+        // from mirrored pools to keep the CPU replay thread out of large RGBA8 decodes.
+        constexpr u64 MinStagedAstcBytes = u64{64} << 10;
+        constexpr u64 MaxStagedAstcBytes = u64{64} << 20;
+        if (!impl.mario_kart_world || s.sparse || !IsAstc8x8(s.host.pixel_format) ||
+            size < MinStagedAstcBytes || size > MaxStagedAstcBytes ||
+            size > impl.device.GetMaxStorageBufferRange() ||
+            !AstcGpuLevels(s, plan, 0, *decoder, levels)) {
+            return false;
+        }
+        try {
+            const StagingRange staging = AllocStaging(size, decoder->OffsetAlignment());
+            std::memcpy(staging.pointer, data, static_cast<size_t>(size));
+            input = staging.buffer;
+            input_offset = staging.offset;
+        } catch (const vk::Exception& exception) {
+            LogOnce(fmt::format("MKW ASTC staging allocation failed: {}", exception.what()));
+            return false;
+        }
     }
     const bool saved = track_writes;
     track_writes = false;
     PrepareImages({{&s, VK_IMAGE_LAYOUT_GENERAL}});
     track_writes = saved;
-    auto views = std::make_shared<std::vector<vk::ImageView>>(decoder->Record(
-        Cmd(), pool.Handle(), s.pool_offset, pool.size - s.pool_offset, *s.image, levels));
+    auto views = std::make_shared<std::vector<vk::ImageView>>(
+        decoder->Record(Cmd(), input, input_offset, input_size, *s.image, levels));
     flight.keepalive.push_back(std::move(views));
     barrier_pending = true;
     return true;
 }
 
-bool Recorder::UploadAstcBcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool) {
+bool Recorder::UploadAstcBcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool, const u8* data,
+                                 u64 size) {
     AstcGpuDecoder* const decoder = impl.AstcDecoder();
     std::vector<AstcGpuDecoder::Level> levels;
-    if (!decoder || !AstcGpuLevels(s, plan, pool, *decoder, levels)) {
+    if (!decoder || size != s.layout.size || s.layout.size > pool.size - s.pool_offset) {
         return false;
+    }
+    VkBuffer input{};
+    u64 input_offset{};
+    u64 input_size{};
+    if (!pool.pending.load(std::memory_order_acquire) && pool.backing == Pool::Backing::Imported &&
+        AstcGpuLevels(s, plan, s.pool_offset, *decoder, levels)) {
+        input = pool.Handle();
+        input_offset = s.pool_offset;
+        input_size = pool.size - s.pool_offset;
+    } else {
+        // Keep MKW's streaming sources on the GPU decode path with mirrored guest pools too.
+        if (!impl.mario_kart_world || !IsAstc8x8(s.host.pixel_format) || size < (u64{64} << 10) ||
+            size > (u64{64} << 20) || size > impl.device.GetMaxStorageBufferRange() ||
+            !AstcGpuLevels(s, plan, 0, *decoder, levels)) {
+            return false;
+        }
+        const StagingRange staging = AllocStaging(size, decoder->OffsetAlignment());
+        std::memcpy(staging.pointer, data, static_cast<size_t>(size));
+        input = staging.buffer;
+        input_offset = staging.offset;
+        input_size = size;
     }
     // The decoder writes level 0 of the scratch: one dispatch per chunk of layers, each bound from
     // its first layer's bytes.
@@ -2269,7 +2394,7 @@ bool Recorder::UploadAstcBcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool)
             part.level = 0;
             part.layers = chunk.layers;
             part.offset += u64{chunk.first_layer} * level.layer_stride;
-            if ((s.pool_offset + part.offset) % decoder->OffsetAlignment() != 0) {
+            if ((input_offset + part.offset) % decoder->OffsetAlignment() != 0) {
                 return false;
             }
             chunks.push_back(chunk);
@@ -2283,8 +2408,8 @@ bool Recorder::UploadAstcBcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool)
     size_t next = 0;
     return RecordBcUpload(s, chunks, true, [&](const BcChunk&, BcScratch& scratch) {
         auto views = std::make_shared<std::vector<vk::ImageView>>(
-            decoder->Record(Cmd(), pool.Handle(), s.pool_offset, pool.size - s.pool_offset,
-                            *scratch.image, std::span{&chunk_levels[next++], 1}));
+            decoder->Record(Cmd(), input, input_offset, input_size, *scratch.image,
+                            std::span{&chunk_levels[next++], 1}));
         flight.keepalive.push_back(std::move(views));
     });
 }
@@ -2342,7 +2467,8 @@ void Recorder::UploadBcFromStaging(Storage& s, const UploadPlan& plan,
         Cmd().CopyBufferToImage(staging.buffer, *scratch.image, VK_IMAGE_LAYOUT_GENERAL, regions);
     };
     if (!RecordBcUpload(s, chunks, true, fill)) {
-        LogOnce(fmt::format("BC stand-in upload (format {:#x}) failed: its texels stay undefined",
+        s.contents_valid = false;
+        LogOnce(fmt::format("BC stand-in upload (format {:#x}) failed: retrying on next use",
                             s.desc.format));
     }
 }
@@ -2417,9 +2543,10 @@ bool Recorder::RefitStandin(Storage& s, const u8* data, u64 size) {
             return Restandin(s, AstcStandin::Bc3);
         }
     }
-    // An sRGB view made after the format was chosen (BuildTexture forced this upload).
+    // This upload was forced by an sRGB view. The draw needs the compatible image now.
     if (s.standin_srgb_view && (current == AstcStandin::Bc4 || current == AstcStandin::Bc5)) {
-        return Restandin(s, SmartStandinFor(s.standin_class, true, impl.smart_bc), true);
+        s.pending_standin.reset();
+        return Restandin(s, SmartStandinFor(s.standin_class, true, impl.smart_bc));
     }
     return true;
 }
@@ -2500,7 +2627,10 @@ bool Recorder::RecordBcUpload(Storage& s, std::span<const BcChunk> chunks, bool 
         const std::shared_ptr<BcScratch> scratch =
             impl.AcquireBcScratch(chunk.width, chunk.height, chunk.layers);
         if (!scratch) {
-            break;
+            if (times) {
+                Cmd().WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *times->pool, query + 1);
+            }
+            return false;
         }
         flight.keepalive.push_back(scratch);
         // The scratch is shared by every upload: whatever used it last (here or in an earlier
@@ -3801,8 +3931,17 @@ void Recorder::CopyTextureToTexture(const VC::CopyTextureToTexturePayload& p) {
         Failed("CopyTextureToTexture", "a BC stand-in could not be recreated as BC3");
         return;
     }
+    // MKW can stream between the linear and sRGB versions of the atlas format. Copy the
+    // decoded texel bits without a colour conversion, as NVN does for the ASTC blocks.
+    const bool mkw_atlas_copy = impl.mario_kart_world && src->host.needs_transcode &&
+                                dst->host.needs_transcode && IsAstc8x8(src->host.pixel_format) &&
+                                IsAstc8x8(dst->host.pixel_format) &&
+                                ((src->host.bc_standin && dst->host.bc_standin &&
+                                  ViewsBcStandin(src->host.format, dst->host.format)) ||
+                                 SrgbStorageViewFormat(src->host.format) == dst->host.format ||
+                                 SrgbStorageViewFormat(dst->host.format) == src->host.format);
     if (src->host.needs_transcode != dst->host.needs_transcode ||
-        (src->host.needs_transcode && src->host.format != dst->host.format)) {
+        (src->host.needs_transcode && src->host.format != dst->host.format && !mkw_atlas_copy)) {
         // Both sides decoded to the same stand-in copy texel for texel; a decoded texture and a
         // native one hold different bytes per texel (as do an RGBA8 and a BC stand-in).
         Unsupported("CopyTextureToTexture",
@@ -3855,13 +3994,10 @@ void Recorder::CopyTextureToTexture(const VC::CopyTextureToTexturePayload& p) {
     }
     const u32 width = (std::min)(sw, dst_extent.width - dx);
     const u32 height = (std::min)(sh, dst_extent.height - dy);
-    if (src->host.bc_standin &&
+    const bool partial_bc_copy =
+        src->host.bc_standin &&
         (!BcRegionAligned(sx, sy, width, height, src_extent.width, src_extent.height) ||
-         !BcRegionAligned(dx, dy, width, height, dst_extent.width, dst_extent.height))) {
-        // The guest's ASTC blocks need not line up with the 4x4 blocks of the BC stand-ins.
-        Unsupported("CopyTextureToTexture", "region of a BC stand-in is not aligned to its blocks");
-        return;
-    }
+         !BcRegionAligned(dx, dy, width, height, dst_extent.width, dst_extent.height));
     const u32 count = p.src_region.depth > 0 ? static_cast<u32>(p.src_region.depth) : 1u;
     const bool src_3d = src->type == VK_IMAGE_TYPE_3D;
     const bool dst_3d = dst->type == VK_IMAGE_TYPE_3D;
@@ -3879,6 +4015,67 @@ void Recorder::CopyTextureToTexture(const VC::CopyTextureToTexturePayload& p) {
         src_3d ? (std::min)({count, src_extent.depth - (std::min)(sz, src_extent.depth - 1),
                              dst_extent.depth - (std::min)(dz, dst_extent.depth - 1)})
                : 1u;
+
+    if (partial_bc_copy && !src_3d && !dst_3d) {
+        if (impl.logged_messages.insert("partial-bc-copy").second) {
+            LOG_INFO(Render_Vulkan,
+                     "[nvn] partial BC copy: {}x{} texels to mip {} layer {}; preserving block "
+                     "neighbors",
+                     width, height, dst_level, dst_first);
+        }
+        EnsureContents(*src, false);
+        EnsureContents(*dst, false);
+        BcGpuEncoder* encoder = impl.BcEncoder();
+        if (!encoder || impl.device.MaxPushDescriptors() < 3) {
+            Failed("CopyTextureToTexture", "partial BC copy needs three push descriptors");
+            return;
+        }
+        const u32 bx = dx / 4 * 4;
+        const u32 by = dy / 4 * 4;
+        const u32 bw = (std::min)((dx + width + 3) / 4 * 4, dst_extent.width) - bx;
+        const u32 bh = (std::min)((dy + height + 3) / 4 * 4, dst_extent.height) - by;
+        const auto chunks = SplitBcLayers(dst_level, dst_first, layers, bw, bh, bx, by);
+        const bool recorded =
+            RecordBcUpload(*dst, chunks, false, [&](const BcChunk& chunk, BcScratch& scratch) {
+                const bool saved = track_writes;
+                track_writes = false;
+                PrepareImages({{src, VK_IMAGE_LAYOUT_GENERAL}, {dst, VK_IMAGE_LAYOUT_GENERAL}});
+                track_writes = saved;
+                auto views = std::make_shared<std::vector<vk::ImageView>>();
+                const auto view = [&](Storage& storage, u32 level, u32 first) {
+                    views->push_back(impl.device.GetLogical().CreateImageView({
+                        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                        .image = *storage.image,
+                        .viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+                        .format = storage.host.format == VK_FORMAT_BC3_SRGB_BLOCK
+                                      ? VK_FORMAT_BC3_UNORM_BLOCK
+                                      : storage.host.format,
+                        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1, first,
+                                             chunk.layers},
+                    }));
+                    return **views->rbegin();
+                };
+                const VkImageView from =
+                    view(*src, src_level, src_first + chunk.first_layer - dst_first);
+                const VkImageView to = view(*dst, dst_level, chunk.first_layer);
+                encoder->RecordCopy(Cmd(), from, to, *scratch.view,
+                                    {static_cast<s32>(sx), static_cast<s32>(sy)},
+                                    {static_cast<s32>(dx), static_cast<s32>(dy)},
+                                    {static_cast<s32>(bx), static_cast<s32>(by)},
+                                    {static_cast<s32>(width), static_cast<s32>(height)},
+                                    {static_cast<s32>(bw), static_cast<s32>(bh)}, chunk.layers);
+                flight.keepalive.push_back(std::move(views));
+                PrepareImages({{dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
+            });
+        if (!recorded) {
+            Failed("CopyTextureToTexture", "partial BC copy could not be encoded");
+        }
+        return;
+    }
+    if (partial_bc_copy) {
+        Unsupported("CopyTextureToTexture", "partial BC copy of a 3D texture");
+        return;
+    }
 
     const bool same = src == dst;
     const bool dst_covered = !same && !dst_3d && dx == 0 && dy == 0 && width == dst_extent.width &&
@@ -5080,17 +5277,113 @@ VkImage Recorder::RawPresentCopy(Storage& s, VkFormat raw_format, bool sampled) 
     return *scratch.image;
 }
 
-bool Recorder::UsePresentPasses(const Layout::FramebufferLayout& layout, const Frame& frame) {
-    static_cast<void>(layout);
-    static_cast<void>(frame);
-    if (PresentNeedsPasses(CurrentPresentSettings()) &&
-        impl.logged_messages.insert("present-passes").second) {
-        LOG_WARNING(Render_Vulkan,
-                    "[nvn] the presentation passes (window filter, anti-aliasing, "
-                    "post-processing) are not available on VTX-HLE; presenting with the plain "
-                    "blit");
+bool Recorder::RecordWindowFilter(Texture& texture, VkFormat source_format, const Frame& frame,
+                                  const PixelRect& crop, const PixelRect& picture) {
+    Storage& source = *texture.storage;
+    using Settings::ScalingFilter;
+    const auto filter = Settings::values.scaling_filter.GetValue();
+    if (filter == ScalingFilter::NearestNeighbor || filter == ScalingFilter::Bilinear ||
+        !frame.framebuffer || source.type != VK_IMAGE_TYPE_2D ||
+        !impl.device.IsFormatSupported(source_format,
+                                       VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT,
+                                       FormatType::Optimal)) {
+        return false;
     }
-    return false;
+    const VkExtent2D extent{picture.width, picture.height};
+    if (impl.window_filter_setting != filter || impl.window_filter_format != frame.format ||
+        impl.window_filter_extent.width != extent.width ||
+        impl.window_filter_extent.height != extent.height) {
+        impl.window_filter.reset();
+        impl.window_fsr.reset();
+        impl.window_fsr3.reset();
+        impl.window_sgsr.reset();
+        impl.window_filter_failed = false;
+        impl.window_filter_setting = filter;
+        impl.window_filter_format = frame.format;
+        impl.window_filter_extent = extent;
+    }
+    if (impl.window_filter_failed) {
+        return false;
+    }
+    try {
+        if (!impl.window_filter) {
+            const bool spatial = filter == ScalingFilter::Fsr || filter == ScalingFilter::Fsr3 ||
+                                 filter == ScalingFilter::Sgsr || filter == ScalingFilter::SgsrEdge;
+            impl.window_filter = MakeWindowAdaptPass(impl.device, frame.format,
+                                                     spatial ? ScalingFilter::Bilinear : filter,
+                                                     impl.device.IsKhrPushDescriptorSupported());
+            if (filter == ScalingFilter::Fsr) {
+                impl.window_fsr = std::make_shared<FSR>(impl.device, *impl.allocator, 1, extent);
+            } else if (filter == ScalingFilter::Fsr3) {
+                impl.window_fsr3 = std::make_shared<FSR3>(impl.device, *impl.allocator, 1, extent);
+            } else if (filter == ScalingFilter::Sgsr || filter == ScalingFilter::SgsrEdge) {
+                impl.window_sgsr = std::make_shared<SGSR>(impl.device, *impl.allocator, 1, extent,
+                                                          filter == ScalingFilter::SgsrEdge);
+            }
+            LOG_INFO(Render_Vulkan,
+                     "[nvn] window filter {} active (source format {}, frame format {})",
+                     static_cast<u32>(filter), static_cast<u32>(source_format),
+                     static_cast<u32>(frame.format));
+        }
+    } catch (const vk::Exception& exception) {
+        impl.window_filter_failed = true;
+        LOG_WARNING(Render_Vulkan, "[nvn] window filter {} unavailable: {}",
+                    static_cast<u32>(filter), exception.what());
+        return false;
+    }
+    const VkImageView source_view =
+        impl.draw_resources->GetView(texture, {
+                                                  .format = source_format,
+                                                  .type = VK_IMAGE_VIEW_TYPE_2D,
+                                                  .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+                                                  .levels = 1,
+                                                  .layers = 1,
+                                              });
+    if (source_view == VK_NULL_HANDLE) {
+        return false;
+    }
+    const bool saved = track_writes;
+    track_writes = false;
+    PrepareImages({{&source, VK_IMAGE_LAYOUT_GENERAL}});
+    track_writes = saved;
+    VkImageView view = source_view;
+    Common::Rectangle<f32> uv{
+        static_cast<f32>(crop.x) / static_cast<f32>(source.extent.width),
+        static_cast<f32>(crop.y) / static_cast<f32>(source.extent.height),
+        static_cast<f32>(crop.x + crop.width) / static_cast<f32>(source.extent.width),
+        static_cast<f32>(crop.y + crop.height) / static_cast<f32>(source.extent.height),
+    };
+    const auto upscale = [&](auto& pass) {
+        if (pass) {
+            view = pass->Record(impl.device, Cmd(), 0, *source.image, view,
+                                {source.extent.width, source.extent.height}, uv);
+            flight.keepalive.push_back(pass);
+            flight.keepalive.push_back(pass->TakeRecordResources());
+            uv = {0.0f, 0.0f, 1.0f, 1.0f};
+        }
+    };
+    upscale(impl.window_fsr);
+    upscale(impl.window_fsr3);
+    upscale(impl.window_sgsr);
+    auto descriptors = impl.window_filter->RecordTexture(
+        Cmd(), frame, view, uv,
+        {picture.x, picture.y, picture.x + picture.width, picture.y + picture.height});
+    if (descriptors) {
+        flight.keepalive.push_back(std::move(descriptors));
+    }
+    flight.keepalive.push_back(impl.window_filter);
+    return true;
+}
+
+void Recorder::WarnUnsupportedPresentPasses(bool applied_filter) {
+    auto settings = CurrentPresentSettings();
+    if (applied_filter) {
+        settings.scaling_filter = Settings::ScalingFilter::Bilinear;
+    }
+    if (PresentNeedsPasses(settings) && impl.logged_messages.insert("present-passes").second) {
+        LOG_WARNING(Render_Vulkan, "[nvn] the presentation passes (window filter, anti-aliasing, "
+                                   "post-processing) requested here are not available on VTX-HLE");
+    }
 }
 
 void Recorder::GenerateFrames(size_t count, const Frame& frame, std::vector<Frame*>& generated) {
@@ -5242,20 +5535,36 @@ void Recorder::RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>
     const PixelRect picture_rect =
         PresentRectOf(layout.screen, layout.width, layout.height, guest_crop.width,
                       guest_crop.height, frame.width, frame.height);
-    const bool through_passes = blittable && UsePresentPasses(layout, frame);
+    bool through_passes = false;
+    const VkFormat texture_format = texture.host.format;
+    const VkFormat raw_format = UnormOfSrgb(texture_format);
+    const VkFormat frame_format = frame.format;
+    const bool raw_copy = raw_format != s.host.format && UnormOfSrgb(frame_format) == frame_format;
+    // Sample encoded values into UNORM frames; sRGB attachments require a decoding source
+    // view so their automatic encode preserves the colours, just as the plain blit does.
+    const VkFormat filter_format = raw_copy ? raw_format : texture_format;
+    const auto filter_twin = &s != &guest ? impl.ScaledTextureOf(texture) : nullptr;
+    Texture& filter_texture = filter_twin ? *filter_twin : texture;
+    if (blittable &&
+        RecordWindowFilter(filter_texture, filter_format, frame, crop_rect, picture_rect)) {
+        through_passes = true;
+        picture_source = *s.image;
+        picture_layout = VK_IMAGE_LAYOUT_GENERAL;
+        frame.source_encoding = PresentEncoding(texture_format);
+    }
     if (blittable) {
+        WarnUnsupportedPresentPasses(through_passes);
+    }
+    if (blittable && !through_passes) {
         // The game renders to an sRGB texture, whose raw bytes are already encoded. A blit reads
         // an sRGB source as linear and writes the (UNORM) frame as is, which darkens the picture:
         // blit from a UNORM copy of the bytes instead. A texture can also be a different
         // mutable-format view of its cached storage (DK reuses its display-buffer bytes for the
         // RGBA8 -> RGB10A2 switch), so the copy must use the texture's format, not the storage's.
-        const VkFormat texture_format = texture.host.format;
-        const VkFormat raw_format = UnormOfSrgb(texture_format);
-        const auto frame_format = static_cast<VkFormat>(frame.format);
         frame.source_encoding = PresentEncoding(texture_format);
         PrepareImages({{&s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL}}, std::span{&frame_in, 1});
         VkImage source = *s.image;
-        if (raw_format != s.host.format && UnormOfSrgb(frame_format) == frame_format) {
+        if (raw_copy) {
             source = RawPresentCopy(s, raw_format);
         }
         const s32 blit_width = static_cast<s32>(picture_rect.width);
@@ -5318,7 +5627,7 @@ void Recorder::RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>
         Cmd().BlitImage(source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, *frame.image,
                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, blit, present_filter);
         picture_source = source;
-    } else {
+    } else if (!blittable) {
         Cmd().PipelineBarrier(ALL_STAGES, ALL_STAGES, 0, frame_in);
     }
     // The present manager expects the frame image in GENERAL.
@@ -5527,8 +5836,16 @@ void Recorder::RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>
     // The GPU command capture (video_core/gpu_capture.h) wants this present as its frame.png: the
     // emulated path serves it through RequestScreenshot at DefaultFrameLayout(1280, 720), so it
     // is the same guest picture as the file captures.
+    const auto prepare_readback_source = [&] {
+        if (through_passes && raw_copy && picture_source == *s.image) {
+            PrepareImages({{&s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL}});
+            picture_source = RawPresentCopy(s, raw_format);
+            picture_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        }
+    };
     const bool gpu_capture_due = !gpu_capture_png.empty();
     if (environment_due || request_due || gpu_capture_due) {
+        prepare_readback_source();
         // The nx2:vi2 path's capture: Layout::DefaultFrameLayout(1280, 720).
         const Layout::FramebufferLayout capture_layout = Layout::DefaultFrameLayout(1280, 720);
         PictureReadback readback =
@@ -5562,6 +5879,7 @@ void Recorder::RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>
                     // A new request replaced the one the readback was sized for: next present.
                     requests->ReleaseScreenshotClaim();
                 } else {
+                    prepare_readback_source();
                     RecordPictureReadback(
                         readback, picture_source, picture_layout, crop_rect, present_filter,
                         ScreenRect(claimed.screen, claimed.width, claimed.height));
@@ -5811,6 +6129,10 @@ void Recorder::SubmitSegments(std::span<const VkSemaphore> binary_signals) {
         }
         vk::Check(result);
     }
+    if (impl.mario_kart_world && count != 0) {
+        impl.mkw_last_submit_semaphore = *queue.timeline;
+        impl.mkw_last_submit_value = segments.back().signal_value;
+    }
     if (impl.options.on_queue_submit) {
         // Force maximum clocks (renderer_force_max_clock): the renderer's TurboMode keeps the GPU
         // busy for 100 ms after each queue submission, and this queue is not the scheduler's.
@@ -5855,14 +6177,25 @@ void Recorder::MaybeSubmitEarly() {
     if (config.early_interval_us == 0 || !impl.options.early_submit || finished || condition_open) {
         return;
     }
+    if (impl.mkw_coalesce_early_submit && early_pieces >= 2) {
+        return;
+    }
     const auto now = std::chrono::steady_clock::now();
     const u64 elapsed = static_cast<u64>(
         std::chrono::duration_cast<std::chrono::microseconds>(now - piece_start).count());
-    if (elapsed < (early_pieces == 0 ? config.early_first_us : config.early_interval_us)) {
-        return;
-    }
-    if (draw.PassOpen() && (config.early_pass_us == 0 || elapsed < config.early_pass_us)) {
-        return; // a natural pass end comes soon: do not split the pass
+    const u64 normal_us = early_pieces == 0 ? config.early_first_us : config.early_interval_us;
+    if (impl.mkw_coalesce_early_submit) {
+        if (!MkwEarlySubmitDue(early_pieces, elapsed, normal_us, config.early_pass_us,
+                               draw.PassOpen(), draw.HasShadows())) {
+            return;
+        }
+    } else {
+        if (elapsed < normal_us) {
+            return;
+        }
+        if (draw.PassOpen() && (config.early_pass_us == 0 || elapsed < config.early_pass_us)) {
+            return; // a natural pass end comes soon: do not split the pass
+        }
     }
     SubmitPiece();
     ++early_pieces;

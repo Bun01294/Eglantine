@@ -6,8 +6,11 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstring>
+#include <map>
 #include <random>
+#include <tuple>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -71,6 +74,119 @@ std::vector<u32> TilesIn(const Nvn::SparseLayout& layout, u64 begin, u64 end,
 }
 
 } // Anonymous namespace
+
+TEST_CASE("nvn sparse: row batching preserves every block mapping", "[nvn][sparse]") {
+    constexpr u32 GRANULE = 256;
+    std::vector<VkSparseImageMemoryBind> binds;
+    // Allocation boundaries, gaps, unbinds, layers, mips, and clipped edge blocks.
+    for (u32 layer = 0; layer < 68; ++layer) {
+        for (u32 mip = 0; mip < 3; ++mip) {
+            for (u32 y = 0; y < 2; ++y) {
+                for (u32 x = 0; x < 32; ++x) {
+                    const u64 page = ((layer * 3 + mip) * 2 + y) * 32 + x;
+                    binds.push_back({
+                        .subresource{VK_IMAGE_ASPECT_COLOR_BIT, mip, layer},
+                        .offset{static_cast<s32>(x * GRANULE), static_cast<s32>(y * GRANULE), 0},
+                        .extent{x == 31 ? 37u : GRANULE, y == 1 ? 53u : GRANULE, 1},
+                        .memory = x % 7 == 0 ? VK_NULL_HANDLE
+                                             : std::bit_cast<VkDeviceMemory>(u64{1} + page / 64),
+                        .memoryOffset = (page % 64 + 2) * Nvn::SPARSE_TILE_BYTES,
+                    });
+                }
+            }
+        }
+    }
+    // Compare the effective per-block bindings, independent of the number/order of records.
+    const auto expand = [&](const std::vector<VkSparseImageMemoryBind>& records) {
+        using Position = std::tuple<u32, u32, u32, s32, s32, s32>;
+        using Mapping = std::tuple<VkDeviceMemory, u64, u32, u32, u32>;
+        std::map<Position, Mapping> blocks;
+        for (const auto& bind : records) {
+            for (u32 x = 0; x < bind.extent.width; x += GRANULE) {
+                const Position pos{bind.subresource.aspectMask,
+                                   bind.subresource.arrayLayer,
+                                   bind.subresource.mipLevel,
+                                   bind.offset.z,
+                                   bind.offset.y,
+                                   bind.offset.x + static_cast<s32>(x)};
+                const u64 offset = bind.memory == VK_NULL_HANDLE
+                                       ? 0
+                                       : bind.memoryOffset + (x / GRANULE) * Nvn::SPARSE_TILE_BYTES;
+                const Mapping mapping{bind.memory, offset, bind.flags,
+                                      (std::min)(GRANULE, bind.extent.width - x),
+                                      bind.extent.height};
+                REQUIRE(blocks.emplace(pos, mapping).second);
+            }
+        }
+        return blocks;
+    };
+    const auto expected = expand(binds);
+    const size_t original_count = binds.size();
+    std::mt19937 random{41};
+    std::shuffle(binds.begin(), binds.end(), random);
+    Nvn::CompactSparseImageBinds(binds, GRANULE, GRANULE);
+    CHECK(binds.size() < original_count / 2);
+    CHECK(expand(binds) == expected);
+    const size_t compact_count = binds.size();
+    Nvn::CompactSparseImageBinds(binds, GRANULE, GRANULE);
+    CHECK(binds.size() == compact_count);
+    CHECK(expand(binds) == expected);
+}
+
+TEST_CASE("nvn sparse: row batching keeps incompatible binds separate", "[nvn][sparse]") {
+    const VkSparseImageMemoryBind first{
+        .subresource{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0},
+        .offset{0, 0, 0},
+        .extent{256, 256, 1},
+        .memory = std::bit_cast<VkDeviceMemory>(u64{1}),
+        .memoryOffset = 0,
+    };
+    VkSparseImageMemoryBind second = first;
+    second.offset.x = 256;
+    second.memoryOffset = Nvn::SPARSE_TILE_BYTES;
+    SECTION("discontiguous physical pages") {
+        second.memoryOffset *= 2;
+    }
+    SECTION("different memory objects") {
+        second.memory = std::bit_cast<VkDeviceMemory>(u64{2});
+    }
+    SECTION("bound followed by unbound") {
+        second.memory = VK_NULL_HANDLE;
+    }
+    SECTION("different binding flags") {
+        second.flags = VK_SPARSE_MEMORY_BIND_METADATA_BIT;
+    }
+    SECTION("different aspect") {
+        second.subresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    }
+    SECTION("different layer") {
+        second.subresource.arrayLayer = 1;
+    }
+    SECTION("different mip") {
+        second.subresource.mipLevel = 1;
+    }
+    SECTION("different row") {
+        second.offset.y = 256;
+    }
+    SECTION("different depth slice") {
+        second.offset.z = 1;
+    }
+    SECTION("gap between blocks") {
+        second.offset.x = 512;
+    }
+    SECTION("different row height") {
+        second.extent.height = 128;
+    }
+    SECTION("multiple host rows") {
+        second.extent.height = 512;
+    }
+    SECTION("multiple depth slices") {
+        second.extent.depth = 2;
+    }
+    std::vector<VkSparseImageMemoryBind> binds{first, second};
+    Nvn::CompactSparseImageBinds(binds, 256, 256);
+    CHECK(binds.size() == 2);
+}
 
 TEST_CASE("nvn sparse: a tile is 64 KiB of one block row of GOB columns", "[nvn][sparse]") {
     struct Case {
@@ -202,6 +318,32 @@ TEST_CASE("nvn sparse: bytes of the storage map to their tiles and tails", "[nvn
     tails.clear();
     CHECK(TilesIn(*layout, 0, 3 * layer, &tails).size() == layout->TileCount());
     CHECK(tails == std::vector<u32>{0, 1, 2});
+}
+
+TEST_CASE("MKW BC6H sparse layout retains lightmap layers beyond 4 GiB", "[nvn][mkw][sparse]") {
+    Nvn::Storage s = MakeSparse(0x50, 8192, 8192, 12, 68, false, PixelFormat::BC6H_UFLOAT);
+    const auto layout = Nvn::BuildSparseLayout(s);
+    REQUIRE(layout);
+    CHECK(s.layout.size == u64{68} * layout->layer_size);
+    REQUIRE(s.layout.size > (u64{4} << 30));
+    const u32 last_layer_tile = 67 * layout->tiles_per_layer;
+    const u64 last_layer_offset = layout->TileOffset(last_layer_tile);
+    REQUIRE(last_layer_offset > (u64{4} << 30));
+    CHECK(layout->Tile(last_layer_tile).layer == 67);
+    CHECK(TilesIn(*layout, last_layer_offset, last_layer_offset + Nvn::SPARSE_TILE_BYTES) ==
+          std::vector<u32>{last_layer_tile});
+    const auto backing = Nvn::SparseBacking::FromLayout(*layout);
+    backing->Remap(last_layer_offset, last_layer_offset + Nvn::SPARSE_TILE_BYTES,
+                   [](u64, u64) { return true; });
+    CHECK(backing->MappedTiles() == 1);
+    const auto tail = Nvn::PlanSparseTail(s, *layout);
+    REQUIRE(tail.unsupported == nullptr);
+    REQUIRE_FALSE(tail.pieces.empty());
+    for (const auto& piece : tail.pieces) {
+        CHECK(piece.guest_offset + layout->tail_offset ==
+              Nvn::TextureLevelOffset(s.desc, piece.level));
+        CHECK(piece.guest_offset + layout->tail_offset + last_layer_offset < s.layout.size);
+    }
 }
 
 TEST_CASE("nvn sparse: edge tiles are cut to the level", "[nvn][sparse]") {

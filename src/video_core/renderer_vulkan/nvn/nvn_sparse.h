@@ -27,12 +27,17 @@
 
 namespace Vulkan::Nvn {
 
+/// Combine adjacent blocks of a single host row without changing their physical mappings.
+void CompactSparseImageBinds(std::vector<VkSparseImageMemoryBind>& binds, u32 granule_x,
+                             u32 granule_y);
+
 /// 64 KiB pages of device memory for sparse images, taken from the allocator in blocks.
 class SparsePagePool {
 public:
     static constexpr u32 NoPage = ~0u;
     static constexpr u64 PageBytes = SPARSE_TILE_BYTES;
     static constexpr u32 PagesPerBlock = 64;
+    static constexpr u32 CachedBlockLimit = 4;
 
     SparsePagePool(const MemoryAllocator& allocator, u64 budget_bytes);
     ~SparsePagePool();
@@ -43,6 +48,8 @@ public:
     /// the budget or the device memory is used up.
     [[nodiscard]] u32 Allocate(u32 memory_type_bits);
     void Free(u32 page);
+    /// Release wholly unused allocations after their pages are no longer in GPU use.
+    void TrimUnusedBlocks();
     /// Counts the pages given back: a starved tile is worth another try only after it changed.
     [[nodiscard]] u64 FreeGeneration() const {
         std::scoped_lock lock{mutex_};
@@ -55,6 +62,8 @@ public:
     [[nodiscard]] Where Get(u32 page) const;
     /// Bytes in use (bound pages).
     [[nodiscard]] u64 UsedBytes() const;
+    /// Allocation bytes, including cached free pages (before VMA's own block overhead).
+    [[nodiscard]] u64 ReservedBytes() const;
     [[nodiscard]] u64 BudgetBytes() const noexcept {
         return budget_;
     }
@@ -65,6 +74,7 @@ private:
         VmaAllocation allocation{};
         Where where;
         u32 type_bits{}; ///< the memory types the block was allocated for
+        u32 used_pages{};
     };
 
     const MemoryAllocator& allocator_;
@@ -74,6 +84,7 @@ private:
     std::vector<u32> free_;
     u64 used_{0};
     u64 free_generation_{0};
+    u32 empty_blocks_{0};
 };
 
 /// The tile state of one sparse storage.
@@ -81,16 +92,17 @@ class SparseBacking {
 public:
     /// Tile flags.
     enum : u8 {
-        Mapped = 1,  ///< the pool maps the tile: it must hold the guest's bytes
-        Dirty = 2,   ///< the bytes behind the tile changed since the last upload
-        Bound = 4,   ///< device memory is bound for the tile's host pages
-        Queued = 8,  ///< on the pending list
+        Mapped = 1, ///< the pool maps the tile: it must hold the guest's bytes
+        Dirty = 2,  ///< the bytes behind the tile changed since the last upload
+        Bound = 4,  ///< device memory is bound for the tile's host pages
+        Queued = 8, ///< on the pending list
     };
 
     /// The units a `Prepare` found ready to upload (mapped, bound, dirty).
     struct Uploads {
         std::vector<u32> tiles;
         std::vector<u32> tails;
+        std::vector<u32> zero_tails; ///< newly resident, unmapped coarse levels
     };
 
     /// nullptr when `s` cannot be tiled (layout, offset not tile aligned, device without sparse
@@ -119,7 +131,8 @@ public:
         layout_.ForEachUnit(
             begin, end,
             [&](u32 id) {
-                SetMapped(tile_flags_[id], id, false, mapped(layout_.TileOffset(id), SPARSE_TILE_BYTES));
+                SetMapped(tile_flags_[id], id, false,
+                          mapped(layout_.TileOffset(id), SPARSE_TILE_BYTES));
             },
             [&](u32 layer) {
                 SetMapped(tail_flags_[layer], layer, true,
@@ -177,7 +190,7 @@ private:
         u32 y;
         u32 width; ///< extent, cut to the level
         u32 height;
-        u32 slot;  ///< index in the unit's page list
+        u32 slot; ///< index in the unit's page list
     };
 
     void SetMapped(u8& flags, u32 id, bool tail, bool mapped);
@@ -195,7 +208,7 @@ private:
     // Image shape (Attach).
     u32 granule_x_{};
     u32 granule_y_{};
-    u32 host_per_x_{};   ///< host tiles across a guest tile
+    u32 host_per_x_{}; ///< host tiles across a guest tile
     u32 host_per_y_{};
     u32 tail_first_lod_{};
     u32 memory_type_bits_{};
@@ -204,12 +217,13 @@ private:
     VkDeviceSize tail_stride_{};
     VkImageAspectFlags aspect_{VK_IMAGE_ASPECT_COLOR_BIT};
     std::vector<HostTile> tail_host_tiles_;
+    std::vector<HostTile> tile_scratch_; ///< reused by BindUnit on the replay thread
     // State.
     std::vector<u8> tile_flags_;
     std::vector<u8> tail_flags_;
     std::vector<u64> tile_hash_;
-    std::vector<u32> tile_pages_;                ///< host_per_x_ * host_per_y_ per tile
-    std::vector<std::vector<u32>> tail_pages_;   ///< per layer: host tail tiles, then opaque pages
+    std::vector<u32> tile_pages_;              ///< host_per_x_ * host_per_y_ per tile
+    std::vector<std::vector<u32>> tail_pages_; ///< per layer: host tail tiles, then opaque pages
     std::vector<u32> pending_tiles_;
     std::vector<u32> pending_tails_;
     u64 bound_pages_{0};
@@ -218,6 +232,7 @@ private:
     u32 verify_cursor_{0};
     std::vector<u32> deferred_free_; ///< pages of unbound units, freed once the binds ran
     bool starved_logged_{false};
+    bool persistent_tails_{false}; ///< MKW writes coarse levels without mapping guest tail pages
     /// Everything pending found no page at generation `starved_generation_`.
     bool starved_only_{false};
     u64 starved_generation_{0};

@@ -57,6 +57,8 @@ public:
     virtual void Attach(MemoryAllocator& allocator) {
         static_cast<void>(allocator);
     }
+    /// Drains queued presentation work before the context waits for the device to go idle.
+    virtual void Drain() {}
     virtual void Detach() {}
 
     /// VkFormat of the images AcquireFrame hands out (0 = VK_FORMAT_UNDEFINED when unknown:
@@ -164,6 +166,8 @@ struct ContextOptions {
     /// Cached storages with an image above this many bytes are trimmed (Context::Impl::
     /// TrimStorageCache). Unset: EDEN_NX2_NVN_STORAGE_BUDGET_MIB, else 6 GiB.
     std::optional<u64> storage_cache_budget_bytes{};
+    /// Override the device-local sparse page limit.
+    std::optional<u64> sparse_device_budget_bytes{};
     /// Presents after which an idle render target that can be rebuilt leaves the cache even under
     /// the budget (0: never). Unset: EDEN_NX2_NVN_TRIM_AGE_PRESENTS, else 0 (off: the age rule dropped GPU-written lighting targets in OoT).
     std::optional<u64> storage_trim_age_presents{};
@@ -251,6 +255,10 @@ struct ContextStats {
     u64 virtual_maps{};
     u64 virtual_unresolved{};
     u64 virtual_sparse_binds{};
+    u64 sparse_write_pool_checks{};
+    u64 driver_bank_uploads{};
+    u64 handle_bank_uploads{};
+    u64 pipeline_state_reuses{};
     u64 texels_flushed{};
     u64 ops_unsupported{};
     u64 ops_failed{};

@@ -115,12 +115,12 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
         std::chrono::duration_cast<std::chrono::nanoseconds>(begin - guest_begin).count());
     const auto signature = [&]() -> u64 {
         if (data) {
-            return SampleGuestBytes(data, size);
+            return SampleGuestBytes(data, size, mario_kart_world);
         }
         return SampleGuestBytesBy(size, [&](u64 offset, u64 count, u8* destination) {
             std::memset(destination, 0, static_cast<size_t>(count));
             GatherVirtual(pool, s.pool_offset + offset, count, destination);
-        });
+        }, mario_kart_world);
     };
     bool changed = false;
     u64 hashed = (std::min)(size, u64{16384});
@@ -487,7 +487,9 @@ struct RunView {
 };
 
 /// The runs of [begin, end), cut to it, neighbours that continue each other merged.
-std::vector<RunView> SnapshotRuns(const std::map<u64, Pool::VirtualRun>& runs, u64 begin, u64 end) {
+std::vector<RunView> SnapshotRuns(
+    const std::map<u64, Pool::VirtualRun>& runs, u64 begin, u64 end,
+    const std::unordered_map<u64, std::shared_ptr<Pool>>* physical_pools) {
     std::vector<RunView> out;
     auto it = runs.upper_bound(begin);
     if (it != runs.begin()) {
@@ -500,8 +502,16 @@ std::vector<RunView> SnapshotRuns(const std::map<u64, Pool::VirtualRun>& runs, u
         if (from >= to) {
             continue;
         }
-        const RunView view{from, to - from, it->second.physical_serial,
-                           it->second.physical_offset + (from - it->first)};
+        RunView view{from, to - from, it->second.physical_serial,
+                     it->second.physical_offset + (from - it->first)};
+        if (physical_pools != nullptr) {
+            const auto physical = physical_pools->find(view.serial);
+            if (physical != physical_pools->end() && physical->second->address != 0 &&
+                (physical->second->flags & PoolFlag::Virtual) == 0) {
+                view.physical += physical->second->address;
+                view.serial = 0; // canonical guest backing, independent of the pool object
+            }
+        }
         if (!out.empty() && out.back().start + out.back().size == view.start &&
             out.back().serial == view.serial &&
             out.back().physical + out.back().size == view.physical) {
@@ -534,6 +544,9 @@ void Context::Impl::MapVirtualNow(u64 pool_serial, const std::vector<VC::Virtual
         return;
     }
     Pool& pool = *found->second;
+    if (mario_kart_world && !mappings.empty()) {
+        ++mkw_mapping_generation;
+    }
     PoolIndex* const index = [&]() -> PoolIndex* {
         const auto it = storage_index.find(pool_serial);
         return it == storage_index.end() ? nullptr : &it->second;
@@ -545,8 +558,12 @@ void Context::Impl::MapVirtualNow(u64 pool_serial, const std::vector<VC::Virtual
         }
         const u64 begin = mapping.virtual_offset;
         const u64 end = begin + mapping.size;
+        mkw_sparse_users_dirty = true;
         auto& runs = pool.virtual_runs;
-        const std::vector<RunView> before = SnapshotRuns(runs, begin, end);
+        // As on the emulated GPU path, mapping the same backing through another pool
+        // object must not replace a lightmap tile with an upload of older guest bytes.
+        const auto* physical_pools = mario_kart_world ? &pools : nullptr;
+        const std::vector<RunView> before = SnapshotRuns(runs, begin, end, physical_pools);
         // Cut the existing runs that overlap [begin, end).
         auto it = runs.lower_bound(begin);
         if (it != runs.begin()) {
@@ -580,7 +597,7 @@ void Context::Impl::MapVirtualNow(u64 pool_serial, const std::vector<VC::Virtual
         }
         // A remap that leaves the bytes where they were (the game maps what is already mapped)
         // changes nothing for the storages over it.
-        if (!index || SnapshotRuns(runs, begin, end) == before) {
+        if (!index || SnapshotRuns(runs, begin, end, physical_pools) == before) {
             continue;
         }
         // Storages placed over the remapped bytes read different bytes now.
@@ -700,6 +717,29 @@ void Context::Impl::FlushedRuns(Pool& pool, u64 begin, u64 size,
     stats.vram_flush_pages_taken.fetch_add(taken, std::memory_order_relaxed);
 }
 
+std::span<const u64> Context::Impl::MkwSparseVirtualUsers(u64 physical_serial) {
+    if (mkw_sparse_users_dirty) {
+        mkw_sparse_physical_users.clear();
+        for (const u64 serial : sparse_virtual_pools) {
+            const auto found = pools.find(serial);
+            if (found == pools.end()) {
+                continue;
+            }
+            for (const auto& [offset, run] : found->second->virtual_runs) {
+                auto& users = mkw_sparse_physical_users[run.physical_serial];
+                // sparse_virtual_pools is ordered: append each virtual pool only once.
+                if (users.empty() || users.back() != serial) {
+                    users.push_back(serial);
+                }
+            }
+        }
+        mkw_sparse_users_dirty = false;
+    }
+    const auto found = mkw_sparse_physical_users.find(physical_serial);
+    return found != mkw_sparse_physical_users.end() ? std::span<const u64>{found->second}
+                                                   : std::span<const u64>{};
+}
+
 void Context::Impl::NotifyCpuWriteNow(u64 address, u64 size, bool host_write) {
     auto pool_it = pools_by_address.upper_bound(address);
     if (pool_it == pools_by_address.begin()) {
@@ -771,11 +811,12 @@ void Context::Impl::NotifyCpuWriteNow(u64 address, u64 size, bool host_write) {
     }
     if (!sparse_virtual_pools.empty() && !pool.IsVirtual()) {
         // The sparse textures that map these bytes through a virtual pool read them again.
-        for (const u64 serial : sparse_virtual_pools) {
+        const auto notify_virtual = [&](u64 serial) {
+            stats.sparse_write_pool_checks.fetch_add(1, std::memory_order_relaxed);
             const auto virtual_it = pools.find(serial);
             const auto index_it = storage_index.find(serial);
             if (virtual_it == pools.end() || index_it == storage_index.end()) {
-                continue;
+                return;
             }
             for (const auto& [run_begin, run] : virtual_it->second->virtual_runs) {
                 if (run.physical_serial != pool.serial || run.physical_offset >= end ||
@@ -800,6 +841,15 @@ void Context::Impl::NotifyCpuWriteNow(u64 address, u64 size, bool host_write) {
                         (std::max)(virtual_from, it->first) - it->first,
                         (std::min)(virtual_to, it->first + storage.layout.size) - it->first);
                 }
+            }
+        };
+        if (mario_kart_world) {
+            for (const u64 serial : MkwSparseVirtualUsers(pool.serial)) {
+                notify_virtual(serial);
+            }
+        } else {
+            for (const u64 serial : sparse_virtual_pools) {
+                notify_virtual(serial);
             }
         }
     }
@@ -889,7 +939,9 @@ void Context::Impl::EvictPoolStorages(u64 pool_serial) {
         doomed.push_back(storage);
     }
     storage_index.erase(index_it);
-    sparse_virtual_pools.erase(pool_serial);
+    if (sparse_virtual_pools.erase(pool_serial) != 0) {
+        mkw_sparse_users_dirty = true;
+    }
     ++storage_index_epoch;
     for (auto it = storage_cache.begin(); it != storage_cache.end();) {
         if (it->first.pool_serial == pool_serial) {
@@ -1236,11 +1288,12 @@ void Context::Impl::LogStorageCensus() {
     LOG_INFO(Render_Vulkan,
              "[nvn] storage census: {} images, estimated MiB (count): sparse {} ({}, bound {}), depth {} "
              "({}), colour targets {} ({}), compressed stand-ins {} ({}; {}), other {} "
-             "({}); GPU-written {} ({}); cache {} MiB; sparse pages {} MiB",
+             "({}); GPU-written {} ({}); cache {} MiB; sparse pages bound/reserved {}/{} MiB",
              seen.size(), mib(sparse.bytes), sparse.count, mib(sparse_bound), mib(depth.bytes),
              depth.count, mib(targets.bytes), targets.count, mib(astc.bytes), astc.count, as_bc,
              mib(other.bytes), other.count, mib(gpu_written.bytes), gpu_written.count,
-             mib(storage_cache_bytes), sparse_pages ? mib(sparse_pages->UsedBytes()) : 0);
+             mib(storage_cache_bytes), sparse_pages ? mib(sparse_pages->UsedBytes()) : 0,
+             sparse_pages ? mib(sparse_pages->ReservedBytes()) : 0);
     if (smart_bc.enabled) {
         const auto total = [](const std::atomic<u64>& value) {
             return value.load(std::memory_order_relaxed);
@@ -1642,7 +1695,7 @@ void Context::Impl::FlushTextureNow(CmdFlushTexture& command) {
     // The guest bytes are the texture's contents now: from here on it is a CPU-sourced storage.
     s.origin = StorageOrigin::Cpu;
     s.guest_hash = HashGuestBytes(storage_bytes, storage_size);
-    s.sample_hash = SampleGuestBytes(storage_bytes, storage_size);
+    s.sample_hash = SampleGuestBytes(storage_bytes, storage_size, mario_kart_world);
     s.unchanged_checks = 0;
     s.next_check_tick = 0;
     s.next_full_tick = PollTick() + FULL_VERIFY_PRESENTS;

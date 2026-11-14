@@ -209,12 +209,32 @@ void Context::Impl::ImmediateSubmit(const std::function<void(vk::CommandBuffer)>
 
 bool Context::Impl::ResolveBuffer(u64 address, u64 size, Pool*& pool, u64& offset) const {
     const u64 generation = pool_generation.load(std::memory_order_acquire);
+    ExactResolveSlot* exact = nullptr;
+    if (mario_kart_world) {
+        const u64 key = ((address >> 4) ^ (size * 0xd6e8feb86659fd93ULL)) *
+                        0x9e3779b97f4a7c15ULL;
+        exact = &mkw_resolve_cache[key >> 56];
+        if (exact->generation == generation && exact->mappings == mkw_mapping_generation &&
+            exact->address == address && exact->size == size) {
+            pool = exact->pool;
+            offset = exact->offset;
+            ++mkw_resolve_hits;
+            return true;
+        }
+        ++mkw_resolve_misses;
+    }
+    const auto remember = [&] {
+        if (exact) {
+            *exact = {generation, mkw_mapping_generation, address, size, pool, offset};
+        }
+    };
     for (const ResolveSlot& slot : resolve_cache) {
         if (slot.generation == generation && address >= slot.begin && address < slot.end) {
             const Pool& cached = *slot.pool;
             if (size <= cached.size - (address - cached.address)) {
                 pool = slot.pool;
                 offset = address - cached.address;
+                remember();
                 return true;
             }
             break; // the slow path decides
@@ -232,7 +252,11 @@ bool Context::Impl::ResolveBuffer(u64 address, u64 size, Pool*& pool, u64& offse
         return false;
     }
     if (candidate.IsVirtual()) {
-        return ResolveVirtualRange(candidate, address - candidate.address, size, pool, offset);
+        if (!ResolveVirtualRange(candidate, address - candidate.address, size, pool, offset)) {
+            return false;
+        }
+        remember();
+        return true;
     }
     pool = &candidate;
     offset = address - candidate.address;
@@ -240,6 +264,7 @@ bool Context::Impl::ResolveBuffer(u64 address, u64 size, Pool*& pool, u64& offse
     resolve_cache[resolve_next++ % resolve_cache.size()] = {
         generation, candidate.address, (std::min)(candidate.address + candidate.size, limit),
         &candidate};
+    remember();
     return true;
 }
 
@@ -767,6 +792,54 @@ void Context::Impl::CreateTextureNow(const VC::TextureDesc& d) {
     textures[d.serial] = BuildTexture(d);
 }
 
+bool Context::Impl::MkwBc3AtlasSupported() {
+    if (mkw_bc3_atlas_supported) {
+        return *mkw_bc3_atlas_supported;
+    }
+    bool supported = astc_standin != AstcStandin::Rgba8 &&
+                     device.IsSparseResidencyImageSupported(VK_IMAGE_TYPE_2D) &&
+                     device.CanUseUnbackedSparseImages();
+    for (VkFormat format : {VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_BC3_SRGB_BLOCK}) {
+        if (!supported) {
+            break;
+        }
+        auto image = allocator->CreateUnbackedImage({
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = format,
+            .extent = {8192, 8192, 1},
+            .mipLevels = 14,
+            .arrayLayers = 68,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                     VK_IMAGE_USAGE_SAMPLED_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        });
+        supported = static_cast<bool>(image);
+        if (image) {
+            const auto requirements = device.GetLogical().GetImageSparseMemoryRequirements(*image);
+            const auto memory = device.GetLogical().GetImageMemoryRequirements(*image);
+            supported = memory.alignment == SPARSE_TILE_BYTES &&
+                        std::ranges::any_of(requirements, [](const auto& requirement) {
+                            const auto& props = requirement.formatProperties;
+                            return props.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT &&
+                                   props.imageGranularity.width == 256 &&
+                                   props.imageGranularity.height == 256 &&
+                                   props.imageGranularity.depth == 1 &&
+                                   !(props.flags & VK_SPARSE_IMAGE_FORMAT_SINGLE_MIPTAIL_BIT);
+                        });
+        }
+    }
+    mkw_bc3_atlas_supported = supported;
+    LOG_INFO(Render_Vulkan, "[nvn] Mario Kart World: sparse ASTC 8x8 atlas backing {}",
+             supported ? "BC3 (one quarter of RGBA8 backing, full guest dimensions)"
+                       : "RGBA8 (BC3 sparse format/usage unavailable or recompression disabled)");
+    return supported;
+}
+
 std::shared_ptr<Texture> Context::Impl::BuildTexture(const VC::TextureDesc& d) {
     auto texture = std::make_shared<Texture>();
     texture->serial = d.serial;
@@ -979,7 +1052,9 @@ std::shared_ptr<Texture> Context::Impl::BuildTexture(const VC::TextureDesc& d) {
                 return VirtualRangeMapped(virtual_pool, begin + offset, size);
             });
             storage->sparse = std::move(sparse);
-            sparse_virtual_pools.insert(d.pool_serial);
+            if (sparse_virtual_pools.insert(d.pool_serial).second) {
+                mkw_sparse_users_dirty = true;
+            }
         } else if (layout.size >= (u64{4} << 20) && virtual_storages_logged++ < 24) {
             LOG_INFO(Render_Vulkan,
                      "[nvn] texture {}x{}x{} ({} levels, format {:#x}, flags {:#x}, {:.1f} MiB) in "
@@ -989,10 +1064,22 @@ std::shared_ptr<Texture> Context::Impl::BuildTexture(const VC::TextureDesc& d) {
         }
     }
 
-    // ASTC stand-ins held as BC (astc_standin): sampled 2D images only. Nothing renders into or
-    // stores to an ASTC texture; tile-backed sparse storages (their tiles upload as RGBA8
-    // texels), 3D and multisampled ones stay RGBA8.
-    if (astc_standin != AstcStandin::Rgba8 && host->needs_transcode &&
+    // Every MKW ASTC 8x8 copy source and atlas uses the same fixed BC3 format. Smart per-image
+    // formats would make streaming copies incompatible, and recreating an atlas loses GPU writes.
+    const bool mkw_atlas_copy_format = mario_kart_world && IsAstc8x8(host->pixel_format);
+    const bool mkw_bc3 = mkw_atlas_copy_format && host->needs_transcode &&
+                         storage->type == VK_IMAGE_TYPE_2D &&
+                         storage->samples == VK_SAMPLE_COUNT_1_BIT && MkwBc3AtlasSupported();
+    if (mkw_bc3) {
+        storage->astc_gpu = false;
+        storage->usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                         VK_IMAGE_USAGE_SAMPLED_BIT;
+        storage->create_flags &= ~VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+        SetStandin(*storage, AstcStandin::Bc3);
+        texture->host = storage->host;
+    }
+    // Other sampled ASTC images retain the selected stand-in policy.
+    if (!mkw_atlas_copy_format && astc_standin != AstcStandin::Rgba8 && host->needs_transcode &&
         VideoCore::Surface::IsPixelFormatASTC(host->pixel_format) &&
         storage->type == VK_IMAGE_TYPE_2D && storage->samples == VK_SAMPLE_COUNT_1_BIT &&
         !storage->sparse) {
@@ -1677,8 +1764,8 @@ u64 Context::Impl::RawCoverageRingFor(u64 seq) {
         for (const RawGlobalRange& entry : raw_table.entries) {
             ranges.push_back({entry.guest, entry.device, entry.size});
         }
-        const auto classify = [&](u64 guest) {
-            return ClassifyHleRawMiss(guest, ranges, pools_by_address, pools);
+        const auto classify = [&](u64 guest_address) {
+            return ClassifyHleRawMiss(guest_address, ranges, pools_by_address, pools);
         };
         for (const std::string& line : raw_coverage_report.AddWindow(
                  raw_coverage_window, window->dispatches, window->seconds, classify)) {

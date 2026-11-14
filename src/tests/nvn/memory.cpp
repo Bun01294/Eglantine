@@ -9,7 +9,11 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -20,17 +24,26 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
+#include "common/cityhash.h"
+#include "common/diag_image.h"
+#include "common/game_presets.h"
 #include "common/literals.h"
+#include "common/scope_exit.h"
+#include "common/settings.h"
 #include "video_core/nvn/guest_memory.h"
 #include "video_core/nvn/record.h"
 #include "video_core/nvn/sink.h"
 #include "video_core/renderer_vulkan/nvn/nvn_context.h"
 #include "video_core/renderer_vulkan/nvn/nvn_format.h"
 #include "video_core/renderer_vulkan/nvn/nvn_impl.h"
+#include "video_core/renderer_vulkan/nvn/nvn_sparse.h"
 #include "video_core/renderer_vulkan/nvn/nvn_texture_layout.h"
 #include "video_core/renderer_vulkan/nvn/nvn_upload.h"
+#include "video_core/renderer_vulkan/present/util.h"
+#include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/surface.h"
 #include "video_core/textures/decoders.h"
+#include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_instance.h"
 #include "video_core/vulkan_common/vulkan_library.h"
@@ -281,6 +294,44 @@ void Run(Nvn::Context& context, u64& seq, std::vector<u64> list) {
 // ---------------------------------------------------------------------------------------------
 // CPU only
 
+TEST_CASE("MKW batched texture signatures keep every sampled line", "[nvn][mkw]") {
+    const bool batch = GENERATE(false, true);
+    const u64 size = GENERATE(0ULL, 1ULL, 4096ULL, 16384ULL, 16385ULL, 65537ULL, 1048579ULL);
+    std::vector<u8> bytes(size + 64);
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        bytes[i] = static_cast<u8>(i * 31 + (i >> 8));
+    }
+    const u64 signature = Nvn::SampleGuestBytes(bytes.data(), size, batch);
+    u64 reads = 0;
+    const u64 gathered = Nvn::SampleGuestBytesBy(
+        size,
+        [&](u64 offset, u64 count, u8* destination) {
+            REQUIRE(offset + count <= size);
+            ++reads;
+            std::memcpy(destination, bytes.data() + offset, count);
+        },
+        batch);
+    CHECK(gathered == signature);
+    CHECK(reads == (size <= 16384 ? 1 : 256));
+    if (size <= 16384) {
+        CHECK(signature == Common::CityHash64(reinterpret_cast<const char*>(bytes.data()), size));
+        if (size != 0) {
+            bytes[size - 1] ^= 1;
+            CHECK(Nvn::SampleGuestBytes(bytes.data(), size, batch) != signature);
+        }
+        return;
+    }
+    const u64 last_line = (size - 64) / 64;
+    for (u64 line = 0; line < 256; ++line) {
+        const u64 offset = last_line * line / 255 * 64;
+        for (u64 edge : {0ULL, 63ULL}) {
+            bytes[offset + edge] ^= 1;
+            CHECK(Nvn::SampleGuestBytes(bytes.data(), size, batch) != signature);
+            bytes[offset + edge] ^= 1;
+        }
+    }
+}
+
 TEST_CASE("nvn memory: a block-linear storage unswizzles in Switch 2 GOB order", "[nvn]") {
     Nvn::Storage s = MakeStorage(NVN_FORMAT_RGBA8, 48, 40, 1, PixelFormat::A8B8G8R8_UNORM,
                                  VK_FORMAT_A8B8G8R8_UNORM_PACK32);
@@ -444,13 +495,17 @@ struct Rig {
     static constexpr u64 TEXTURE_POOL_VA = 0x1000'0000;
     static constexpr u64 BUFFER_POOL_VA = 0x2000'0000;
 
-    explicit Rig(HeadlessVulkan& vulkan, bool allow_import, u32 texture_pool_flags = POOL_CPU_CACHED,
+    explicit Rig(HeadlessVulkan& vulkan, bool allow_import,
+                 u32 texture_pool_flags = POOL_CPU_CACHED,
                  std::optional<u64> storage_cache_budget = {},
                  std::optional<u64> trim_age_presents = {}, std::optional<bool> trim_legacy = {},
-                 std::optional<bool> vma_device_strict = {})
-        : context(*vulkan.device, vulkan.submit_mutex, nullptr,
+                 std::optional<bool> vma_device_strict = {},
+                 std::unique_ptr<Nvn::PresentTarget> target = {},
+                 std::optional<u64> sparse_device_budget = {})
+        : context(*vulkan.device, vulkan.submit_mutex, std::move(target),
                   {.allow_host_import = allow_import,
                    .storage_cache_budget_bytes = storage_cache_budget,
+                   .sparse_device_budget_bytes = sparse_device_budget,
                    .storage_trim_age_presents = trim_age_presents,
                    .storage_trim_legacy = trim_legacy,
                    .vma_device_strict = vma_device_strict}) {
@@ -1254,7 +1309,7 @@ TEST_CASE("nvn memory: a texture in a virtual pool reads the mapped bytes", "[nv
     REQUIRE(rig.context.Stats().pools_unsupported == 0);
 }
 
-TEST_CASE("nvn memory: a large sparse texture is bound and uploaded tile by tile", "[nvn]") {
+TEST_CASE("nvn memory: a large sparse texture is bound and uploaded tile by tile", "[nvn][mkw]") {
     auto vulkan = MakeHeadlessVulkan();
     if (!vulkan) {
         SKIP("no Vulkan device");
@@ -1271,7 +1326,10 @@ TEST_CASE("nvn memory: a large sparse texture is bound and uploaded tile by tile
     constexpr u32 WIDTH = 4096; // 16x8 tiles of 256x256 R8: 8 MiB
     constexpr u32 HEIGHT = 2048;
     constexpr u64 TILE = 0x10000;
+    const bool mario_kart_world = GENERATE(false, true);
     Rig rig{*vulkan, true};
+    rig.context.SetTitleId(mario_kart_world ? Settings::MarioKartWorldProgramId
+                                            : Settings::OcarinaOfTimeProgramId);
     u8* physical = rig.memory.Add(PHYSICAL_VA, 1_MiB);
     rig.context.CreatePool({.serial = PHYSICAL_POOL, .guest_address = PHYSICAL_VA, .size = 1_MiB,
                             .flags = POOL_CPU_CACHED});
@@ -1297,11 +1355,11 @@ TEST_CASE("nvn memory: a large sparse texture is bound and uploaded tile by tile
         std::memcpy(physical + physical_offset, guest.data(), guest.size());
     };
     // The texels of tile (x, y) of the level as the GPU holds them.
-    const auto read_tile = [&](u32 x, u32 y) {
+    const auto read_tile = [&](u32 x, u32 y, u64 texture = 10) {
         std::memset(rig.readback, 0xCD, 256 * 256);
         VC::CopyBufferTexturePayload copy{};
         copy.buffer = Rig::BUFFER_POOL_VA;
-        copy.texture = {.serial = 10, .level = 0, .layer = 0};
+        copy.texture = {.serial = texture, .level = 0, .layer = 0};
         copy.region = {static_cast<s32>(x * 256), static_cast<s32>(y * 256), 0, 256, 256, 1};
         std::vector<u64> list;
         Push(list, VC::Op::CopyTextureToBuffer, copy);
@@ -1329,6 +1387,12 @@ TEST_CASE("nvn memory: a large sparse texture is bound and uploaded tile by tile
     CHECK(stats.uploads == 2);
     CHECK(stats.upload_bytes == 2 * TILE);
 
+    // An unrelated buffer flush need not search the sparse atlas mappings on MKW.
+    u64 checks = stats.sparse_write_pool_checks;
+    rig.context.NotifyCpuWrite(Rig::BUFFER_POOL_VA, TILE);
+    Run(rig.context, rig.seq, {});
+    CHECK(rig.context.Stats().sparse_write_pool_checks == checks + (mario_kart_world ? 0 : 1));
+
     // Mapping the same bytes again changes nothing: nothing is uploaded.
     rig.context.MapVirtual(VIRTUAL_POOL, {{0, PHYSICAL_POOL, 0x10000, TILE}});
     REQUIRE(read_tile(0, 0) == a);
@@ -1343,18 +1407,374 @@ TEST_CASE("nvn memory: a large sparse texture is bound and uploaded tile by tile
     // The game rewrites the bytes behind a mapped tile and flushes the pool: that tile again.
     const std::vector<u8> d = tile_texels(4);
     put_tile(0x20000, d);
+    checks = rig.context.Stats().sparse_write_pool_checks;
     rig.context.NotifyCpuWrite(PHYSICAL_VA + 0x20000, TILE);
     REQUIRE(read_tile(1, 1) == d);
     CHECK(rig.context.Stats().uploads == 4);
+    CHECK(rig.context.Stats().sparse_write_pool_checks == checks + 1);
 
     // Unmapping a tile takes its memory back: it reads as zero.
     rig.context.MapVirtual(VIRTUAL_POOL, {{17 * TILE, 0, 0, TILE}});
     REQUIRE(read_tile(1, 1) == std::vector<u8>(256 * 256, 0));
     REQUIRE(read_tile(0, 0) == c);
     CHECK(rig.context.Stats().uploads == 4);
+
+    // Another pool object maps the same physical bytes. MKW keeps the resident texels.
+    constexpr u64 ALIAS_POOL = 7;
+    rig.context.CreatePool({.serial = ALIAS_POOL,
+                            .guest_address = PHYSICAL_VA + 0x30000,
+                            .size = TILE,
+                            .flags = POOL_CPU_CACHED});
+    rig.context.MapVirtual(VIRTUAL_POOL, {{0, ALIAS_POOL, 0, TILE}});
+    REQUIRE(read_tile(0, 0) == c);
+    CHECK(rig.context.Stats().uploads == (mario_kart_world ? 4 : 5));
+
+    // The cached physical users must follow a remap to another pool object.
+    put_tile(0x30000, a);
+    rig.context.NotifyHostWrite(PHYSICAL_VA + 0x30000, TILE);
+    REQUIRE(read_tile(0, 0) == a);
+    checks = rig.context.Stats().sparse_write_pool_checks;
+    rig.context.NotifyCpuWrite(PHYSICAL_VA + 0x10000, TILE);
+    Run(rig.context, rig.seq, {});
+    CHECK(rig.context.Stats().sparse_write_pool_checks == checks + (mario_kart_world ? 0 : 1));
+
+    // Add a sparse texture after its pool is mapped and the lookup is already populated.
+    constexpr u64 SECOND_VIRTUAL_POOL = 8;
+    rig.context.CreatePool({.serial = SECOND_VIRTUAL_POOL,
+                            .guest_address = VIRTUAL_VA + 32_MiB,
+                            .size = 16_MiB,
+                            .flags = POOL_VIRTUAL});
+    rig.context.MapVirtual(SECOND_VIRTUAL_POOL, {{0, ALIAS_POOL, 0, TILE}});
+    rig.context.NotifyCpuWrite(PHYSICAL_VA + 0x30000, TILE);
+    Run(rig.context, rig.seq, {});
+    desc.serial = 11;
+    desc.pool_serial = SECOND_VIRTUAL_POOL;
+    rig.context.CreateTexture(desc);
+    REQUIRE(read_tile(0, 0, 11) == a);
+
+    put_tile(0x30000, b);
+    checks = rig.context.Stats().sparse_write_pool_checks;
+    rig.context.NotifyCpuWrite(PHYSICAL_VA + 0x30000, TILE);
+    REQUIRE(read_tile(0, 0) == b);
+    REQUIRE(read_tile(0, 0, 11) == b);
+    CHECK(rig.context.Stats().sparse_write_pool_checks == checks + 2);
+
+    // Removing a virtual pool drops it from the lookup before the next CPU notification.
+    rig.context.Destroy(11);
+    rig.context.Destroy(SECOND_VIRTUAL_POOL);
+    put_tile(0x30000, c);
+    checks = rig.context.Stats().sparse_write_pool_checks;
+    rig.context.NotifyCpuWrite(PHYSICAL_VA + 0x30000, TILE);
+    REQUIRE(read_tile(0, 0) == c);
+    CHECK(rig.context.Stats().sparse_write_pool_checks == checks + 1);
 }
 
-TEST_CASE("nvn memory: FlushTextureToGuest writes a GPU-written texture into its storage", "[nvn]") {
+TEST_CASE("MKW sparse row binds preserve distinct neighboring tiles", "[nvn][mkw][sparse]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan || !vulkan->device->IsSparseResidencyImageSupported(VK_IMAGE_TYPE_2D) ||
+        !vulkan->device->CanUseUnbackedSparseImages()) {
+        SKIP("no sparse residency images");
+    }
+    constexpr u64 PHYSICAL_POOL = 5;
+    constexpr u64 VIRTUAL_POOL = 6;
+    constexpr u64 PHYSICAL_VA = 0x3000'0000;
+    constexpr u64 VIRTUAL_VA = 0x7D00'0000'0000'0000ULL;
+    constexpr u32 SIZE = 256;
+    constexpr u64 TILE = 64_KiB;
+    Rig rig{*vulkan, true};
+    rig.context.SetTitleId(Settings::MarioKartWorldProgramId);
+    u8* physical = rig.memory.Add(PHYSICAL_VA, 4 * TILE);
+    rig.context.CreatePool({.serial = PHYSICAL_POOL,
+                            .guest_address = PHYSICAL_VA,
+                            .size = 4 * TILE,
+                            .flags = POOL_CPU_CACHED});
+    rig.context.CreatePool({.serial = VIRTUAL_POOL,
+                            .guest_address = VIRTUAL_VA,
+                            .size = 64_MiB,
+                            .flags = POOL_VIRTUAL});
+    VC::TextureDesc desc = MakeTexture(10, VIRTUAL_POOL, 0, 0x01, 8192, 8192);
+    desc.flags = 0x20;
+    rig.context.CreateTexture(desc);
+    std::array<std::vector<u8>, 4> texels;
+    for (u32 tile = 0; tile < texels.size(); ++tile) {
+        auto& pixels = texels[tile];
+        pixels.resize(TILE);
+        for (u32 i = 0; i < pixels.size(); ++i) {
+            pixels[i] = static_cast<u8>(i * 31 + (i >> 8) * 7 + tile * 43);
+        }
+        std::vector<u8> guest(TILE);
+        Tegra::Texture::SwizzleTexture(guest, pixels, 1, SIZE, SIZE, 1, 5, 0, 0, true);
+        std::memcpy(physical + tile * TILE, guest.data(), TILE);
+    }
+    const auto read = [&](u32 tile) {
+        VC::CopyBufferTexturePayload copy{};
+        copy.buffer = Rig::BUFFER_POOL_VA;
+        copy.texture = {.serial = 10};
+        copy.region = {static_cast<s32>(tile * SIZE), 0, 0, SIZE, SIZE, 1};
+        std::vector<u64> list;
+        Push(list, VC::Op::CopyTextureToBuffer, copy);
+        Run(rig.context, rig.seq, std::move(list));
+        return std::vector<u8>(rig.readback, rig.readback + TILE);
+    };
+    rig.context.MapVirtual(VIRTUAL_POOL, {{0, PHYSICAL_POOL, 0, 3 * TILE}});
+    for (u32 tile = 0; tile < 3; ++tile) {
+        CHECK(read(tile) == texels[tile]);
+    }
+    CHECK(rig.context.Stats().virtual_sparse_binds == 1);
+    // A hole inside the compacted run must not unbind either neighbor.
+    rig.context.MapVirtual(VIRTUAL_POOL, {{TILE, 0, 0, TILE}});
+    CHECK(read(1) == std::vector<u8>(TILE, 0));
+    CHECK(read(0) == texels[0]);
+    CHECK(read(2) == texels[2]);
+    rig.context.MapVirtual(VIRTUAL_POOL, {{TILE, PHYSICAL_POOL, 3 * TILE, TILE}});
+    CHECK(read(1) == texels[3]);
+    CHECK(read(2) == texels[2]);
+    rig.context.MapVirtual(VIRTUAL_POOL, {{0, 0, 0, 3 * TILE}});
+    for (u32 tile = 0; tile < 3; ++tile) {
+        CHECK(read(tile) == std::vector<u8>(TILE, 0));
+    }
+    // Refill after reclaiming whole blocks, including allocation slots returned to VMA.
+    std::vector<VC::VirtualMapping> burst;
+    constexpr u32 BURST_TILES = 384;
+    for (u32 tile = 0; tile < BURST_TILES; ++tile) {
+        burst.push_back({tile * TILE, PHYSICAL_POOL, (tile % 4) * TILE, TILE});
+    }
+    for (u32 refill = 0; refill < 2; ++refill) {
+        rig.context.MapVirtual(VIRTUAL_POOL, std::vector<VC::VirtualMapping>{burst});
+        CHECK(read(0) == texels[0]);
+        CHECK(read(1) == texels[1]);
+        CHECK(read(2) == texels[2]);
+        rig.context.MapVirtual(VIRTUAL_POOL, {{0, 0, 0, BURST_TILES * TILE}});
+        CHECK(read(0) == std::vector<u8>(TILE, 0));
+    }
+    CHECK(rig.context.Stats().ops_failed == 0);
+    CHECK(rig.context.Stats().ops_unsupported == 0);
+}
+
+TEST_CASE("MKW BC3: large atlas residency fits a constrained device heap",
+          "[nvn][mkw][.vram-stress]") {
+    auto vulkan = MakeHeadlessVulkan();
+    REQUIRE(vulkan);
+    REQUIRE_FALSE(vulkan->device->IsOptimalAstcSupported());
+    const u64 budget = vulkan->device->GetDeviceMemoryBudget();
+    REQUIRE(budget <= 12_GiB);
+    INFO("device budget MiB " << (budget >> 20));
+    Nvn::Context::Impl impl(*vulkan->device, vulkan->submit_mutex, nullptr,
+                            {.background_backing = false, .vma_device_strict = true});
+    impl.mario_kart_world = true;
+    impl.astc_standin = Nvn::AstcStandin::Bc3;
+    REQUIRE(impl.MkwBc3AtlasSupported());
+    // Leave 4 GiB occupied by other device-local resources while binding the atlas.
+    std::vector<Vulkan::vk::Buffer> pressure;
+    for (u32 i = 0; i < 4; ++i) {
+        pressure.push_back(impl.CreateHostBuffer(1_GiB, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                                 Vulkan::MemoryUsage::DeviceLocal,
+                                                 Vulkan::AllocationKind::PoolBuffer));
+        REQUIRE(pressure.back());
+    }
+    constexpr u64 VIRTUAL_BYTES = 2_GiB;
+    impl.CreatePoolNow({.serial = 6,
+                        .guest_address = 0x7D00'0000'0000'0000ULL,
+                        .size = VIRTUAL_BYTES,
+                        .flags = POOL_VIRTUAL});
+    VC::TextureDesc desc = MakeTexture(10, 6, 0, 0x80, 8192, 8192);
+    desc.target = 4;
+    desc.depth = 68;
+    desc.flags = 0x20;
+    desc.levels = 14;
+    auto texture = impl.BuildTexture(desc);
+    REQUIRE(texture);
+    auto& storage = *texture->storage;
+    REQUIRE(storage.host.format == VK_FORMAT_BC3_UNORM_BLOCK);
+    REQUIRE(storage.extent.width == 8192);
+    REQUIRE(storage.layers == 68);
+    REQUIRE(storage.sparse);
+    REQUIRE(impl.EnsureImage(storage));
+    REQUIRE(storage.sparse); // never silently materialize the full multi-gigabyte image
+    auto& sparse = *storage.sparse;
+    const auto& layout = sparse.Layout();
+    Nvn::SparseBacking::Uploads uploads;
+    REQUIRE(sparse.Prepare(impl, storage, uploads));
+    const u64 tail_backing = sparse.BoundBytes();
+    const u64 tail_binds = impl.stats.virtual_sparse_binds.load();
+    CHECK(tail_backing > 0);
+    CHECK(tail_backing < 32_MiB);
+    CHECK(uploads.tiles.empty());
+    CHECK(uploads.tails.empty()); // unmapped coarse levels must not overwrite GPU texels with zeros
+    constexpr u32 RESIDENT_TILES = 11000;
+    REQUIRE(layout.TileCount() > RESIDENT_TILES);
+    for (u32 id = 0; id < RESIDENT_TILES; ++id) {
+        const u64 offset = layout.TileOffset(id);
+        sparse.Remap(offset, offset + Nvn::SPARSE_TILE_BYTES, [](u64, u64) { return true; });
+    }
+    REQUIRE(sparse.Prepare(impl, storage, uploads));
+    CHECK(sparse.StarvedUnits() == 0);
+    CHECK(uploads.tiles.size() == RESIDENT_TILES);
+    // BC3 uses 2x2 host blocks per guest tile; each contiguous host row is one bind.
+    CHECK(impl.stats.virtual_sparse_binds.load() - tail_binds == u64{RESIDENT_TILES} * 2);
+    CHECK(sparse.BoundBytes() == tail_backing + u64{RESIDENT_TILES} * 256_KiB);
+    CHECK(sparse.BoundBytes() < budget / 5 * 2);
+    VmaTotalStatistics allocations{};
+    vmaCalculateStatistics(impl.vma, &allocations);
+    CHECK(allocations.total.statistics.allocationBytes >= 4_GiB + sparse.BoundBytes());
+    CHECK(allocations.total.statistics.blockBytes <= budget);
+    CHECK(impl.spills.bytes[static_cast<size_t>(Vulkan::AllocationKind::PoolBuffer)].load() == 0);
+    // The same full guest tiles formerly needed 10.74 GiB of RGBA8, before other resources.
+    CHECK(u64{RESIDENT_TILES} * 1_MiB > budget / 5 * 2);
+    WARN("11000 mapped ASTC 8x8 tiles: BC3 "
+         << (sparse.BoundBytes() >> 20)
+         << " MiB; previous RGBA8 11000 MiB; other resources 4096 MiB; device budget "
+         << (budget >> 20) << " MiB");
+    sparse.Remap(0, storage.layout.size, [](u64, u64) { return false; });
+    uploads = {};
+    REQUIRE(sparse.Prepare(impl, storage, uploads));
+    CHECK(sparse.BoundBytes() == tail_backing);
+    CHECK(impl.sparse_pages->UsedBytes() == tail_backing);
+    constexpr u64 POOL_BLOCK_BYTES =
+        Nvn::SparsePagePool::PageBytes * Nvn::SparsePagePool::PagesPerBlock;
+    const u64 reserved_limit =
+        (tail_backing + POOL_BLOCK_BYTES - 1) / POOL_BLOCK_BYTES * POOL_BLOCK_BYTES +
+        POOL_BLOCK_BYTES * Nvn::SparsePagePool::CachedBlockLimit;
+    const u64 reserved_after_unmap = impl.sparse_pages->ReservedBytes();
+    CHECK(reserved_after_unmap <= reserved_limit);
+    CHECK(reserved_after_unmap < 32_MiB);
+    // Refill after reclamation: page ids in active tail blocks must remain valid, and removed
+    // allocation slots must be safe to reuse without growing the block table indefinitely.
+    constexpr u32 REFILL_TILES = 128;
+    for (u32 id = 0; id < REFILL_TILES; ++id) {
+        const u64 offset = layout.TileOffset(id);
+        sparse.Remap(offset, offset + Nvn::SPARSE_TILE_BYTES, [](u64, u64) { return true; });
+    }
+    uploads = {};
+    REQUIRE(sparse.Prepare(impl, storage, uploads));
+    CHECK(sparse.StarvedUnits() == 0);
+    CHECK(sparse.BoundBytes() == tail_backing + REFILL_TILES * 256_KiB);
+    sparse.Remap(0, storage.layout.size, [](u64, u64) { return false; });
+    uploads = {};
+    REQUIRE(sparse.Prepare(impl, storage, uploads));
+    CHECK(impl.sparse_pages->ReservedBytes() <= reserved_limit);
+    CHECK(sparse.BoundBytes() == tail_backing);
+}
+
+TEST_CASE("MKW BC6H lightmaps keep high layers and GPU-written unmapped coarse levels",
+          "[nvn][mkw][sparse][mkw-lighting]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan || !vulkan->device->IsOptimalBcnSupported() ||
+        !vulkan->device->IsSparseResidencyImageSupported(VK_IMAGE_TYPE_2D) ||
+        !vulkan->device->CanUseUnbackedSparseImages()) {
+        SKIP("requires native BC6H sparse residency");
+    }
+    constexpr u64 PHYSICAL_POOL = 5;
+    constexpr u64 VIRTUAL_POOL = 6;
+    constexpr u64 PHYSICAL_VA = 0x3000'0000;
+    constexpr u64 VIRTUAL_VA = 0x7D00'0000'0000'0000ULL;
+    constexpr u32 FORMAT = 0x50;
+    Rig rig{*vulkan, true};
+    rig.context.SetTitleId(Settings::MarioKartWorldProgramId);
+    u8* physical = rig.memory.Add(PHYSICAL_VA, 2 * Nvn::SPARSE_TILE_BYTES);
+    rig.context.CreatePool({.serial = PHYSICAL_POOL,
+                            .guest_address = PHYSICAL_VA,
+                            .size = 2 * Nvn::SPARSE_TILE_BYTES,
+                            .flags = POOL_CPU_CACHED});
+    rig.context.CreatePool({.serial = VIRTUAL_POOL,
+                            .guest_address = VIRTUAL_VA,
+                            .size = 8_GiB,
+                            .flags = POOL_VIRTUAL});
+    auto desc = MakeTexture(10, VIRTUAL_POOL, 0, FORMAT, 8192, 8192);
+    desc.target = 4;
+    desc.depth = 68;
+    desc.levels = 12;
+    desc.flags = 0x20;
+    rig.context.CreateTexture(desc);
+    auto reference =
+        MakeStorage(FORMAT, 8192, 8192, 12, PixelFormat::BC6H_UFLOAT, VK_FORMAT_BC6H_UFLOAT_BLOCK);
+    reference.desc.target = 4;
+    reference.desc.depth = 68;
+    reference.desc.flags = 0x20;
+    reference.layers = 68;
+    reference.layout = Nvn::ComputeTextureLayout(reference.desc);
+    const auto layout = Nvn::BuildSparseLayout(reference);
+    REQUIRE(layout);
+    REQUIRE(layout->HasTail());
+    REQUIRE(layout->tile_width == layout->tile_height);
+    const u64 high_offset = layout->TileOffset(67 * layout->tiles_per_layer);
+    REQUIRE(high_offset > 4_GiB);
+    std::array<std::vector<u8>, 2> tiles;
+    for (u32 tile = 0; tile < tiles.size(); ++tile) {
+        auto& blocks = tiles[tile];
+        blocks.resize(Nvn::SPARSE_TILE_BYTES);
+        for (size_t i = 0; i < blocks.size(); ++i) {
+            blocks[i] = static_cast<u8>(i * 37 + (i >> 7) + tile * 61);
+        }
+        Nvn::Storage single = MakeStorage(FORMAT, layout->tile_width, layout->tile_height, 1,
+                                          PixelFormat::BC6H_UFLOAT, VK_FORMAT_BC6H_UFLOAT_BLOCK);
+        const auto guest =
+            SwizzleLevel0(single, blocks, 16, layout->tile_width / 4, layout->tile_height / 4);
+        REQUIRE(guest.size() == Nvn::SPARSE_TILE_BYTES);
+        std::memcpy(physical + tile * Nvn::SPARSE_TILE_BYTES, guest.data(), guest.size());
+    }
+    rig.context.MapVirtual(VIRTUAL_POOL, {{0, PHYSICAL_POOL, 0, Nvn::SPARSE_TILE_BYTES},
+                                          {high_offset, PHYSICAL_POOL, Nvn::SPARSE_TILE_BYTES,
+                                           Nvn::SPARSE_TILE_BYTES}});
+    const auto read = [&](u32 layer, u32 level, u32 size) {
+        const size_t bytes = static_cast<size_t>((size + 3) / 4) * ((size + 3) / 4) * 16;
+        std::memset(rig.readback, 0xCD, bytes);
+        auto copy = CopyToBuffer(Rig::BUFFER_POOL_VA, 10, size, size);
+        copy.texture.layer = layer;
+        copy.texture.level = level;
+        std::vector<u64> list;
+        Push(list, VC::Op::CopyTextureToBuffer, copy);
+        Run(rig.context, rig.seq, std::move(list));
+        REQUIRE(rig.context.Stats().ops_failed == 0);
+        REQUIRE(rig.context.Stats().ops_unsupported == 0);
+        return std::vector<u8>(rig.readback, rig.readback + bytes);
+    };
+    CHECK(read(0, 0, layout->tile_width) == tiles[0]);
+    CHECK(read(67, 0, layout->tile_width) == tiles[1]);
+
+    // Real backing for unmapped coarse mips must start deterministic, including on a reused
+    // sparse allocation. Later reads must retain the GPU copies rather than clearing again.
+    for (const u32 mip : {static_cast<u32>(layout->level.size()), 11u}) {
+        const u32 size = (std::max)(8192u >> mip, 1u);
+        const size_t bytes = static_cast<size_t>((size + 3) / 4) * ((size + 3) / 4) * 16;
+        CHECK(read(67, mip, size) == std::vector<u8>(bytes, 0));
+    }
+
+    // The game copies coarse atlas texels without ever mapping their guest tail bytes.
+    // Exercise both the first coarse level and the final mip, in the last array layer.
+    for (const u32 mip : {static_cast<u32>(layout->level.size()), 11u}) {
+        const u32 size = (std::max)(8192u >> mip, 1u);
+        const size_t bytes = static_cast<size_t>((size + 3) / 4) * ((size + 3) / 4) * 16;
+        std::vector<u8> blocks(bytes);
+        for (size_t i = 0; i < bytes; ++i) {
+            blocks[i] = static_cast<u8>(i * 29 + mip * 17);
+        }
+        Nvn::Storage single = MakeStorage(FORMAT, size, size, 1, PixelFormat::BC6H_UFLOAT,
+                                          VK_FORMAT_BC6H_UFLOAT_BLOCK);
+        const auto guest = SwizzleLevel0(single, blocks, 16, (size + 3) / 4, (size + 3) / 4);
+        const u64 source_offset = mip * 64_KiB;
+        std::memcpy(rig.texture_bytes + source_offset, guest.data(), guest.size());
+        rig.context.CreateTexture(
+            MakeTexture(20 + mip, Rig::TEXTURE_POOL, source_offset, FORMAT, size, size));
+        VC::CopyTextureToTexturePayload copy{};
+        copy.src = {.serial = 20 + mip};
+        copy.dst = {.serial = 10, .level = mip, .layer = 67};
+        copy.src_region =
+            copy.dst_region = {0, 0, 0, static_cast<s32>(size), static_cast<s32>(size), 1};
+        std::vector<u64> list;
+        Push(list, VC::Op::CopyTextureToTexture, copy);
+        Run(rig.context, rig.seq, std::move(list));
+        CHECK(read(67, mip, size) == blocks);
+        // Revisit without a map: an upload of unmapped guest bytes must not erase it.
+        CHECK(read(67, mip, size) == blocks);
+    }
+    rig.context.MapVirtual(VIRTUAL_POOL, {{high_offset, 0, 0, Nvn::SPARSE_TILE_BYTES}});
+    CHECK(read(67, 0, layout->tile_width) == std::vector<u8>(Nvn::SPARSE_TILE_BYTES, 0));
+    CHECK(read(0, 0, layout->tile_width) == tiles[0]);
+}
+
+TEST_CASE("nvn memory: FlushTextureToGuest writes a GPU-written texture into its storage",
+          "[nvn]") {
     auto vulkan = MakeHeadlessVulkan();
     if (!vulkan) {
         SKIP("no Vulkan device");
@@ -1428,6 +1848,52 @@ TEST_CASE("nvn memory: compressed textures upload and copy without unsupported o
     }
 }
 
+TEST_CASE("nvn memory: MKW copies decoded ASTC 8x8 texels between UNORM and sRGB", "[nvn][mkw]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    if (vulkan->device->IsOptimalAstcSupported()) {
+        SKIP("this exercises the decoded ASTC path");
+    }
+    const bool mario_kart_world = GENERATE(false, true);
+    constexpr u32 SIZE = 16;
+    constexpr s32 ASTC_8X8 = 0x80;
+    constexpr s32 ASTC_8X8_SRGB = 0x8e;
+    // Match the host-format override installed by the frontend for VTX-HLE.
+    Settings::SetAstcRecompressionOverride(Settings::AstcRecompression::Uncompressed);
+    SCOPE_EXIT {
+        Settings::SetAstcRecompressionOverride(std::nullopt);
+    };
+    Rig rig{*vulkan, true};
+    rig.context.SetTitleId(mario_kart_world ? Settings::MarioKartWorldProgramId
+                                            : Settings::OcarinaOfTimeProgramId);
+    const Nvn::Storage reference =
+        MakeStorage(ASTC_8X8, SIZE, SIZE, 1, PixelFormat::ASTC_2D_8X8_UNORM,
+                    VK_FORMAT_A8B8G8R8_UNORM_PACK32, true);
+    const auto block = VoidBlock(0x2000, 0x4000, 0xc000, 0xffff);
+    std::array<u8, 64> blocks;
+    for (size_t offset = 0; offset < blocks.size(); offset += block.size()) {
+        std::ranges::copy(block, blocks.begin() + offset);
+    }
+    const auto bytes = SwizzleLevel0(reference, blocks, block.size(), 2, 2);
+    std::memcpy(rig.texture_bytes, bytes.data(), bytes.size());
+    rig.context.CreateTexture(MakeTexture(10, Rig::TEXTURE_POOL, 0, ASTC_8X8, SIZE, SIZE));
+    rig.context.CreateTexture(
+        MakeTexture(11, Rig::TEXTURE_POOL, 0x40000, ASTC_8X8_SRGB, SIZE, SIZE));
+    std::vector<u64> list;
+    Push(list, VC::Op::CopyTextureToTexture,
+         VC::CopyTextureToTexturePayload{
+             .src = {.serial = 10},
+             .src_region = {0, 0, 0, SIZE, SIZE, 1},
+             .dst = {.serial = 11},
+             .dst_region = {0, 0, 0, SIZE, SIZE, 1},
+         });
+    Run(rig.context, rig.seq, std::move(list));
+    CHECK(rig.context.Stats().ops_failed == 0);
+    CHECK(rig.context.Stats().ops_unsupported == (mario_kart_world ? 0 : 1));
+}
+
 TEST_CASE("nvn memory: spills count device-local requests placed in host memory types", "[nvn]") {
     Vulkan::AllocationSpills spills;
     using Vulkan::AllocationKind;
@@ -1481,4 +1947,378 @@ TEST_CASE("nvn memory: the memory line splits storages by the recorder's holder 
     CHECK(line.find("storage_images 0/0") != std::string::npos);
     const Nvn::ContextStats stats = rig.context.Stats();
     REQUIRE(stats.ops_failed == 0);
+}
+
+namespace {
+
+class FilterReadbackTarget final : public Nvn::PresentTarget {
+public:
+    FilterReadbackTarget(HeadlessVulkan& vk, VkFormat format, u32 width = 79, u32 height = 57)
+        : vulkan{vk}, format{format}, width{width}, height{height} {}
+
+    void Attach(Vulkan::MemoryAllocator& allocator) override {
+        using namespace Vulkan;
+        const auto& device = *vulkan.device;
+        frame.width = width;
+        frame.height = height;
+        frame.format = format;
+        frame.image = allocator.CreateImage({
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = format,
+            .extent = {frame.width, frame.height, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                     VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        });
+        frame.image_view = CreateWrappedImageView(device, frame.image, format);
+        pass = CreateWrappedRenderPass(device, format, VK_IMAGE_LAYOUT_UNDEFINED);
+        frame.framebuffer =
+            CreateWrappedFramebuffer(device, pass, frame.image_view, {frame.width, frame.height});
+        frame.render_ready = device.GetLogical().CreateSemaphore({
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+        });
+        download = allocator.CreateBuffer(
+            {
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .size = frame.width * frame.height * 4,
+                .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            },
+            MemoryUsage::Download);
+    }
+
+    Vulkan::Frame* AcquireFrame() override {
+        return &frame;
+    }
+
+    void PresentFrame(Vulkan::Frame*) override {
+        using namespace Vulkan;
+        const auto& device = *vulkan.device;
+        auto pool = device.GetLogical().CreateCommandPool({
+            .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            .queueFamilyIndex = device.GetGraphicsFamily(),
+        });
+        auto buffers = pool.Allocate(1);
+        const VkCommandBuffer raw = buffers[0];
+        vk::CommandBuffer cmd{raw, device.GetDispatchLoader()};
+        cmd.Begin({.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                   .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT});
+        const VkMemoryBarrier barrier{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        };
+        cmd.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                            barrier, {}, {});
+        const VkBufferImageCopy region{
+            .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            .imageExtent = {frame.width, frame.height, 1},
+        };
+        cmd.CopyImageToBuffer(*frame.image, VK_IMAGE_LAYOUT_GENERAL, *download, region);
+        cmd.End();
+        auto fence =
+            device.GetLogical().CreateFence({.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO});
+        const VkSemaphore ready = *frame.render_ready;
+        const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        const VkSubmitInfo submit{
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &ready,
+            .pWaitDstStageMask = &wait_stage,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &raw,
+        };
+        {
+            std::scoped_lock lock{vulkan.submit_mutex};
+            vk::Check(device.GetGraphicsQueue().Submit(submit, *fence));
+        }
+        vk::Check(fence.Wait());
+        download.Invalidate();
+        const auto bytes = download.Mapped();
+        result.set_value(
+            std::vector<u8>(bytes.begin(), bytes.begin() + frame.width * frame.height * 4));
+    }
+
+    void Detach() override {
+        download = {};
+        frame = {};
+        pass = {};
+    }
+
+    s32 FrameFormat() const override {
+        return static_cast<s32>(format);
+    }
+
+    std::future<std::vector<u8>> Next() {
+        result = {};
+        return result.get_future();
+    }
+
+private:
+    HeadlessVulkan& vulkan;
+    VkFormat format;
+    u32 width;
+    u32 height;
+    Vulkan::Frame frame{};
+    Vulkan::vk::RenderPass pass;
+    Vulkan::vk::Buffer download;
+    std::promise<std::vector<u8>> result;
+};
+
+} // namespace
+
+TEST_CASE("NVN window filters change actual presented pixels on every title and colour format",
+          "[nvn][present-filter]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    const auto format = GENERATE(VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB);
+    const auto title =
+        GENERATE(Settings::MarioKartWorldProgramId, Settings::OcarinaOfTimeProgramId);
+    const u32 source_format = GENERATE(0x25u, 0x38u);
+    const auto saved_filter = Settings::values.scaling_filter.GetValue();
+    SCOPE_EXIT {
+        Settings::values.scaling_filter.SetValue(saved_filter);
+    };
+    auto target = std::make_unique<FilterReadbackTarget>(*vulkan, format);
+    auto* readback = target.get();
+    Rig rig(*vulkan, false, POOL_CPU_CACHED, {}, {}, {}, {}, std::move(target));
+    rig.context.SetTitleId(title);
+    constexpr u32 WIDTH = 32;
+    constexpr u32 HEIGHT = 24;
+    auto source = MakeStorage(NVN_FORMAT_RGBA8, WIDTH, HEIGHT, 1, PixelFormat::A8B8G8R8_UNORM,
+                              VK_FORMAT_A8B8G8R8_UNORM_PACK32);
+    const auto bytes = SwizzleLevel0(source, Gradient(WIDTH, HEIGHT, 63), 4, WIDTH, HEIGHT);
+    std::memcpy(rig.texture_bytes, bytes.data(), bytes.size());
+    rig.context.CreateTexture(MakeTexture(10, Rig::TEXTURE_POOL, 0, source_format, WIDTH, HEIGHT));
+    REQUIRE(rig.Read(10, WIDTH, HEIGHT).size() == WIDTH * HEIGHT * 4);
+    const auto capture = [&](Settings::ScalingFilter filter) {
+        Settings::values.scaling_filter.SetValue(filter);
+        auto future = readback->Next();
+        rig.context.Present({.seq = ++rig.seq,
+                             .queue = 0,
+                             .texture_serial = 10,
+                             .window_slot = 0,
+                             .present_interval = 1,
+                             .crop = {.x = 2, .y = 1, .width = 28, .height = 20}});
+        REQUIRE(future.wait_for(20s) == std::future_status::ready);
+        auto result = future.get();
+        REQUIRE(rig.context.Wait(rig.seq, 20s));
+        REQUIRE(rig.context.Stats().ops_failed == 0);
+        return result;
+    };
+    using Settings::ScalingFilter;
+    const auto nearest = capture(ScalingFilter::NearestNeighbor);
+    const auto bilinear = capture(ScalingFilter::Bilinear);
+    REQUIRE(nearest != bilinear);
+    for (const auto filter :
+         {ScalingFilter::Bicubic, ScalingFilter::ZeroTangent, ScalingFilter::BSpline,
+          ScalingFilter::Mitchell, ScalingFilter::Spline1, ScalingFilter::Gaussian,
+          ScalingFilter::Lanczos, ScalingFilter::ScaleForce, ScalingFilter::Area,
+          ScalingFilter::Mmpx, ScalingFilter::Fsr, ScalingFilter::Sgsr, ScalingFilter::SgsrEdge,
+          ScalingFilter::Fsr3}) {
+        INFO("filter " << static_cast<u32>(filter) << " format " << format << " title " << title);
+        const auto filtered = capture(filter);
+        CHECK(filtered != bilinear);
+        CHECK(filtered.size() == bilinear.size());
+        // Re-selecting a cached filter must keep producing the same pixels.
+        CHECK(capture(filter) == filtered);
+    }
+    CHECK(capture(ScalingFilter::NearestNeighbor) == nearest);
+    CHECK(capture(ScalingFilter::Bilinear) == bilinear);
+}
+
+TEST_CASE("MKW window filters process a saved gameplay image at display resolutions",
+          "[nvn][present-filter][.mkw-filter-capture]") {
+    // External local captures stay outside the source tree: two u32 dimensions, then RGBA8.
+    const char* input = std::getenv("EDEN_NX2_TEST_FILTER_INPUT_RGBA");
+    const char* output = std::getenv("EDEN_NX2_TEST_FILTER_OUTPUT");
+    if (!input || !output) {
+        SKIP("set EDEN_NX2_TEST_FILTER_INPUT_RGBA and EDEN_NX2_TEST_FILTER_OUTPUT");
+    }
+    std::ifstream in(input, std::ios::binary);
+    REQUIRE(in.good());
+    u32 width{}, height{};
+    in.read(reinterpret_cast<char*>(&width), sizeof(width));
+    in.read(reinterpret_cast<char*>(&height), sizeof(height));
+    REQUIRE(width == 1280);
+    REQUIRE(height == 720);
+    std::vector<u8> pixels(static_cast<size_t>(width) * height * 4);
+    in.read(reinterpret_cast<char*>(pixels.data()), static_cast<std::streamsize>(pixels.size()));
+    REQUIRE(in.good());
+    auto vulkan = MakeHeadlessVulkan();
+    REQUIRE(vulkan);
+    const auto saved_filter = Settings::values.scaling_filter.GetValue();
+    const auto saved_aa = Settings::values.anti_aliasing.GetValue();
+    SCOPE_EXIT {
+        Settings::values.scaling_filter.SetValue(saved_filter);
+        Settings::values.anti_aliasing.SetValue(saved_aa);
+    };
+    // The user's FXAA selection must not suppress the separately selected window filter.
+    Settings::values.anti_aliasing.SetValue(Settings::AntiAliasing::Fxaa);
+    const u32 source_format = GENERATE(0x25u, 0x38u);
+    const std::filesystem::path directory =
+        std::filesystem::path(output) / (source_format == 0x25 ? "unorm" : "srgb");
+    std::filesystem::create_directories(directory);
+    std::string csv =
+        "width,height,filter,changed_pixels,changed_over_1,pixels,mean_abs_rgb,max_rgb_delta\n";
+    using Settings::ScalingFilter;
+    const std::array filters{ScalingFilter::NearestNeighbor,
+                             ScalingFilter::Bilinear,
+                             ScalingFilter::Bicubic,
+                             ScalingFilter::ZeroTangent,
+                             ScalingFilter::BSpline,
+                             ScalingFilter::Mitchell,
+                             ScalingFilter::Spline1,
+                             ScalingFilter::Gaussian,
+                             ScalingFilter::Lanczos,
+                             ScalingFilter::ScaleForce,
+                             ScalingFilter::Area,
+                             ScalingFilter::Mmpx,
+                             ScalingFilter::Fsr,
+                             ScalingFilter::Sgsr,
+                             ScalingFilter::SgsrEdge,
+                             ScalingFilter::Fsr3};
+    struct Size {
+        u32 width;
+        u32 height;
+    };
+    for (const auto size : {Size{1280, 720}, Size{1920, 1080}, Size{2560, 1440}}) {
+        auto target = std::make_unique<FilterReadbackTarget>(*vulkan, VK_FORMAT_B8G8R8A8_UNORM,
+                                                             size.width, size.height);
+        auto* readback = target.get();
+        Rig rig(*vulkan, false, POOL_CPU_CACHED, {}, {}, {}, {}, std::move(target));
+        rig.context.SetTitleId(Settings::MarioKartWorldProgramId);
+        auto source = MakeStorage(NVN_FORMAT_RGBA8, width, height, 1, PixelFormat::A8B8G8R8_UNORM,
+                                  VK_FORMAT_A8B8G8R8_UNORM_PACK32);
+        const auto bytes = SwizzleLevel0(source, pixels, 4, width, height);
+        REQUIRE(bytes.size() <= 4_MiB);
+        std::memcpy(rig.texture_bytes, bytes.data(), bytes.size());
+        // MKW reported source format 51 (packed RGBA UNORM), output 44 (BGRA UNORM).
+        // The second variant also exercises the sRGB-source raw-bit presentation path.
+        rig.context.CreateTexture(
+            MakeTexture(10, Rig::TEXTURE_POOL, 0, source_format, width, height));
+        REQUIRE(rig.Read(10, 1, 1).size() == 4); // upload the source before it becomes displayable
+        const auto capture = [&](ScalingFilter filter) {
+            Settings::values.scaling_filter.SetValue(filter);
+            auto future = readback->Next();
+            rig.context.Present({.seq = ++rig.seq,
+                                 .queue = 0,
+                                 .texture_serial = 10,
+                                 .window_slot = 0,
+                                 .present_interval = 1});
+            REQUIRE(future.wait_for(30s) == std::future_status::ready);
+            auto result = future.get();
+            REQUIRE(rig.context.Wait(rig.seq, 30s));
+            REQUIRE(rig.context.Stats().ops_failed == 0);
+            for (size_t i = 0; i < result.size(); i += 4) {
+                std::swap(result[i], result[i + 2]); // BGRA frame -> RGBA artifact
+            }
+            return result;
+        };
+        const auto bilinear = capture(ScalingFilter::Bilinear);
+        for (const auto filter : filters) {
+            INFO("output " << size.width << "x" << size.height << ", filter "
+                           << static_cast<u32>(filter));
+            const auto filtered = capture(filter);
+            REQUIRE(filtered.size() == bilinear.size());
+            CHECK(capture(filter) == filtered); // switching through the cached pass is stable
+            u64 changed = 0, changed_over_1 = 0, sum = 0;
+            u32 maximum = 0;
+            std::array<s64, 3> drift{};
+            for (size_t i = 0; i < filtered.size(); i += 4) {
+                u32 pixel_max = 0;
+                for (size_t c = 0; c < 3; ++c) {
+                    const s32 delta = s32{filtered[i + c]} - s32{bilinear[i + c]};
+                    const u32 magnitude = static_cast<u32>(std::abs(delta));
+                    sum += magnitude;
+                    drift[c] += delta;
+                    pixel_max = (std::max)(pixel_max, magnitude);
+                }
+                changed += pixel_max > 0;
+                changed_over_1 += pixel_max > 1;
+                maximum = (std::max)(maximum, pixel_max);
+            }
+            const u64 count = u64{size.width} * size.height;
+            const double mean = static_cast<double>(sum) / static_cast<double>(count * 3);
+            csv += fmt::format("{},{},{},{},{},{},{:.6f},{}\n", size.width, size.height,
+                               static_cast<u32>(filter), changed, changed_over_1, count, mean,
+                               maximum);
+            // A filter should not introduce a large colour/transfer-function shift.
+            for (const auto channel : drift) {
+                CHECK(std::abs(channel) < static_cast<s64>(count * 3));
+            }
+            if (filter == ScalingFilter::ScaleForce && size.width > width) {
+                CHECK(changed_over_1 > count / 100); // visible-scale changes, not just rounding
+                WARN("ScaleForce "
+                     << size.width << "x" << size.height << ": "
+                     << (100.0 * static_cast<double>(changed_over_1) / static_cast<double>(count))
+                     << "% pixels differ by >1 from bilinear; mean RGB delta " << mean);
+            }
+            if (size.width == width && filter == ScalingFilter::NearestNeighbor) {
+                u32 identity_error = 0;
+                for (size_t i = 0; i < pixels.size(); i += 4) {
+                    for (size_t c = 0; c < 3; ++c) {
+                        identity_error =
+                            (std::max)(identity_error,
+                                       static_cast<u32>(
+                                           std::abs(s32{pixels[i + c]} - s32{filtered[i + c]})));
+                    }
+                }
+                CHECK(identity_error <= 1); // orientation, channel order, crop and gamma
+            }
+            REQUIRE(Common::DiagRequest::WritePng(directory / fmt::format("{}x{}-filter-{}.png",
+                                                                          size.width, size.height,
+                                                                          static_cast<u32>(filter)),
+                                                  size.width, size.height, filtered));
+        }
+    }
+    REQUIRE(Common::DiagRequest::WriteTextFile(directory / "metrics.csv", csv));
+}
+
+TEST_CASE("MKW buffer lookup cache follows pool replacement and virtual remaps", "[nvn][mkw]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    auto impl =
+        std::make_unique<Nvn::Context::Impl>(*vulkan->device, vulkan->submit_mutex, nullptr,
+                                             Nvn::ContextOptions{.background_backing = false});
+    impl->mario_kart_world = GENERATE(false, true);
+    impl->CreatePoolNow({.serial = 1, .guest_address = 0x10000, .size = 0x10000});
+    impl->CreatePoolNow({.serial = 2, .guest_address = 0x30000, .size = 0x10000});
+    impl->CreatePoolNow(
+        {.serial = 3, .guest_address = 0x50000, .size = 0x10000, .flags = POOL_VIRTUAL});
+    const auto resolve = [&](u64 address, u64 size, u64 serial, u64 expected_offset) {
+        Nvn::Pool* pool = nullptr;
+        u64 offset = ~u64{0};
+        REQUIRE(impl->ResolveBuffer(address, size, pool, offset));
+        REQUIRE(pool->serial == serial);
+        REQUIRE(offset == expected_offset);
+    };
+    resolve(0x10120, 64, 1, 0x120);
+    resolve(0x10120, 64, 1, 0x120);
+    CHECK(impl->mkw_resolve_hits == (impl->mario_kart_world ? 1 : 0));
+    impl->CreatePoolNow({.serial = 4, .guest_address = 0x10100, .size = 0x100});
+    resolve(0x10120, 64, 4, 0x20);
+    impl->DestroyNow(4);
+    resolve(0x10120, 64, 1, 0x120);
+    impl->MapVirtualNow(3, {{0, 1, 0x200, 0x1000}});
+    resolve(0x50040, 64, 1, 0x240);
+    resolve(0x50040, 64, 1, 0x240);
+    impl->MapVirtualNow(3, {{0, 2, 0x400, 0x1000}});
+    resolve(0x50040, 64, 2, 0x440);
+    impl->MapVirtualNow(3, {{0, 0, 0, 0x1000}});
+    Nvn::Pool* pool = nullptr;
+    u64 offset = 0;
+    REQUIRE_FALSE(impl->ResolveBuffer(0x50040, 64, pool, offset));
+    REQUIRE_FALSE(impl->ResolveBuffer(0x3fff0, 32, pool, offset));
+    resolve(0x3fff0, 16, 2, 0xfff0);
 }

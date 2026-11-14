@@ -604,6 +604,62 @@ range of its own (`0x7D00...`, 2 MiB aligned) and `nvnMemoryPoolMapVirtual` reac
 
 ### Storage cache budget
 
+**MKW sparse binding batches (2026-11-14).** `SparseBacking::Prepare` compacts image binds
+into horizontal host-block runs for MKW only, following the row-batching idea in
+[`mkw-recomp` commit 30af22d](https://github.com/adriadam10/mkw-recomp/commit/30af22de9062367d3831d3787d136a6f43ebe275).
+Only adjacent blocks of the same aspect, layer, mip, row, height, memory object and flags
+merge; bound blocks also need consecutive physical offsets. Unbinds merge without a
+physical-offset condition. Each record remains one host-block row, including clipped edge
+blocks. Sorting and compacting do not change page ownership, residency, uploads, mip tails,
+the memory budget or the existing wait before changing atlas residency. With the current
+BC3 page allocation a full 512x512 guest tile uses two row binds instead of four individual
+256x256 block binds, with the same 256 KiB backing. The neighboring-tile GPU test and the
+per-block mapping comparison cover holes, remaps and physical-offset preservation. These
+checks pass in the incremental build; no gameplay speedup is claimed.
+
+**MKW coarse atlas levels.** The host blocks and opaque mip tail outside the guest's
+tiled levels now retain backing for every MKW array layer even when no guest virtual
+pages cover the tail. This adapts `mkw-recomp`'s `tail_alloc` rule: the game can populate
+these foliage/lightmap levels with GPU copies rather than `MapVirtual`, and writes to
+unbacked levels would be discarded. Tail residency is queued on attach and reserved before
+detailed tiles, using the same sparse page pool/budget. Only tails with mapped guest bytes
+are uploaded; a subsequent use of an unmapped tail must preserve its GPU-written texels.
+Unmapping fine tiles still frees their pages. Other titles retain their prior tail rule.
+The new BC6H regression uses a full 8192x8192x68 lightmap layout, distinct base/high-layer
+tiles beyond 4 GiB, and copies/readbacks of the first coarse and final mip of layer 67
+without tail mappings. These GPU readbacks and the BC3 pressure tests pass at simulated
+8/12 GiB limits; gameplay appearance remains for manual testing.
+
+**Sparse allocation reclamation and replay state (2026-11-14).** The page pool tracks live
+pages per 4 MiB allocation. After a successful unbind fence and deferred page releases,
+it frees wholly unused allocations beyond four cached blocks (16 MiB). Vacant metadata
+slots are reused without renumbering live pages. Reserved-byte diagnostics count these
+allocations separately from bound pages; VMA may retain additional allocator overhead.
+The pressure test checks reclamation and refill, and neighboring-tile GPU readbacks cover
+reuse after releasing whole allocations. BindUnit reuses scratch tile storage.
+
+Repeated dynamic values compare their exact bits and preserve pending dirty groups;
+the diagnostic no-state-elision switch still forces recording. An unknown predecessor
+graphics pipeline restores all dynamic groups, including after masked clears. Identical
+descriptor registrations preserve snapshot storage. Retirement compacts survivors in
+place before invoking release callbacks, which may append more retirements. Staging-buffer
+reuse remains deferred pending a separate lifetime and retention design.
+
+**Tiny BC copies and coarse initialization (2026-11-14 live investigation).** A game copy
+may end at a tiny ASTC mip edge while its BC stand-in destination does not end at a 4x4
+block edge. The direct Vulkan copy cannot represent that region. Instead of rejecting
+it, the replay samples the source and the destination block envelope into RGBA8 scratch,
+then encodes and copies the affected BC blocks. Sampling uses raw UNORM views across
+UNORM/sRGB copies. Texels outside the requested region are retained subject to normal
+BC re-encoding error. Aligned copies retain the direct path; partial 3D BC copies remain
+unsupported. The copy shader is built lazily on the first such copy.
+
+Newly bound, unmapped MKW coarse color levels are zero-initialized once before use.
+Later visits and remaps do not clear GPU-written coarse texels. The sparse prepare result
+reports those newly resident tails separately from guest-data uploads. Regressions cover
+tiny copies, surrounding texels, high array layers, untouched coarse levels and final
+mips; these do not establish that every reported gameplay artifact is fixed.
+
 Every `Storage` (one VkImage per pool, offset and shape) stays in `storage_cache` after its textures
 died, so the game's transient render targets reuse their image. `TrimStorageCache` keeps the
 cache under `ContextOptions::storage_cache_budget_bytes` (6 GiB): a pass runs when the cache is over

@@ -23,16 +23,20 @@
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include "common/diag_request.h"
+#include "common/game_presets.h"
 #include "common/literals.h"
 #include "common/settings.h"
 #include "video_core/nvn/guest_memory.h"
 #include "video_core/nvn/record.h"
 #include "video_core/nvn/shader/nvn_program_map.h"
 #include "video_core/nvn/sink.h"
+#include "video_core/renderer_vulkan/nvn/nvn_bc_encode.h"
 #include "video_core/renderer_vulkan/nvn/nvn_context.h"
 #include "video_core/renderer_vulkan/nvn/nvn_counters.h"
+#include "video_core/renderer_vulkan/nvn/nvn_sparse_layout.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_instance.h"
 #include "video_core/vulkan_common/vulkan_library.h"
@@ -889,7 +893,7 @@ std::array<Inst, 6> StoreProgram(u32 word, u32 value) {
 } // namespace
 
 TEST_CASE("NVN storage shadow: a render pass writing a storage range reaches the guest bytes",
-          "[nvn][compute]") {
+          "[nvn][compute][mkw]") {
     auto vulkan = MakeHeadlessVulkan();
     if (!vulkan) {
         SKIP("no Vulkan device");
@@ -898,8 +902,10 @@ TEST_CASE("NVN storage shadow: a render pass writing a storage range reaches the
     u8* data = memory.Add(POOL_VA, 64_KiB);
     std::memset(data, 0xCD, 64_KiB);
     memory.Add(TEXTURE_POOL_VA, 1_MiB);
+    const bool mkw = GENERATE(false, true);
     Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr,
-                                 {.try_storage_vram = false});
+                                 {.early_submit = false, .try_storage_vram = false});
+    context.SetTitleId(mkw ? Settings::MarioKartWorldProgramId : Settings::OcarinaOfTimeProgramId);
     context.SetGuestMemory(&memory);
     context.CreatePool({.serial = 1, .guest_address = POOL_VA, .size = 64_KiB,
                         .flags = POOL_CPU_CACHED});
@@ -930,6 +936,8 @@ TEST_CASE("NVN storage shadow: a render pass writing a storage range reaches the
          {reinterpret_cast<const u8*>(&color), sizeof(color)});
     Push(list, VC::Op::SetRasterizerDiscard, VC::EnablePayload{.enable = 1});
     const auto draw = [&](u64 program, u64 address) {
+        Push(list, VC::Op::SetDepthClamp, VC::EnablePayload{.enable = 0});
+        Push(list, VC::Op::SetSampleMask, VC::U32Payload{.value = 0xFFFFFFFFu});
         Push(list, VC::Op::BindProgram,
              VC::BindProgramPayload{.program_serial = program, .stages = 1u << 0});
         const VC::BufferRange range{address, 4096};
@@ -940,6 +948,7 @@ TEST_CASE("NVN storage shadow: a render pass writing a storage range reaches the
     };
     draw(VERTEX_PROGRAM, POOL_VA + 0x1000);
     draw(VERTEX_PROGRAM + 1, POOL_VA + 0x1000);
+    draw(VERTEX_PROGRAM, POOL_VA + 0x4000);
     draw(VERTEX_PROGRAM, POOL_VA + 0x4000);
     PushEnd(list);
     context.Submit(MakeSubmission(1, std::move(list), {VERTEX_PROGRAM, VERTEX_PROGRAM + 1, 10, 1, 2}));
@@ -953,10 +962,12 @@ TEST_CASE("NVN storage shadow: a render pass writing a storage range reaches the
     CHECK(WordAt(data, 0x1008) == 0xCDCDCDCDu);
     CHECK(WordAt(data, 0x4000) == 0x1337);
     CHECK(WordAt(data, 0x4004) == 0xCDCDCDCDu);
+    CHECK(stats.driver_bank_uploads == (mkw ? 2 : 4));
+    CHECK(stats.pipeline_state_reuses == (mkw ? 1 : 0));
     if (stats.pools_imported != 0) {
         CHECK(stats.shadow_creates == 1);
         CHECK(stats.shadow_redirects == 2);
-        CHECK(stats.shadow_skipped_open_pass == 1);
+        CHECK(stats.shadow_skipped_open_pass == 2);
         CHECK(stats.shadow_flush_segment == 1);
     }
 }
@@ -1671,6 +1682,29 @@ TEST_CASE("NVN compute: an R32UI image view of an RGB9E5 texture takes the shade
     }
 }
 
+namespace {
+
+// Sample the red channel at the centre of texel (group x, 0) in a four-wide texture.
+std::array<Inst, 12> SampleTextureRedProgram() {
+    const std::array<Inst, 12> reader{{
+        S2R(0, SR_CTAID_X),
+        {{0x00027245, 0x00000000, 0x00201000, 0x000fe400}},
+        {{0x02047421, 0x3f000000, 0x00010000, Sched}},
+        {{0x04047820, 0x3e800000, 0x00410000, Sched}},
+        AddImm(3, 255, 0x3f000000),
+        {{0x04047b60, 0x30000803, 0x049e01ff, 0x000f4800}},
+        MovC0(6, 0x10),
+        MovC0(7, 0x14),
+        MulImm(5, 0, 4),
+        Add(6, 6, 5),
+        Stg(6, 4),
+        Exit,
+    }};
+    return reader;
+}
+
+} // namespace
+
 TEST_CASE("NVN compute: an image written as a storage image is sampled in GENERAL, ordered by the "
           "game's barrier",
           "[nvn][compute]") {
@@ -1732,21 +1766,8 @@ TEST_CASE("NVN compute: an image written as a storage image is sampled in GENERA
     //   I2FP.F32.U32 R2, R0; FADD.FTZ R4, R2, 0.5; FMUL.FTZ R4, R4, 0.25; IADD3 R3, RZ, 0.5;
     //   TEX.SCR.LZ.NODEP RZ, R4, R4, R3, 0x0, 0x8, 2D, 0x1 (OoT's blur pass word);
     //   R6:R7 = c0[0x10] + 4 * R0; STG.E [R6], R4.
-    const std::array<Inst, 12> reader{{
-        S2R(0, SR_CTAID_X),
-        {{0x00027245, 0x00000000, 0x00201000, 0x000fe400}},
-        {{0x02047421, 0x3f000000, 0x00010000, Sched}},
-        {{0x04047820, 0x3e800000, 0x00410000, Sched}},
-        AddImm(3, 255, 0x3f000000),
-        {{0x04047b60, 0x30000803, 0x049e01ff, 0x000f4800}},
-        MovC0(6, 0x10),
-        MovC0(7, 0x14),
-        MulImm(5, 0, 4),
-        Add(6, 6, 5),
-        Stg(6, 4),
-        Exit,
-    }};
-    context.CreateProgram(MakeProgram(READ, reader, {.storage = 1, .textures = 1}));
+    context.CreateProgram(
+        MakeProgram(READ, SampleTextureRedProgram(), {.storage = 1, .textures = 1}));
 
     constexpr u32 IMAGE_ID = 5;
     constexpr u32 TEXTURE_ID = 6;
@@ -1826,6 +1847,370 @@ TEST_CASE("NVN compute: an image written as a storage image is sampled in GENERA
         CHECK(WordAt(data, 0x1000 + x * 4) == LOW + x);
         CHECK(WordAt(data, 0x2000 + x * 4) == HIGH + x);
     }
+}
+
+TEST_CASE("NVN smart BC: the first sample uses the recompressed image view", "[nvn][compute]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan || vulkan->device->IsOptimalAstcSupported() ||
+        !Vulkan::Nvn::BcGpuEncoder::Supported(*vulkan->device) ||
+        !Vulkan::Nvn::BcGpuEncoder::SupportsBc45(*vulkan->device)) {
+        SKIP("requires ASTC recompression with smart BC formats");
+    }
+    FakeMemory memory;
+    u8* output = memory.Add(POOL_VA, 64_KiB);
+    u8* astc = memory.Add(TEXTURE_POOL_VA, 1_MiB);
+    // One void-extent ASTC LDR block, with 0.5 grey and opaque alpha.
+    constexpr std::array<u8, 16> block{
+        0xfc, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0xff, 0xff,
+    };
+    std::memcpy(astc, block.data(), block.size());
+    Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr, {});
+    context.SetGuestMemory(&memory);
+    context.CreatePool(
+        {.serial = 1, .guest_address = POOL_VA, .size = 64_KiB, .flags = POOL_CPU_CACHED});
+    context.CreatePool(
+        {.serial = 2, .guest_address = TEXTURE_POOL_VA, .size = 1_MiB, .flags = POOL_CPU_CACHED});
+    VC::TextureDesc texture{};
+    texture.target = 1;
+    texture.format = 0x79; // RGBA_ASTC_4x4
+    texture.width = 4;
+    texture.height = 4;
+    texture.depth = 1;
+    texture.levels = 1;
+    texture.serial = 10;
+    texture.pool_serial = 2;
+    context.CreateTexture(texture);
+    VC::SamplerDesc sampler{};
+    sampler.serial = 20;
+    sampler.wrap_s = sampler.wrap_t = sampler.wrap_r = 7;
+    context.CreateSampler(sampler);
+
+    constexpr u64 SAMPLE_PROGRAM = 303;
+    context.CreateProgram(
+        MakeProgram(SAMPLE_PROGRAM, SampleTextureRedProgram(), {.storage = 1, .textures = 1}));
+    const auto sample = [&](u64 seq, u64 texture_serial, f32 expected) {
+        std::vector<u64> list;
+        BindCompute(list, SAMPLE_PROGRAM, POOL_VA + seq * 0x1000, 16);
+        const u64 handle = 1 | u64{1} << 20;
+        Push(list, VC::Op::BindTextures, VC::BindHandlesPayload{.stage = 5, .first = 0, .count = 1},
+             {reinterpret_cast<const u8*>(&handle), sizeof(handle)});
+        Push(list, VC::Op::Dispatch, VC::DispatchPayload{.x = 4, .y = 1, .z = 1});
+        PushEnd(list);
+        VC::Submission submission =
+            MakeSubmission(seq, std::move(list), {SAMPLE_PROGRAM, texture_serial, 20, 1, 2});
+        submission.texture_pool_snapshot = VC::IdSnapshot{
+            std::make_shared<const std::vector<u64>>(std::vector<u64>{0, texture_serial})};
+        submission.sampler_pool_snapshot =
+            VC::IdSnapshot{std::make_shared<const std::vector<u64>>(std::vector<u64>{0, 20})};
+        context.Submit(std::move(submission));
+        REQUIRE(context.Wait(seq, 60s));
+        f32 observed{};
+        std::memcpy(&observed, output + seq * 0x1000, sizeof(observed));
+        CHECK(observed > expected - 0.03f);
+        CHECK(observed < expected + 0.03f);
+    };
+    sample(1, 10, 0.5f); // BC3 key was planned before first use chose BC4.
+
+    VC::TextureDesc srgb = texture;
+    srgb.serial = 11;
+    srgb.view_of = texture.serial;
+    srgb.view.set_format = true;
+    srgb.view.format = 0x87; // RGBA_ASTC_4x4_SRGB
+    context.CreateTexture(srgb);
+    sample(2, 11, 0.214f); // the sRGB alias needs an upload into BC1 before it can sample.
+}
+
+TEST_CASE("MKW BC3: sparse atlas sampling and streaming copies preserve residency",
+          "[nvn][mkw][compute][mkw-vram]") {
+    namespace Nvn = Vulkan::Nvn;
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    if (vulkan->device->IsOptimalAstcSupported() ||
+        !Nvn::BcGpuEncoder::Supported(*vulkan->device)) {
+        SKIP("requires desktop ASTC recompression");
+    }
+    struct Shape {
+        u32 width;
+        u32 layers;
+        u32 levels;
+    };
+    const auto shape = GENERATE(Shape{8192, 68, 14}, Shape{16384, 1, 15}, Shape{8192, 1, 1});
+    INFO("atlas " << shape.width << "x" << shape.width << "x" << shape.layers << ", levels "
+                  << shape.levels);
+    constexpr u64 VIRTUAL_VA = 0x7D00'0000'0000'0000ULL;
+    constexpr u64 TILE = 64_KiB;
+    FakeMemory memory;
+    u8* output = memory.Add(POOL_VA, 64_KiB);
+    u8* astc = memory.Add(TEXTURE_POOL_VA, 2_MiB);
+    const auto fill = [&](u64 offset, u64 size, u16 red) {
+        std::array<u8, 16> block{0xfc, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                                 0,    0,    0,    0,    0,    0,    0xff, 0xff};
+        std::memcpy(block.data() + 8, &red, sizeof(red));
+        for (u64 i = 0; i < size; i += block.size()) {
+            std::memcpy(astc + offset + i, block.data(), block.size());
+        }
+    };
+    fill(0, 2_MiB, 0x8000);
+    Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr, {});
+    context.SetGuestMemory(&memory);
+    context.SetTitleId(Settings::MarioKartWorldProgramId);
+    context.CreatePool(
+        {.serial = 1, .guest_address = POOL_VA, .size = 64_KiB, .flags = POOL_CPU_CACHED});
+    context.CreatePool(
+        {.serial = 2, .guest_address = TEXTURE_POOL_VA, .size = 2_MiB, .flags = POOL_CPU_CACHED});
+    context.CreatePool({.serial = 3, .guest_address = VIRTUAL_VA, .size = 2_GiB, .flags = 0x200});
+    VC::TextureDesc atlas{};
+    atlas.target = 4;
+    atlas.format = 0x80; // ASTC 8x8
+    atlas.flags = 0x20;
+    atlas.width = atlas.height = shape.width;
+    atlas.depth = shape.layers;
+    atlas.levels = shape.levels;
+    atlas.serial = 10;
+    atlas.pool_serial = 3;
+    context.CreateTexture(atlas);
+    Nvn::Storage reference;
+    reference.desc = {.target = 4,
+                      .format = 0x80,
+                      .flags = 0x20,
+                      .width = shape.width,
+                      .height = shape.width,
+                      .depth = shape.layers,
+                      .levels = shape.levels};
+    reference.layout = Nvn::ComputeTextureLayout(reference.desc);
+    reference.extent = {shape.width, shape.width, 1};
+    reference.type = VK_IMAGE_TYPE_2D;
+    reference.samples = VK_SAMPLE_COUNT_1_BIT;
+    reference.levels = shape.levels;
+    reference.layers = shape.layers;
+    const auto layout = Nvn::BuildSparseLayout(reference);
+    REQUIRE(layout);
+    const u32 sample_x = shape.width / 8;
+    const u32 sample_y = shape.width / 2;
+    const auto& level = layout->level[0];
+    const u32 id = (sample_y / layout->tile_height) * level.tiles_x + sample_x / layout->tile_width;
+    const u64 tile_offset = layout->TileOffset(id);
+    const u64 last_layer_tile = tile_offset + (shape.layers - 1) * layout->layer_size;
+    context.MapVirtual(3, {{tile_offset, 2, 0, TILE}, {last_layer_tile, 2, 0, TILE}});
+    const auto view = [&](u64 serial, u32 layer, u32 mip, bool srgb) {
+        VC::TextureDesc desc = atlas;
+        desc.serial = serial;
+        desc.view_of = atlas.serial;
+        desc.view.set_layers = true;
+        desc.view.min_layer = static_cast<u16>(layer);
+        desc.view.nlayers = 1;
+        desc.view.set_target = true;
+        desc.view.target = 1;
+        desc.view.set_levels = true;
+        desc.view.base_level = static_cast<u8>(mip);
+        desc.view.nlevels = 1;
+        desc.view.set_format = true;
+        desc.view.format = srgb ? 0x8e : 0x80;
+        context.CreateTexture(desc);
+    };
+    view(11, 0, 0, false);
+    view(12, shape.layers - 1, 0, false);
+    view(13, 0, 0, true);
+    VC::SamplerDesc sampler{};
+    sampler.serial = 20;
+    sampler.wrap_s = sampler.wrap_t = sampler.wrap_r = 7;
+    context.CreateSampler(sampler);
+    constexpr u64 SAMPLE_PROGRAM = 304;
+    context.CreateProgram(
+        MakeProgram(SAMPLE_PROGRAM, SampleTextureRedProgram(), {.storage = 1, .textures = 1}));
+    u64 seq = 0;
+    const auto run = [&](std::vector<u64> list, u64 texture_serial) {
+        BindCompute(list, SAMPLE_PROGRAM, POOL_VA, 16);
+        const u64 handle = 1 | u64{1} << 20;
+        Push(list, VC::Op::BindTextures, VC::BindHandlesPayload{.stage = 5, .first = 0, .count = 1},
+             {reinterpret_cast<const u8*>(&handle), sizeof(handle)});
+        Push(list, VC::Op::Dispatch, VC::DispatchPayload{.x = 4, .y = 1, .z = 1});
+        PushEnd(list);
+        auto submission = MakeSubmission(
+            ++seq, std::move(list),
+            {SAMPLE_PROGRAM, texture_serial, 10, 20, 1, 2, 3, 4, 30, 40, 41, 50, 51, 52, 53});
+        submission.texture_pool_snapshot = VC::IdSnapshot{
+            std::make_shared<const std::vector<u64>>(std::vector<u64>{0, texture_serial})};
+        submission.sampler_pool_snapshot =
+            VC::IdSnapshot{std::make_shared<const std::vector<u64>>(std::vector<u64>{0, 20})};
+        context.Submit(std::move(submission));
+        REQUIRE(context.Wait(seq, 60s));
+        REQUIRE(context.Stats().ops_failed == 0);
+        REQUIRE(context.Stats().ops_unsupported == 0);
+        std::array<f32, 4> samples{};
+        std::memcpy(samples.data(), output, sizeof(samples));
+        return samples;
+    };
+    const auto check = [&](u64 texture, f32 expected) {
+        const auto samples = run({}, texture);
+        CHECK(samples[0] > expected - 0.035f);
+        CHECK(samples[0] < expected + 0.035f);
+        CHECK(samples[1] == 0.0f); // an unmapped tile still reads zero
+    };
+    // Tiny mip copies cannot use vkCmdCopyImage when their BC blocks do not align with
+    // the destination. Preserve the surrounding texels and the raw UNORM/sRGB bits.
+    fill(3 * TILE, TILE, 0xe000);
+    VC::TextureDesc tiny{};
+    tiny.target = 1;
+    tiny.format = 0x8e;
+    tiny.width = tiny.height = 2;
+    tiny.depth = tiny.levels = 1;
+    tiny.serial = 50;
+    tiny.pool_serial = 2;
+    tiny.pool_offset = 3 * TILE;
+    context.CreateTexture(tiny);
+    tiny.format = 0x80;
+    tiny.width = tiny.height = 4;
+    tiny.serial = 51;
+    tiny.pool_offset = 4 * TILE;
+    context.CreateTexture(tiny);
+    VC::CopyTextureToTexturePayload partial{};
+    partial.src = {.serial = 50};
+    partial.dst = {.serial = 51};
+    partial.src_region = {0, 0, 0, 2, 2, 1};
+    partial.dst_region = {1, 1, 0, 2, 2, 1};
+    std::vector<u64> partial_list;
+    Push(partial_list, VC::Op::CopyTextureToTexture, partial);
+    const auto partial_samples = run(std::move(partial_list), 51);
+    for (u32 i = 0; i < 4; ++i) {
+        const f32 expected = i == 1 || i == 2 ? 0.875f : 0.5f;
+        // Re-encoding a mixed BC3 block can move its endpoints by several UNORM steps.
+        CHECK(partial_samples[i] > expected - 0.06f);
+        CHECK(partial_samples[i] < expected + 0.06f);
+    }
+    if (layout->HasTail()) {
+        const u32 coarse_mip = static_cast<u32>(layout->level.size());
+        const u32 coarse_size = (std::max)(shape.width >> coarse_mip, 1u);
+        view(52, shape.layers - 1, coarse_mip, false);
+        const auto empty_coarse = run({}, 52);
+        for (f32 value : empty_coarse) {
+            CHECK(value == 0.0f);
+        }
+        partial.dst = {.serial = 10, .level = coarse_mip, .layer = shape.layers - 1};
+        partial.dst_region = {
+            static_cast<s32>(coarse_size / 8), static_cast<s32>(coarse_size / 2), 0, 2, 2, 1};
+        partial_list.clear();
+        Push(partial_list, VC::Op::CopyTextureToTexture, partial);
+        const auto coarse_samples = run(std::move(partial_list), 52);
+        CHECK(coarse_samples[0] > 0.8f);
+        CHECK(coarse_samples[1] == 0.0f);
+        CHECK(coarse_samples[2] == 0.0f);
+        CHECK(coarse_samples[3] == 0.0f);
+        // Re-visiting an unmapped coarse mip must retain the new GPU texels.
+        CHECK(run({}, 52) == coarse_samples);
+        view(53, shape.layers - 1, shape.levels - 1, false);
+        partial.dst.level = shape.levels - 1;
+        partial.src_region = partial.dst_region = {0, 0, 0, 1, 1, 1};
+        partial_list.clear();
+        Push(partial_list, VC::Op::CopyTextureToTexture, partial);
+        for (f32 value : run(std::move(partial_list), 53)) {
+            CHECK(value > 0.8f);
+        }
+    }
+
+    check(11, 0.5f);
+    check(12, 0.5f);   // full array layer range, including the final layer
+    check(13, 0.214f); // first sRGB alias sees the same BC bits
+    const u64 tile_binds = shape.layers > 1 ? 4 : 2;
+    if (layout->HasTail()) {
+        CHECK(context.Stats().virtual_sparse_binds > tile_binds);
+    } else {
+        CHECK(context.Stats().virtual_sparse_binds == tile_binds);
+    }
+    fill(TILE, TILE, 0xe000);
+    context.MapVirtual(3, {{tile_offset, 2, TILE, TILE}});
+    check(11, 0.875f);
+    check(12, shape.layers > 1 ? 0.5f : 0.875f);
+    fill(TILE, TILE, 0x4000);
+    context.NotifyCpuWrite(TEXTURE_POOL_VA + TILE, TILE);
+    check(11, 0.25f);
+
+    // Stream an ordinary UNORM ASTC texture into an sRGB sparse atlas without converting bits.
+    VC::TextureDesc source{};
+    source.target = 1;
+    source.format = 0x80;
+    source.width = layout->tile_width;
+    source.height = layout->tile_height;
+    source.depth = source.levels = 1;
+    source.serial = 30;
+    source.pool_serial = 2;
+    source.pool_offset = 2 * TILE;
+    fill(2 * TILE, TILE, 0xc000);
+    context.CreateTexture(source);
+    VC::CopyTextureToTexturePayload copy{};
+    copy.src = {.serial = 30};
+    copy.dst = {.serial = 13};
+    copy.src_region = {
+        0, 0, 0, static_cast<s32>(layout->tile_width), static_cast<s32>(layout->tile_height), 1};
+    copy.dst_region = {static_cast<s32>((sample_x / layout->tile_width) * layout->tile_width),
+                       static_cast<s32>((sample_y / layout->tile_height) * layout->tile_height),
+                       0,
+                       static_cast<s32>(layout->tile_width),
+                       static_cast<s32>(layout->tile_height),
+                       1};
+    std::vector<u64> list;
+    Push(list, VC::Op::CopyTextureToTexture, copy);
+    const auto copied = run(std::move(list), 11);
+    CHECK(copied[0] > 0.715f);
+    CHECK(copied[0] < 0.785f);
+    check(13, 0.523f);
+    const auto uploads = context.Stats().uploads;
+    context.MapVirtual(3, {{tile_offset, 2, TILE, TILE}}); // identical remap keeps GPU writes
+    check(11, 0.75f);
+    CHECK(context.Stats().uploads == uploads);
+    context.MapVirtual(3, {{tile_offset, 0, 0, TILE}});
+    check(11, 0.0f);
+    check(12, shape.layers > 1 ? 0.5f : 0.0f);
+
+    // Test distinct UNORM/sRGB storages too, rather than just format aliases of one image.
+    context.CreatePool(
+        {.serial = 4, .guest_address = VIRTUAL_VA + 4_GiB, .size = 2_GiB, .flags = 0x200});
+    VC::TextureDesc srgb_atlas = atlas;
+    srgb_atlas.serial = 40;
+    srgb_atlas.pool_serial = 4;
+    srgb_atlas.format = 0x8e;
+    context.CreateTexture(srgb_atlas);
+    context.MapVirtual(4, {{tile_offset, 2, 0, TILE}});
+    VC::TextureDesc srgb_view = srgb_atlas;
+    srgb_view.serial = 41;
+    srgb_view.view_of = 40;
+    srgb_view.view.set_target = true;
+    srgb_view.view.target = 1;
+    srgb_view.view.set_layers = true;
+    srgb_view.view.nlayers = 1;
+    context.CreateTexture(srgb_view);
+    copy.dst.serial = 40;
+    list.clear();
+    Push(list, VC::Op::CopyTextureToTexture, copy);
+    const auto srgb_copied = run(std::move(list), 41);
+    CHECK(srgb_copied[0] > 0.488f);
+    CHECK(srgb_copied[0] < 0.558f);
+    // Reverse the copy back into the UNORM storage: no sRGB conversion in either direction.
+    context.MapVirtual(3, {{tile_offset, 2, TILE, TILE}});
+    copy.src = {.serial = 40};
+    copy.src_region = copy.dst_region;
+    copy.dst.serial = 10;
+    list.clear();
+    Push(list, VC::Op::CopyTextureToTexture, copy);
+    const auto reverse_copied = run(std::move(list), 11);
+    CHECK(reverse_copied[0] > 0.715f);
+    CHECK(reverse_copied[0] < 0.785f);
+
+    // Guest mip tails bind the host tail and any remaining host sparse levels separately.
+    if (!layout->HasTail()) {
+        return;
+    }
+    const u64 tail = layout->tail_offset;
+    REQUIRE(layout->TailSize() <= 1_MiB);
+    fill(1_MiB, layout->TailSize(), 0x8000);
+    context.MapVirtual(3, {{tail, 2, 1_MiB, layout->TailSize()}});
+    view(14, 0, shape.levels - 1, false);
+    const auto tail_samples = run({}, 14);
+    CHECK(tail_samples[0] > 0.465f);
+    CHECK(tail_samples[0] < 0.535f);
 }
 
 // ---- SAMPLES_PASSED reports inside a render pass -----------------------------------------------
@@ -2702,6 +3087,71 @@ TEST_CASE("NVN draw: without render targets a draw rasterizes over NVN's no-targ
     CHECK(StatRow(context, "render_pass_begins") == 1);
     CHECK(WordAt(data, REPORTS) == 1);
     CHECK(WordAt(data, REPORTS + 4) == 0);
+}
+
+TEST_CASE("NVN draw: unchanged dynamic state survives a masked clear",
+          "[nvn][compute][pass_state]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    FakeMemory memory;
+    u8* data = memory.Add(POOL_VA, 64_KiB);
+    memory.Add(TEXTURE_POOL_VA, 1_MiB);
+    Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr,
+                                 {.early_submit = false});
+    context.SetGuestMemory(&memory);
+    context.CreatePool(
+        {.serial = 1, .guest_address = POOL_VA, .size = 64_KiB, .flags = POOL_CPU_CACHED});
+    context.CreatePool({.serial = 2,
+                        .guest_address = TEXTURE_POOL_VA,
+                        .size = 1_MiB,
+                        .flags = 1 /* CPU_NO_ACCESS */});
+    VC::TextureDesc target{};
+    target.target = 1;
+    target.format = 0x25;
+    target.width = target.height = 64;
+    target.depth = target.levels = 1;
+    target.serial = 10;
+    target.pool_serial = 2;
+    context.CreateTexture(target);
+    constexpr Inst position{{0xff007322, 0x00007000, 0x00000cff, 0x000fe200}};
+    const std::array<Inst, 6> point{{AddImm(0, 255, 0x3c800000), AddImm(1, 255, 0x3c800000),
+                                     AddImm(2, 255, 0), AddImm(3, 255, 0x3f800000), position,
+                                     Exit}};
+    context.CreateProgram(MakeVertexProgram(VERTEX_PROGRAM, point));
+    std::vector<u64> list;
+    const VC::RenderTargetRef color{.texture = {.serial = 10}};
+    Push(list, VC::Op::SetRenderTargets, VC::SetRenderTargetsPayload{1, 0},
+         {reinterpret_cast<const u8*>(&color), sizeof(color)});
+    Push(list, VC::Op::BindProgram,
+         VC::BindProgramPayload{.program_serial = VERTEX_PROGRAM, .stages = 1u << 0});
+    Push(list, VC::Op::SetPointSize, VC::F32Payload{.value = 1.0f});
+    for (u32 draw = 0; draw < 2; ++draw) {
+        if (draw != 0) {
+            VC::ClearColorPayload clear{};
+            clear.mask = 1;
+            clear.color[0] = 1.0f;
+            Push(list, VC::Op::ClearColor, clear);
+        }
+        const VC::ViewportRect viewport{0.0f, 0.0f, 64.0f, 64.0f};
+        Push(list, VC::Op::SetViewports, VC::SetViewportsPayload{.first = 0, .count = 1},
+             {reinterpret_cast<const u8*>(&viewport), sizeof(viewport)});
+        Push(list, VC::Op::SetLineWidth, VC::F32Payload{.value = 1.0f});
+        Push(list, VC::Op::ResetCounter, VC::ResetCounterPayload{.counter_type = SAMPLES_PASSED});
+        Push(list, VC::Op::Draw,
+             VC::DrawPayload{.mode = 0, .first = 0, .count = 1, .instance_count = 1});
+        Push(list, VC::Op::ReportCounter,
+             VC::ReportCounterPayload{.address = POOL_VA + draw * 16,
+                                      .counter_type = SAMPLES_PASSED});
+    }
+    PushEnd(list);
+    context.Submit(MakeSubmission(1, std::move(list), {VERTEX_PROGRAM, 10, 1, 2}));
+    REQUIRE(context.Wait(1, 60s));
+    CHECK(context.Stats().ops_failed == 0);
+    CHECK(context.Stats().ops_unsupported == 0);
+    CHECK(WordAt(data, 0) == 1);
+    CHECK(WordAt(data, 16) == 1);
 }
 
 TEST_CASE("NVN draw: with asynchronous shaders only the draws the emulated path may skip are "
@@ -3755,4 +4205,70 @@ TEST_CASE("NVN uniform mirror: the first copy is the pages the bindings use, not
     REQUIRE(rig.Draw(PROGRAM_UNIFORM, 1, 2, binds) == 2);
     CHECK(rig.context.Stats().vram_copy_in_bytes == 3 * 4096);
     CHECK(rig.context.Stats().ops_failed == 0);
+}
+
+TEST_CASE("MKW split mirrors observe raw GPU stores before later descriptor reads",
+          "[nvn][compute][mirror][mkw]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan || !vulkan->device->IsBufferDeviceAddressSupported() ||
+        !vulkan->device->IsShaderInt64Supported() ||
+        !vulkan->device->IsExtExternalMemoryHostSupported()) {
+        SKIP("split raw imports unavailable");
+    }
+    const bool mkw = GENERATE(false, true);
+    FakeMemory memory;
+    constexpr u64 RUN = 64_KiB;
+    u8* first = memory.Add(POOL_VA, RUN);
+    memory.Add(POOL_VA + RUN, RUN);
+    constexpr u64 OUTPUT = POOL_VA + 4 * RUN;
+    u8* output = memory.Add(OUTPUT, RUN);
+    Vulkan::Nvn::Context context(
+        *vulkan->device, vulkan->submit_mutex, nullptr,
+        {.early_submit = false, .try_storage_vram = false, .mirror_hash_tracked = true});
+    context.SetGuestMemory(&memory);
+    context.SetTitleId(mkw ? Settings::MarioKartWorldProgramId : Settings::OcarinaOfTimeProgramId);
+    context.CreatePool(
+        {.serial = 1, .guest_address = POOL_VA, .size = 2 * RUN, .flags = POOL_CPU_CACHED});
+    context.CreatePool(
+        {.serial = 2, .guest_address = OUTPUT, .size = RUN, .flags = POOL_CPU_CACHED});
+    const std::array<Inst, 5> raw_store{MovC0(2, 0x10), MovC0(3, 0x14), AddImm(6, 255, 0x1234),
+                                        Stg(2, 6), Exit};
+    context.CreateProgram(MakeProgram(PROGRAM_RAW_WRITE, raw_store, {.push_words = 2}));
+    u64 seq = 0;
+    const auto run = [&](std::vector<u64> list) {
+        PushEnd(list);
+        context.Submit(MakeSubmission(++seq, std::move(list), {1, 2, PROGRAM_RAW_WRITE}));
+        REQUIRE(context.Wait(seq, 20s));
+    };
+    const auto copy = [&](u64 source) {
+        std::vector<u64> list;
+        Push(list, VC::Op::CopyBufferToBuffer,
+             VC::CopyBufferToBufferPayload{.src = source, .dst = OUTPUT, .size = 4});
+        run(std::move(list));
+    };
+    copy(POOL_VA + 0x1000);
+    if (context.Stats().pools_split_imported == 0) {
+        SKIP("device could not import split runs");
+    }
+    REQUIRE(WordAt(output, 0) == 0);
+    const u64 hashed = context.Stats().mirror_pages_hashed;
+    copy(POOL_VA + 0x1000);
+    REQUIRE(context.Stats().mirror_pages_hashed == hashed);
+    for (const u64 offset : {0x1000u, 0x2000u, 0x1000u}) {
+        std::vector<u64> list;
+        Push(list, VC::Op::BindProgram,
+             VC::BindProgramPayload{.program_serial = PROGRAM_RAW_WRITE, .stages = 1u << 5});
+        PushRawAddress(list, POOL_VA + offset);
+        Push(list, VC::Op::Dispatch, VC::DispatchPayload{.x = 1, .y = 1, .z = 1});
+        run(std::move(list));
+        REQUIRE(WordAt(first, offset) == 0x1234);
+        copy(POOL_VA + offset);
+        REQUIRE(WordAt(output, 0) == 0x1234);
+        const u32 cpu = 0x4567;
+        memory.CpuWrite(POOL_VA + offset, &cpu, sizeof(cpu));
+        copy(POOL_VA + offset);
+        REQUIRE(WordAt(output, 0) == cpu);
+    }
+    REQUIRE(context.Stats().ops_failed == 0);
+    REQUIRE(context.Stats().ops_unsupported == 0);
 }
