@@ -91,6 +91,15 @@ void GameCard::paint(QPainter* painter, const QStyleOptionViewItem& option,
 
         painter->setRenderHint(QPainter::SmoothPixmapTransform, true);
 
+        // Soft drop shadow: stacked translucent rects, darkest under the icon's centre.
+        painter->setPen(Qt::NoPen);
+        painter->setBrush(QColor(0, 0, 0, 14));
+        for (int spread = 1; spread <= 6; ++spread) {
+            const QRectF shadow = QRectF(iconRect).adjusted(-spread, -spread + 3, spread,
+                                                            spread + 3);
+            painter->drawRoundedRect(shadow, cardCornerRadius + spread, cardCornerRadius + spread);
+        }
+
         painter->save();
         QPainterPath clip_path;
         clip_path.addRoundedRect(iconRect, cardCornerRadius, cardCornerRadius);
