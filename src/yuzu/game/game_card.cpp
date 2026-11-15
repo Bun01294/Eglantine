@@ -3,12 +3,56 @@
 
 #include <QPainter>
 #include <QPainterPath>
+#include <QTextLayout>
 #include "game_card.h"
 #include "qt_common/config/uisettings.h"
 
 GameCard::GameCard(QObject* parent) : QStyledItemDelegate{parent} {
     setObjectName("GameCard");
 }
+
+namespace {
+
+constexpr int MaxTitleLines = 2;
+
+/// Wraps `text` into at most `max_lines` centred lines, eliding the last one if it overflows.
+void DrawTitle(QPainter* painter, const QRect& rect, const QString& text, const QFont& font,
+               int max_lines) {
+    const QFontMetrics metrics(font);
+    QTextLayout layout(text, font);
+    QTextOption option;
+    option.setWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
+    layout.setTextOption(option);
+
+    QStringList lines;
+    layout.beginLayout();
+    while (lines.size() < max_lines) {
+        QTextLine line = layout.createLine();
+        if (!line.isValid()) {
+            break;
+        }
+        line.setLineWidth(rect.width());
+        if (lines.size() == max_lines - 1) {
+            lines << metrics.elidedText(text.mid(line.textStart()).trimmed(), Qt::ElideRight,
+                                        rect.width());
+        } else {
+            lines << text.mid(line.textStart(), line.textLength()).trimmed();
+        }
+    }
+    layout.endLayout();
+
+    int y = rect.top();
+    for (const QString& line : std::as_const(lines)) {
+        if (y + metrics.height() > rect.bottom() + 1) {
+            break;
+        }
+        painter->drawText(QRect(rect.left(), y, rect.width(), metrics.height()),
+                          Qt::AlignHCenter | Qt::AlignTop, line);
+        y += metrics.lineSpacing();
+    }
+}
+
+} // namespace
 
 void GameCard::paint(QPainter* painter, const QStyleOptionViewItem& option,
                      const QModelIndex& index) const {
@@ -21,30 +65,24 @@ void GameCard::paint(QPainter* painter, const QStyleOptionViewItem& option,
     constexpr int cardCornerRadius = 10;
 
     const QRect cardRect = getCardRect(option, index);
+    const QPalette& palette = option.palette;
+    const bool selected = option.state & QStyle::State_Selected;
+    const bool hovered = option.state & QStyle::State_MouseOver;
 
-    QPalette palette = option.palette;
-    QColor backgroundColor = palette.window().color();
-    QColor borderColor = palette.dark().color();
-    QColor textColor = palette.text().color();
-
-    // highlight on select or hover
-    if (option.state & QStyle::State_Selected) {
-        backgroundColor = palette.highlight().color();
-        borderColor = palette.highlight().color().lighter(150);
-        textColor = palette.highlightedText().color();
-    } else if (option.state & QStyle::State_MouseOver) {
-        backgroundColor = backgroundColor.lighter(120);
+    // No card frame: only hover and selection get a soft backdrop.
+    if (selected || hovered) {
+        QColor backdrop = palette.highlight().color();
+        backdrop.setAlpha(selected ? 110 : 45);
+        painter->setPen(Qt::NoPen);
+        painter->setBrush(backdrop);
+        painter->drawRoundedRect(cardRect, cardCornerRadius, cardCornerRadius);
     }
-
-    painter->setBrush(backgroundColor);
-    painter->setPen(QPen(borderColor, 1));
-    painter->drawRoundedRect(cardRect, cardCornerRadius, cardCornerRadius);
 
     const u32 icon_size = UISettings::values.game_icon_size.GetValue();
     QPixmap icon_pixmap = index.data(Qt::DecorationRole).value<QPixmap>();
 
     QRect iconRect;
-    if (!icon_pixmap.isNull()) {
+    if (!icon_pixmap.isNull() && icon_size > 0) {
         QSize scaled = icon_pixmap.size();
         scaled.scale(icon_size, icon_size, Qt::KeepAspectRatio);
 
@@ -59,6 +97,13 @@ void GameCard::paint(QPainter* painter, const QStyleOptionViewItem& option,
         painter->setClipPath(clip_path);
         painter->drawPixmap(iconRect, icon_pixmap);
         painter->restore();
+
+        if (selected) {
+            painter->setPen(QPen(palette.highlight().color(), 2));
+            painter->setBrush(Qt::NoBrush);
+            painter->drawRoundedRect(QRectF(iconRect).adjusted(-1, -1, 1, 1), cardCornerRadius,
+                                     cardCornerRadius);
+        }
     } else {
         iconRect = {cardRect.left() + cardMargin, cardRect.top() + cardMargin,
                     static_cast<int>(icon_size), static_cast<int>(icon_size)};
@@ -67,17 +112,18 @@ void GameCard::paint(QPainter* painter, const QStyleOptionViewItem& option,
     if (UISettings::values.show_game_name.GetValue()) {
         QRect textRect = cardRect;
         textRect.setTop(iconRect.bottom() + cardMargin);
-        textRect.adjust(cardMargin, 0, -cardMargin, -cardMargin);
+        textRect.adjust(cardMargin / 2, 0, -cardMargin / 2, -cardMargin / 2);
 
-        QString title = index.data(Qt::DisplayRole).toString().split(QLatin1Char('\n')).first();
+        const QString title =
+            index.data(Qt::DisplayRole).toString().split(QLatin1Char('\n')).first();
 
-        painter->setPen(textColor);
         QFont font = option.font;
         font.setBold(true);
         font.setPixelSize(std::max(11.0, std::sqrt(static_cast<double>(icon_size))));
         painter->setFont(font);
+        painter->setPen(palette.text().color());
 
-        painter->drawText(textRect, Qt::AlignHCenter | Qt::AlignTop | Qt::TextWordWrap, title);
+        DrawTitle(painter, textRect, title, font, MaxTitleLines);
     }
 
     painter->restore();
