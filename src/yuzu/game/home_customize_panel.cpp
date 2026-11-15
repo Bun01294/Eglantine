@@ -19,6 +19,7 @@
 #include <QScrollBar>
 #include <QSlider>
 #include <QStyle>
+#include <QStyledItemDelegate>
 #include <QToolButton>
 #include <QVBoxLayout>
 
@@ -97,6 +98,49 @@ QIcon MakeModeIcon(Settings::GameListMode mode, const QColor& color, qreal dpr) 
     return QIcon(pixmap);
 }
 
+/// Draws each recent background as a full-cell rounded thumbnail with an even border.
+class RecentThumbDelegate : public QStyledItemDelegate {
+public:
+    using QStyledItemDelegate::QStyledItemDelegate;
+
+    void paint(QPainter* p, const QStyleOptionViewItem& option,
+               const QModelIndex& index) const override {
+        const QRect rect(option.rect.center() - QPoint(RecentThumbSize.width() / 2,
+                                                       RecentThumbSize.height() / 2),
+                         RecentThumbSize);
+        const QIcon thumb = index.data(Qt::DecorationRole).value<QIcon>();
+
+        p->save();
+        p->setRenderHint(QPainter::Antialiasing);
+        p->setRenderHint(QPainter::SmoothPixmapTransform);
+        thumb.paint(p, rect);
+
+        const QPalette& pal = option.palette;
+        const bool selected = option.state & QStyle::State_Selected;
+        const bool hovered = option.state & QStyle::State_MouseOver;
+        // Mid is black on some dark palettes, so derive the idle border from the text colour.
+        QColor color = pal.color(QPalette::Text);
+        color.setAlpha(70);
+        qreal width = 1.0;
+        if (selected) {
+            color = pal.color(QPalette::Highlight);
+            width = 2.0;
+        } else if (hovered) {
+            color = pal.color(QPalette::Highlight);
+            color.setAlpha(160);
+        }
+        const qreal inset = width / 2.0;
+        p->setPen(QPen(color, width));
+        p->setBrush(Qt::NoBrush);
+        p->drawRoundedRect(QRectF(rect).adjusted(inset, inset, -inset, -inset), 6, 6);
+        p->restore();
+    }
+
+    QSize sizeHint(const QStyleOptionViewItem&, const QModelIndex&) const override {
+        return RecentThumbSize + QSize(8, 8);
+    }
+};
+
 QLabel* MakeHeading(QWidget* parent, qreal scale) {
     auto* label = new QLabel(parent);
     QFont font = label->font();
@@ -171,8 +215,16 @@ void BackgroundDropZone::paintEvent(QPaintEvent*) {
         p.drawText(rect().adjusted(12, 12, -12, -12), Qt::AlignCenter | Qt::TextWordWrap, hint);
     }
 
-    QPen border(drag_active || hovered ? pal.color(QPalette::Highlight) : pal.color(QPalette::Mid),
-                drag_active ? 2 : 1);
+    QColor border_color = pal.color(QPalette::Text);
+    border_color.setAlpha(70);
+    if (drag_active || (hovered && has_image)) {
+        border_color = pal.color(QPalette::Highlight);
+    } else if (!has_image) {
+        // Keep the empty drop zone visible; hover only strengthens the gray.
+        border_color = pal.color(QPalette::Text);
+        border_color.setAlpha(hovered ? 150 : 90);
+    }
+    QPen border(border_color, drag_active ? 2 : 1);
     if (!has_image || drag_active) {
         border.setStyle(Qt::DashLine);
     }
@@ -262,6 +314,9 @@ HomeCustomizePanel::HomeCustomizePanel(HomeBackground* background_, QWidget* par
     layout->addLayout(header);
 
     // Background
+    background_label = MakeHeading(content, 1.15);
+    layout->addWidget(background_label);
+
     drop_zone = new BackgroundDropZone(background, content);
     connect(drop_zone, &BackgroundDropZone::BrowseRequested, this, &HomeCustomizePanel::Browse);
     connect(drop_zone, &BackgroundDropZone::FileDropped, this,
@@ -286,6 +341,8 @@ HomeCustomizePanel::HomeCustomizePanel(HomeBackground* background_, QWidget* par
                                 recent_list->horizontalScrollBar()->sizeHint().height());
     recent_list->setContextMenuPolicy(Qt::CustomContextMenu);
     recent_list->setStyleSheet(QStringLiteral("QListWidget { background: transparent; }"));
+    recent_list->setItemDelegate(new RecentThumbDelegate(recent_list));
+    recent_list->setMouseTracking(true);
     connect(recent_list, &QListWidget::itemClicked, this, [this](QListWidgetItem* item) {
         emit BackgroundChosen(item->data(Qt::UserRole).toString());
     });
@@ -402,7 +459,7 @@ QPixmap HomeCustomizePanel::Thumbnail(const QString& path) {
     p.setRenderHint(QPainter::SmoothPixmapTransform);
     const QRect rect(QPoint{}, RecentThumbSize);
     QPainterPath clip;
-    clip.addRoundedRect(QRectF(rect).adjusted(0.5, 0.5, -0.5, -0.5), 6, 6);
+    clip.addRoundedRect(QRectF(rect), 6, 6);
     p.setClipPath(clip);
     p.fillRect(rect, palette().color(QPalette::Base));
 
@@ -443,6 +500,11 @@ void HomeCustomizePanel::RefreshRecents() {
             paths << path;
         }
     }
+
+    // Only offer recents once a background has been used.
+    const bool show_recents = paths.size() > 1 || !current.isEmpty();
+    recent_label->setVisible(show_recents);
+    recent_list->setVisible(show_recents);
 
     recent_list->clear();
     for (const QString& path : paths) {
@@ -494,6 +556,7 @@ void HomeCustomizePanel::UpdateIconSizeLabel() {
 
 void HomeCustomizePanel::RetranslateUI() {
     title_label->setText(tr("Home Screen"));
+    background_label->setText(tr("Background"));
     close_button->setToolTip(tr("Close"));
     drop_zone->setToolTip(tr("Click to choose a background, or drop an image or video here"));
     recent_label->setText(tr("Recent backgrounds"));

@@ -89,6 +89,7 @@ private:
 
     QLabel* title_label = nullptr;
     QToolButton* close_button = nullptr;
+    QLabel* background_label = nullptr;
     BackgroundDropZone* drop_zone = nullptr;
     QLabel* recent_label = nullptr;
     QListWidget* recent_list = nullptr;

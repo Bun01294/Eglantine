@@ -84,8 +84,15 @@ QImage HomeBackground::LoadThumbnail(const QString& path, const QSize& size) {
     if (IsVideo(path)) {
         return {};
     }
-    // Read at twice the cell size so the cover crop stays sharp on HiDPI screens.
-    return ReadStill(path, size * 2);
+    // Decode just large enough to cover twice the cell, so the crop stays sharp on HiDPI.
+    QImageReader reader(path);
+    reader.setAutoTransform(true);
+    const QSize source = reader.size();
+    const QSize cover = source.scaled(size * 2, Qt::KeepAspectRatioByExpanding);
+    if (source.isValid() && cover.width() < source.width()) {
+        reader.setScaledSize(cover);
+    }
+    return reader.read();
 }
 
 void HomeBackground::PaintCover(QPainter& painter, const QRect& target, const QImage& image) {
