@@ -1915,6 +1915,8 @@ void MainWindow::ConnectWidgetEvents() {
     connect(game_list, &GameList::PopulatingCompleted,
             [this] { multiplayer_state->UpdateGameList(game_list->GetModel()); });
     connect(game_list, &GameList::SaveConfig, this, &MainWindow::OnSaveConfig);
+    connect(game_list, &GameList::GameListModeRequested, this, &MainWindow::SetGameListMode);
+    connect(game_list, &GameList::GameIconSizeRequested, this, &MainWindow::SetGameIconSize);
 
     connect(game_list, &GameList::OpenPerGameGeneralRequested, this,
             &MainWindow::OnGameListOpenPerGameProperties);
@@ -2004,11 +2006,7 @@ void MainWindow::ConnectMenuEvents() {
 
         connect(action, &QAction::triggered, this, [this, size](bool checked) {
             if (checked) {
-                UISettings::values.game_icon_size.SetValue(size);
-                CheckIconSize();
-
-                game_list->UpdateIconSizes();
-                game_list->RefreshGameDirectory();
+                SetGameIconSize(size);
             }
         });
     }
@@ -4059,6 +4057,18 @@ void MainWindow::SetTreeView() {
 
 void MainWindow::SetCarouselView() {
     SetGameListMode(Settings::GameListMode::CarouselView);
+}
+
+void MainWindow::SetGameIconSize(u32 size) {
+    UISettings::values.game_icon_size.SetValue(size);
+    const auto actions = game_size_actions->actions();
+    for (size_t i = 0; i < default_game_icon_sizes.size(); i++) {
+        actions.at(i)->setChecked(default_game_icon_sizes[i].first == size);
+    }
+    CheckIconSize();
+
+    game_list->UpdateIconSizes();
+    game_list->RefreshGameDirectory();
 }
 
 void MainWindow::CheckIconSize() {

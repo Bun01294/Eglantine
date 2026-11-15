@@ -17,7 +17,11 @@
 #include <QJsonObject>
 #include <QList>
 #include <QListView>
+#include <QHBoxLayout>
 #include <QMenu>
+#include <QMessageBox>
+#include <QPainter>
+#include <QPropertyAnimation>
 #include <QScrollBar>
 #include <QScroller>
 #include <QScrollerProperties>
@@ -40,10 +44,65 @@
 #include "yuzu/game/game_grid.h"
 #include "yuzu/game/game_list.h"
 #include "yuzu/game/game_tree.h"
+#include "yuzu/game/home_background.h"
+#include "yuzu/game/home_customize_panel.h"
 #include "yuzu/game/search_field.h"
 #include "yuzu/main_window.h"
 #include "yuzu/shader_warm_dialog.h"
 #include "yuzu/util/controller_navigation.h"
+
+/// Holds the game views and paints the home screen background behind them.
+class HomeSurface : public QWidget {
+public:
+    HomeSurface(HomeBackground* background_, QWidget* parent)
+        : QWidget{parent}, background{background_} {
+        connect(background, &HomeBackground::FrameChanged, this, [this] {
+            cached = {};
+            update();
+        });
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        if (background->IsEmpty()) {
+            return;
+        }
+        const QImage& frame = background->Frame();
+        const qreal dpr = devicePixelRatioF();
+        if (cached.isNull() || cached_key != frame.cacheKey() || cached_size != size() ||
+            cached.devicePixelRatio() != dpr) {
+            cached = QPixmap(size() * dpr);
+            cached.setDevicePixelRatio(dpr);
+            QPainter cp(&cached);
+            cp.setRenderHint(QPainter::SmoothPixmapTransform);
+            HomeBackground::PaintCover(cp, rect(), frame);
+            // Keep game names and the tree's columns readable on bright or busy backgrounds.
+            QColor scrim = palette().color(QPalette::Window);
+            scrim.setAlpha(90);
+            cp.fillRect(rect(), scrim);
+            cached_key = frame.cacheKey();
+            cached_size = size();
+        }
+        QPainter p(this);
+        p.drawPixmap(0, 0, cached);
+    }
+
+    void showEvent(QShowEvent* event) override {
+        background->SetActive(true);
+        QWidget::showEvent(event);
+    }
+
+    void hideEvent(QHideEvent* event) override {
+        background->SetActive(false);
+        QWidget::hideEvent(event);
+    }
+
+private:
+    HomeBackground* background;
+    QPixmap cached;
+    qint64 cached_key = 0;
+    QSize cached_size;
+};
 
 GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvider* provider_,
                    PlayTime::PlayTimeManager& play_time_manager_, Core::System& system_,
@@ -52,10 +111,17 @@ GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvid
       play_time_manager{play_time_manager_}, system{system_} {
 
     this->main_window = parent;
-    layout = new QVBoxLayout;
+    outer_layout = new QHBoxLayout(this);
+    outer_layout->setContentsMargins(0, 0, 0, 0);
+    outer_layout->setSpacing(0);
+
+    background = new HomeBackground(this);
+    surface = new HomeSurface(background, this);
+    outer_layout->addWidget(surface, 1);
+
+    layout = new QVBoxLayout(surface);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
-    setLayout(layout);
 
     item_model = new GameListModel(vfs, provider, play_time_manager, system, this);
 
@@ -67,6 +133,7 @@ GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvid
     controller_navigation = new ControllerNavigation(system.HIDCore(), this);
 
     SetupScrollAnimation();
+    SetupCustomization();
 
     connect(tree_view, &QTreeView::activated, this, &GameList::ValidateEntry);
     connect(tree_view, &QTreeView::customContextMenuRequested, this, &GameList::PopupContextMenu);
@@ -252,6 +319,114 @@ void GameList::ResetViewMode() {
             item_model->PopulateAsync(UISettings::values.game_dirs);
         }
     }
+
+    if (customize_panel) {
+        customize_panel->SyncFromSettings();
+    }
+}
+
+void GameList::SetupCustomization() {
+    customize_panel = new HomeCustomizePanel(background, this);
+    customize_panel->setMaximumWidth(0);
+    customize_panel->hide();
+    outer_layout->addWidget(customize_panel);
+
+    customize_animation = new QPropertyAnimation(customize_panel, "maximumWidth", this);
+    customize_animation->setDuration(180);
+    customize_animation->setEasingCurve(QEasingCurve::OutCubic);
+    connect(customize_animation, &QPropertyAnimation::finished, this, [this] {
+        if (customize_panel->maximumWidth() == 0) {
+            customize_panel->hide();
+            m_currentView->setFocus();
+        }
+    });
+
+    connect(customize_panel, &HomeCustomizePanel::CloseRequested, this,
+            [this] { ShowCustomizePanel(false); });
+    connect(customize_panel, &HomeCustomizePanel::BackgroundChosen, this,
+            &GameList::SetHomeBackground);
+    connect(customize_panel, &HomeCustomizePanel::RecentBackgroundRemoved, this,
+            &GameList::RemoveRecentBackground);
+    connect(customize_panel, &HomeCustomizePanel::GameListModeRequested, this,
+            &GameList::GameListModeRequested);
+    connect(customize_panel, &HomeCustomizePanel::GameIconSizeRequested, this,
+            &GameList::GameIconSizeRequested);
+
+    const QString saved = QString::fromStdString(UISettings::values.home_background.GetValue());
+    if (!saved.isEmpty() && !background->SetSource(saved)) {
+        LOG_WARNING(Frontend, "Home screen background {} could not be loaded", saved.toStdString());
+    }
+    UpdateViewTransparency();
+}
+
+void GameList::ShowCustomizePanel(bool show) {
+    const int target = show ? HomeCustomizePanel::PanelWidth : 0;
+    if (show) {
+        customize_panel->SyncFromSettings();
+        customize_panel->show();
+        customize_panel->setFocus();
+    } else if (customize_panel->isHidden()) {
+        return;
+    }
+    customize_animation->stop();
+    customize_animation->setStartValue(customize_panel->maximumWidth());
+    customize_animation->setEndValue(target);
+    customize_animation->start();
+}
+
+void GameList::SetHomeBackground(const QString& path) {
+    if (!background->SetSource(path)) {
+        QMessageBox::warning(this, tr("Home Screen"),
+                             HomeBackground::IsVideo(path)
+                                 ? tr("Video backgrounds need a build with QtMultimedia.")
+                                 : tr("\"%1\" could not be loaded as a background.")
+                                       .arg(QFileInfo(path).fileName()));
+        return;
+    }
+
+    UISettings::values.home_background.SetValue(path.toStdString());
+    if (!path.isEmpty()) {
+        constexpr qsizetype MaxRecentBackgrounds = 8;
+        auto& recents = UISettings::values.recent_home_backgrounds;
+        recents.removeAll(path);
+        recents.prepend(path);
+        while (recents.size() > MaxRecentBackgrounds) {
+            recents.removeLast();
+        }
+    }
+
+    UpdateViewTransparency();
+    customize_panel->SyncFromSettings();
+    emit SaveConfig();
+}
+
+void GameList::RemoveRecentBackground(const QString& path) {
+    UISettings::values.recent_home_backgrounds.removeAll(path);
+    customize_panel->SyncFromSettings();
+    emit SaveConfig();
+}
+
+void GameList::UpdateViewTransparency() {
+    if (background->IsEmpty()) {
+        tree_view->setStyleSheet(QStringLiteral("QTreeView{ border: none; }"));
+        grid_view->setStyleSheet({});
+        carousel_view->setStyleSheet({});
+        return;
+    }
+
+    QColor alternate = palette().color(QPalette::AlternateBase);
+    alternate.setAlpha(110);
+    tree_view->setStyleSheet(
+        QStringLiteral("QTreeView{ border: none; background: transparent; "
+                       "alternate-background-color: rgba(%1, %2, %3, %4); }")
+            .arg(alternate.red())
+            .arg(alternate.green())
+            .arg(alternate.blue())
+            .arg(alternate.alpha()));
+    const QString list_style =
+        QStringLiteral("QListView{ border: none; background: transparent; }");
+    grid_view->setStyleSheet(list_style);
+    carousel_view->setStyleSheet(list_style);
 }
 
 void GameList::OnTextChanged(const QString& new_text) {
@@ -368,6 +543,10 @@ void GameList::RefreshExternalContent() {
 }
 
 void GameList::UpdateIconSizes() {
+    if (customize_panel) {
+        customize_panel->SyncFromSettings();
+    }
+
     switch (game_list_mode) {
     case Settings::GameListMode::GridView:
         grid_view->UpdateIconSize();
@@ -433,13 +612,14 @@ void GameList::ToggleFavorite(u64 program_id) {
 void GameList::PopupContextMenu(const QPoint& menu_location) {
     QModelIndex item = m_currentView->indexAt(menu_location);
     if (!item.isValid()) {
-        if (m_isTreeMode)
-            return;
-
         QMenu blank_menu;
-        QAction* addGameDirAction = blank_menu.addAction(tr("&Add New Game Directory"));
-
-        connect(addGameDirAction, &QAction::triggered, this, &GameList::AddDirectory);
+        if (!m_isTreeMode) {
+            QAction* addGameDirAction = blank_menu.addAction(tr("&Add New Game Directory"));
+            connect(addGameDirAction, &QAction::triggered, this, &GameList::AddDirectory);
+            blank_menu.addSeparator();
+        }
+        QAction* customize = blank_menu.addAction(tr("&Customize Home Screen..."));
+        connect(customize, &QAction::triggered, this, [this] { ShowCustomizePanel(true); });
         blank_menu.exec(m_currentView->viewport()->mapToGlobal(menu_location));
         return;
     }
@@ -730,6 +910,8 @@ void GameList::AddFavoritesPopup(QMenu& context_menu) {
 void GameList::changeEvent(QEvent* event) {
     if (event->type() == QEvent::LanguageChange) {
         RetranslateUI();
+    } else if (event->type() == QEvent::PaletteChange && background) {
+        UpdateViewTransparency();
     }
 
     QWidget::changeEvent(event);

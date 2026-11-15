@@ -41,6 +41,11 @@ enum class AmLaunchType;
 enum class StartGameType;
 
 class GameCarousel;
+class HomeBackground;
+class HomeCustomizePanel;
+class HomeSurface;
+class QHBoxLayout;
+class QPropertyAnimation;
 
 class QAbstractItemView;
 namespace Core {
@@ -91,6 +96,8 @@ public:
 
     void ResetViewMode();
 
+    void ShowCustomizePanel(bool show);
+
 public slots:
     void SetNupConversionRunning(bool running);
     void RefreshGameDirectory();
@@ -127,6 +134,8 @@ signals:
     void ShowList(bool show);
     void PopulatingCompleted();
     void SaveConfig();
+    void GameListModeRequested(Settings::GameListMode mode);
+    void GameIconSizeRequested(u32 size);
 
 private slots:
     void OnTextChanged(const QString& new_text);
@@ -151,13 +160,23 @@ private:
 
     void RetranslateUI();
 
+    void SetupCustomization();
+    void SetHomeBackground(const QString& path);
+    void RemoveRecentBackground(const QString& path);
+    void UpdateViewTransparency();
+
     friend class GameListSearchField;
 
     std::shared_ptr<FileSys::VfsFilesystem> vfs;
     FileSys::ManualContentProvider* provider;
     GameListSearchField* search_field = nullptr;
     MainWindow* main_window = nullptr;
+    QHBoxLayout* outer_layout = nullptr;
+    HomeSurface* surface = nullptr;
     QVBoxLayout* layout = nullptr;
+    HomeBackground* background = nullptr;
+    HomeCustomizePanel* customize_panel = nullptr;
+    QPropertyAnimation* customize_animation = nullptr;
 
     GameTree* tree_view = nullptr;
     GameGrid* grid_view = nullptr;
