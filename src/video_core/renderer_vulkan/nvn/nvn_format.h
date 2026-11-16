@@ -23,6 +23,11 @@ namespace Vulkan::Nvn {
 /// has no counterpart (three-component formats, *_I2F integer-to-float reads, ...).
 [[nodiscard]] std::optional<VideoCore::Surface::PixelFormat> NvnToPixelFormat(s32 nvn_format);
 
+[[nodiscard]] constexpr bool IsAstc8x8(VideoCore::Surface::PixelFormat format) {
+    using VideoCore::Surface::PixelFormat;
+    return format == PixelFormat::ASTC_2D_8X8_UNORM || format == PixelFormat::ASTC_2D_8X8_SRGB;
+}
+
 struct HostFormat {
     VkFormat format{VK_FORMAT_UNDEFINED};
     VideoCore::Surface::PixelFormat pixel_format{};

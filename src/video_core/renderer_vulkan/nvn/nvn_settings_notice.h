@@ -31,15 +31,12 @@ struct PresentSettingsView {
            view.anti_aliasing != Settings::AntiAliasing::None || view.post_shader_active;
 }
 
-/// The settings that are set to something the HLE presentation does not apply. In Eglantine the
-/// replay presents with its plain blit: aspect ratio, background colour, nearest and bilinear
-/// window filters and the resolution scale (nvn_rescale.h) apply; the other window filters,
-/// anti-aliasing, post-processing and frame generation do not. One short phrase each, for the log
-/// line that makes the gap visible.
+/// Settings still absent from the replay presentation path. Window filters are applied by
+/// RecordWindowFilter; anti-aliasing and the post-processing chain remain separate passes.
 [[nodiscard]] inline std::vector<std::string> SettingsNotApplied(const PresentSettingsView& view) {
     std::vector<std::string> result;
-    if (PresentNeedsPasses(view)) {
-        result.emplace_back("Window adapting filter, anti-aliasing or post-processing "
+    if (view.anti_aliasing != Settings::AntiAliasing::None || view.post_shader_active) {
+        result.emplace_back("Anti-aliasing or post-processing "
                             "(not available on VTX-HLE)");
     }
     if (view.frame_gen && !FrameGenTypeSupported(view.frame_gen_type)) {

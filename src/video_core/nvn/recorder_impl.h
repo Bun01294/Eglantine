@@ -304,12 +304,15 @@ struct List {
     std::vector<u64> refs; ///< sorted, unique serials referenced by the records
     std::vector<Action> actions;
     std::vector<u64> callees; ///< sorted, unique synthetic handles its CallList records call
+    std::vector<size_t> expansion_offsets; ///< calls and deferred records in word order
+    size_t record_end{}; ///< word index of the end marker
 };
 
 /// Host memory a list takes.
 [[nodiscard]] inline u64 ListBytes(const List& list) {
     return sizeof(List) + list.words.size() * sizeof(u64) + list.refs.size() * sizeof(u64) +
-           list.actions.size() * sizeof(Action) + list.callees.size() * sizeof(u64);
+           list.actions.size() * sizeof(Action) + list.callees.size() * sizeof(u64) +
+           list.expansion_offsets.size() * sizeof(size_t);
 }
 
 struct ListEntry {
@@ -467,6 +470,7 @@ struct Recorder::Impl {
     // Uniform snapshot at submit (uniform_snapshot.h). The pools, pages, scratch and counters are
     // under sink_mutex.
     std::atomic<UniformSnapshotMode> uniform_snapshot{UniformSnapshotMode::Off};
+    std::atomic<bool> batch_command_copies{false};
     UniformSnapshotPools snapshot_pools;
     UniformSnapshotCpuPages snapshot_cpu;
     UniformSnapshotScratch snapshot_scratch;

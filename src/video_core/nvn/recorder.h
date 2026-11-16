@@ -126,6 +126,8 @@ public:
     [[nodiscard]] RecorderStats Stats() const;
     /// Forwards the device's window origin / depth mode to the sink (Sink::SetDeviceModes).
     void SetDeviceModes(u32 window_origin, u32 depth_mode);
+    /// Copies consecutive plain records together at submit; set before the first submission.
+    void SetCommandListBatching(bool enabled);
     /// EDEN_NX2_NVN_UBO_SNAPSHOT: every later submission carries the CPU-written uniform bytes it
     /// binds as of its submit call (Submission::uniform_snapshot, uniform_snapshot.h). Off by
     /// default; set before the first submission.

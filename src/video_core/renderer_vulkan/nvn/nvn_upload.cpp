@@ -163,7 +163,7 @@ u64 HashGuestBytes(const u8* data, u64 size) {
     return Common::CityHash64(reinterpret_cast<const char*>(data), static_cast<size_t>(size));
 }
 
-u64 SampleGuestBytes(const u8* data, u64 size) {
+u64 SampleGuestBytes(const u8* data, u64 size, bool batch_lines) {
     const Common::FrameStats::Scope stall{Common::FrameStats::Cause::CoherencyCheck};
     constexpr u64 LINE = 64;
     constexpr u64 LINES = 256;
@@ -172,6 +172,14 @@ u64 SampleGuestBytes(const u8* data, u64 size) {
     }
     // Evenly spaced 64-byte lines, the first and the last one included.
     const u64 last_line = (size - LINE) / LINE;
+    if (batch_lines) {
+        std::array<u8, LINE * LINES> samples;
+        for (u64 i = 0; i < LINES; ++i) {
+            const u64 offset = (last_line * i / (LINES - 1)) * LINE;
+            std::memcpy(samples.data() + i * LINE, data + offset, LINE);
+        }
+        return Common::CityHash64(reinterpret_cast<const char*>(samples.data()), samples.size());
+    }
     u64 hash = 0;
     for (u64 i = 0; i < LINES; ++i) {
         const u64 offset = (last_line * i / (LINES - 1)) * LINE;
@@ -181,7 +189,8 @@ u64 SampleGuestBytes(const u8* data, u64 size) {
 }
 
 u64 SampleGuestBytesBy(u64 size,
-                       const std::function<void(u64 offset, u64 count, u8* destination)>& read) {
+                       const std::function<void(u64 offset, u64 count, u8* destination)>& read,
+                       bool batch_lines) {
     const Common::FrameStats::Scope stall{Common::FrameStats::Cause::CoherencyCheck};
     constexpr u64 LINE = 64;
     constexpr u64 LINES = 256;
@@ -193,6 +202,14 @@ u64 SampleGuestBytesBy(u64 size,
     }
     // The same lines, in the same order, as SampleGuestBytes.
     const u64 last_line = (size - LINE) / LINE;
+    if (batch_lines) {
+        std::array<u8, LINE * LINES> samples;
+        for (u64 i = 0; i < LINES; ++i) {
+            const u64 offset = (last_line * i / (LINES - 1)) * LINE;
+            read(offset, LINE, samples.data() + i * LINE);
+        }
+        return Common::CityHash64(reinterpret_cast<const char*>(samples.data()), samples.size());
+    }
     u64 hash = 0;
     std::array<u8, LINE> line;
     for (u64 i = 0; i < LINES; ++i) {

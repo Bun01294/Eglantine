@@ -14,6 +14,13 @@
 
 namespace Core::NvnHle {
 
+/// The patched MKW main loop measures the full frame. Let a late race frame use the next
+/// 60 Hz slot without rounding it up to a second vblank. Video keeps the requested interval.
+[[nodiscard]] constexpr s32 AdaptivePresentInterval(s32 requested, bool mkw_adaptive,
+                                                    bool video) noexcept {
+    return mkw_adaptive && !video && requested == 2 ? 1 : requested;
+}
+
 /// What the pacing of one NVN present depends on.
 struct PresentPaceInputs {
     /// The swap interval the display uses (60 Hz vsyncs per frame; the window's, or 1 while the
@@ -82,11 +89,9 @@ struct PacePlan {
     return period_ns * 100 / in.speed_limit_percent;
 }
 
-/// EDEN_NX2_MAX_FRAMES_IN_FLIGHT=<n> (default 1): bounds how far the game runs ahead of the
-/// host GPU. A present returns to the game only once the present `n` frames before it has
-/// completed on the GPU (n = 1: the previous one; n = 2: the one before that). The default keeps
-/// only the current present potentially unfinished, preserving one frame of CPU/GPU overlap like
-/// the console.
+/// EDEN_NX2_MAX_FRAMES_IN_FLIGHT=<n> bounds how far the game runs ahead of the host GPU.
+/// A present returns once the present `n` frames before it has completed (1 is the previous
+/// present, 2 is the one before that). The default is 1.
 /// `self` (n = 0) returns a present only once this present itself completed: no frame stays in
 /// flight (the CPU/GPU overlap is gone; every GPU result the game reads next frame is complete).
 /// Setting 0 or off removes this extra limit; then only the window's texture count bounds the
@@ -120,9 +125,8 @@ private:
     std::array<u64, MaxDepth + 1> ring{};
 };
 
-/// Resolves EDEN_NX2_MAX_FRAMES_IN_FLIGHT: unset = 1; `self` = 0 (the present returns only once
-/// this present itself completed on the GPU: nothing of its frame stays in flight); 0, off,
-/// empty or invalid = unlimited.
+/// Resolves EDEN_NX2_MAX_FRAMES_IN_FLIGHT: unset = 1; `self` = 0 (wait for this present to
+/// complete on the GPU); 0, off, empty or invalid = unlimited.
 [[nodiscard]] inline std::optional<u32> ParseMaxFramesInFlight(const char* value) noexcept {
     if (value == nullptr) {
         return 1;

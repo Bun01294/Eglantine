@@ -273,6 +273,9 @@ struct DrawCounters {
     std::atomic<u64> elided_descriptors{};
     std::atomic<u64> elided_vertex_binds{};
     std::atomic<u64> elided_index_binds{};
+    std::atomic<u64> driver_bank_uploads{};
+    std::atomic<u64> handle_bank_uploads{};
+    std::atomic<u64> pipeline_state_reuses{};
     /// Vertex staging (nvn_vertex_stage.h): passes that staged, ranges staged, copy regions and
     /// bytes copied (gaps between merged ranges included), ranges and bytes a pass found staged by
     /// an earlier pass of the command buffer, vertex buffer and index buffer binds served from a

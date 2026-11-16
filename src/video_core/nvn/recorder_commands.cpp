@@ -282,21 +282,24 @@ u64 Recorder::EndRecording(u64 cmd_va) {
     }
     impl->ReleaseRefs(extra);
     list->refs.erase(std::unique(list->refs.begin(), list->refs.end()), list->refs.end());
-    // The synthetic lists it calls: the byte cap keeps them while this list exists.
-    for (size_t i = 0; i < list->words.size();) {
-        const auto* header = reinterpret_cast<const RecordHeader*>(&list->words[i]);
-        const size_t count = header->size / 8;
-        if (count == 0 || i + count > list->words.size()) {
-            break;
-        }
-        if (header->op == static_cast<u16>(Op::CallList)) {
+    // Index the records that need work at submit and retain synthetic callees.
+    const u64* const words = list->words.data();
+    RecordReader reader{words, list->words.size()};
+    size_t offset = 0;
+    while (const RecordHeader* header = reader.Next()) {
+        const Op op = RecordOp(header);
+        if (op == Op::CallList) {
             const u64 callee = RecordPayload<CallListPayload>(header)->handle;
             if (callee >= SYNTHETIC_BASE) {
                 list->callees.push_back(callee);
             }
+            list->expansion_offsets.push_back(offset);
+        } else if ((header->flags & RECORD_FLAG_DEFERRED) && IsDeferrableOp(op)) {
+            list->expansion_offsets.push_back(offset);
         }
-        i += count;
+        offset = static_cast<size_t>(reader.Cursor() - words);
     }
+    list->record_end = offset;
     std::sort(list->callees.begin(), list->callees.end());
     list->callees.erase(std::unique(list->callees.begin(), list->callees.end()),
                         list->callees.end());

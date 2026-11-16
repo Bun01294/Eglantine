@@ -16,6 +16,7 @@
 #include <fmt/ranges.h>
 
 #include "common/diag_request.h"
+#include "common/game_presets.h"
 #include "common/assert.h"
 #include "common/logging.h"
 #include "common/settings.h"
@@ -27,6 +28,8 @@
 #include "video_core/upscaler.h"
 #include "video_core/renderer_vulkan/nvn/nvn_draw.h"
 #include "video_core/renderer_vulkan/present/fsr.h"
+#include "video_core/renderer_vulkan/present/fsr3.h"
+#include "video_core/renderer_vulkan/present/sgsr.h"
 #include "video_core/renderer_vulkan/present/util.h"
 #include "video_core/renderer_vulkan/nvn/nvn_impl.h"
 #include "video_core/renderer_vulkan/vk_present_manager.h"
@@ -114,10 +117,12 @@ public:
         allocator = &allocator_;
     }
 
-    void Detach() override {
-        // The device is idle and the replay stopped: drop what the allocator created before it is
-        // destroyed. The present thread must be done with the frames too.
+    void Drain() override {
         present_manager.WaitPresent();
+    }
+
+    void Detach() override {
+        // The presentation worker has drained and the device is idle.
         for (Frame* frame : owned_frames) {
             frame->framebuffer = {};
             frame->storage_view = {};
@@ -584,6 +589,9 @@ Context::Impl::~Impl() {
     if (bc_encoder_future.valid()) {
         bc_encoder_future.wait();
     }
+    if (present_target) {
+        present_target->Drain();
+    }
     {
         std::scoped_lock lock{submit_mutex};
         void(device.GetLogical().WaitIdle());
@@ -620,6 +628,8 @@ Context::Impl::~Impl() {
     retired.clear();
     commands.clear();
     inflight.clear();
+    draw_contexts.clear();
+    draw_resources.reset();
     storage_index.clear();
     storage_cache.clear();
     textures.clear();
@@ -632,8 +642,6 @@ Context::Impl::~Impl() {
         ASSERT_MSG(sparse_pages.use_count() == 1, "a sparse backing outlives the context");
         sparse_pages.reset();
     }
-    draw_contexts.clear();
-    draw_resources.reset();
     import_chunks.clear(); // after the pool buffers bound into them
     clear_render_passes.clear();
     counters_published.store(nullptr);
@@ -647,6 +655,11 @@ Context::Impl::~Impl() {
     // The frame generation chains record through the presentation passes' recorder.
     present_frame_gen.reset();
     present_scratch = {};
+    window_filter.reset();
+    window_fsr.reset();
+    window_fsr3.reset();
+    window_sgsr.reset();
+
     final_fsr.reset();
     upscaler_fsr.reset();
     mirror_merge_stats = {}; // allocator-owned, like the pool buffers above
@@ -757,6 +770,24 @@ void Context::Impl::Dispatch(Command& command) {
             impl.ProcessSubmit(std::move(c));
         }
         void operator()(CmdSetTitle& c) const {
+            impl.mario_kart_world = c.title_id == Settings::MarioKartWorldProgramId;
+            if (impl.mario_kart_world) {
+                LOG_INFO(Render_Vulkan,
+                         "[nvn] Mario Kart World: sparse CPU writes use physical-pool lookup; "
+                         "exact buffer lookup cache and lazy raw mirror invalidation active");
+            }
+            impl.mkw_coalesce_early_submit =
+                impl.mario_kart_world && std::getenv("EDEN_NX2_NVN_EARLY_SUBMIT_US") == nullptr &&
+                std::getenv("EDEN_NX2_NVN_EARLY_FIRST_US") == nullptr &&
+                std::getenv("EDEN_NX2_NVN_EARLY_PASS_US") == nullptr;
+            if (impl.mkw_coalesce_early_submit && impl.options.early_submit) {
+                LOG_INFO(Render_Vulkan, "[nvn] Mario Kart World: early submit at most twice per "
+                                        "submission; live passes and shadows use the pass budget");
+            }
+            if (!impl.options.barrier_merge &&
+                std::getenv("EDEN_NX2_TRY_BARRIER_MERGE") == nullptr) {
+                impl.barrier_merge = BarrierMergeMask(impl.mario_kart_world ? 1 : 0);
+            }
             impl.draw_resources->OpenCache(c.title_id);
         }
         void operator()(CmdPresent& c) const {
@@ -803,12 +834,19 @@ void Context::Impl::RetireCompleted() {
         return;
     }
     const u64 done = completed_seq.load(std::memory_order_acquire);
-    std::vector<Retired> keep;
     std::vector<Retired> release;
-    for (Retired& entry : retired) {
-        (entry.after_seq <= done ? release : keep).push_back(std::move(entry));
+    size_t kept = 0;
+    for (size_t i = 0; i < retired.size(); ++i) {
+        if (retired[i].after_seq <= done) {
+            release.push_back(std::move(retired[i]));
+        } else {
+            if (kept != i) {
+                retired[kept] = std::move(retired[i]);
+            }
+            ++kept;
+        }
     }
-    retired = std::move(keep);
+    retired.resize(kept);
     for (Retired& entry : release) {
         entry.release();
     }
@@ -1557,6 +1595,7 @@ ContextStats Context::Stats() const {
         .virtual_maps = s.virtual_maps.load(relaxed),
         .virtual_unresolved = s.virtual_unresolved.load(relaxed),
         .virtual_sparse_binds = s.virtual_sparse_binds.load(relaxed),
+        .sparse_write_pool_checks = s.sparse_write_pool_checks.load(relaxed),
         .texels_flushed = s.texels_flushed.load(relaxed),
         .ops_unsupported = s.ops_unsupported.load(relaxed),
         .ops_failed = s.ops_failed.load(relaxed),
@@ -1581,6 +1620,9 @@ ContextStats Context::Stats() const {
     stats.raw_global_rebuilds = s.raw_global_rebuilds.load(relaxed);
     if (impl->draw_resources) {
         const DrawCounters& draw = impl->draw_resources->counters;
+        stats.driver_bank_uploads = draw.driver_bank_uploads.load(relaxed);
+        stats.handle_bank_uploads = draw.handle_bank_uploads.load(relaxed);
+        stats.pipeline_state_reuses = draw.pipeline_state_reuses.load(relaxed);
         stats.shadow_creates = draw.shadow_creates.load(relaxed);
         stats.shadow_redirects = draw.shadow_redirects.load(relaxed);
         stats.shadow_flush_segment = draw.shadow_flush_segment.load(relaxed);
@@ -2155,6 +2197,10 @@ void Context::CollectStats(std::vector<VideoCommon::Nvn::SinkStat>& out) const {
                    impl->stats.barrier_merge_emitted.load()});
     out.push_back({"depth_upload_unsupported", s.depth_upload_unsupported});
     out.push_back({"virtual_unresolved", s.virtual_unresolved});
+    out.push_back({"sparse virtual pools checked for CPU writes", s.sparse_write_pool_checks});
+    out.push_back({"graphics driver bank uploads", s.driver_bank_uploads});
+    out.push_back({"handle bank uploads", s.handle_bank_uploads});
+    out.push_back({"graphics pipeline state reuses", s.pipeline_state_reuses});
     out.push_back({"ops_unsupported", s.ops_unsupported});
     out.push_back({"ops_failed", s.ops_failed});
     out.push_back({"device_lost", s.device_lost});

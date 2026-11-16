@@ -9,6 +9,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "core/hle/nvn/present_pacing.h"
+#include "video_core/renderer_vulkan/nvn/nvn_submit_policy.h"
 
 namespace {
 
@@ -159,6 +160,32 @@ TEST_CASE("NVN present depth limit: a present waits for the one n frames before 
             REQUIRE(limit.OnPresent(i * 10) == (i - PresentDepthLimit::MaxDepth) * 10);
         }
     }
+}
+
+TEST_CASE("MKW adaptive present only shortens the two-vblank gameplay interval",
+          "[nvn][present][mkw]") {
+    using Core::NvnHle::AdaptivePresentInterval;
+    REQUIRE(AdaptivePresentInterval(2, true, false) == 1);
+    REQUIRE(AdaptivePresentInterval(2, false, false) == 2);
+    REQUIRE(AdaptivePresentInterval(2, true, true) == 2);
+    REQUIRE(AdaptivePresentInterval(0, true, false) == 0);
+    REQUIRE(AdaptivePresentInterval(1, true, false) == 1);
+    REQUIRE(AdaptivePresentInterval(3, true, false) == 3);
+}
+
+TEST_CASE("MKW early submit keeps bounded overlap through long passes and shadows", "[nvn][mkw]") {
+    using Vulkan::Nvn::MkwEarlySubmitDue;
+    CHECK_FALSE(MkwEarlySubmitDue(0, 299, 300, 4000, false, false));
+    CHECK(MkwEarlySubmitDue(0, 300, 300, 4000, false, false));
+    CHECK_FALSE(MkwEarlySubmitDue(1, 1499, 1500, 4000, false, false));
+    CHECK(MkwEarlySubmitDue(1, 1500, 1500, 4000, false, false));
+    CHECK_FALSE(MkwEarlySubmitDue(0, 3999, 300, 4000, true, false));
+    CHECK(MkwEarlySubmitDue(0, 4000, 300, 4000, true, false));
+    CHECK_FALSE(MkwEarlySubmitDue(0, 3999, 300, 4000, false, true));
+    CHECK(MkwEarlySubmitDue(0, 4000, 300, 4000, false, true));
+    CHECK_FALSE(MkwEarlySubmitDue(0, 5000, 300, 0, true, true));
+    CHECK_FALSE(MkwEarlySubmitDue(2, 100000, 300, 4000, false, false));
+    CHECK_FALSE(MkwEarlySubmitDue(2, 100000, 300, 4000, true, true));
 }
 
 TEST_CASE("NVN present depth limit: EDEN_NX2_MAX_FRAMES_IN_FLIGHT parsing", "[nvn][present]") {

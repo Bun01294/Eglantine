@@ -31,7 +31,7 @@ inline constexpr u32 BC7_QUALITY_DEFAULT = 1;
 /// The blocks `bc_encoder.comp` writes (its push constant `mode`; the emulated path uses Bc1 and
 /// Bc3 only).
 enum class BcBlocks : u32 {
-    Bc1 = 0,       ///< punch-through for blocks with a texel below alpha 0.5
+    Bc1 = 0, ///< punch-through for blocks with a texel below alpha 0.5
     Bc3 = 1,
     Bc4 = 2,       ///< red
     Bc5 = 3,       ///< red, and alpha as green (a luminance+alpha stand-in's L and A)
@@ -82,6 +82,12 @@ public:
                    u32 quality, VkBuffer modes, u64 modes_size, VkBuffer output,
                    u64 output_size) const;
 
+    /// Decode a partial compressed copy and its unchanged destination neighbors into scratch.
+    void RecordCopy(vk::CommandBuffer cmd, VkImageView source, VkImageView destination,
+                    VkImageView scratch, std::array<s32, 2> source_origin,
+                    std::array<s32, 2> destination_origin, std::array<s32, 2> block_origin,
+                    std::array<s32, 2> copy_size, std::array<s32, 2> scratch_size, u32 layers);
+
     /// Whether the BC7 pipelines were built (RecordBc7 can be used).
     [[nodiscard]] bool HasBc7() const {
         return static_cast<bool>(bc7_pipelines[0]);
@@ -94,6 +100,11 @@ private:
     vk::ShaderModule module;
     vk::Pipeline pipeline;
 
+    vk::DescriptorSetLayout copy_set_layout;
+    vk::PipelineLayout copy_pipeline_layout;
+    vk::ShaderModule copy_module;
+    vk::Pipeline copy_pipeline;
+
     vk::DescriptorSetLayout bc7_set_layout;
     vk::PipelineLayout bc7_pipeline_layout;
     vk::ShaderModule bc7_module;
@@ -104,10 +115,10 @@ private:
 /// reads them, and the buffer the blocks go to before they are copied into the stand-in. One is
 /// reused for every upload; callers keep it alive through the flight that records into it.
 struct BcScratch {
-    vk::Image image;   ///< SOURCE_FORMAT, 1 level, STORAGE | TRANSFER_DST
+    vk::Image image;    ///< SOURCE_FORMAT, 1 level, STORAGE | TRANSFER_DST
     vk::ImageView view; ///< 2D array storage view of every layer
-    vk::Buffer blocks; ///< device-local, room for the BC3 blocks of the whole image
-    vk::Buffer modes;  ///< device-local, 8 bytes per block for the BC7 passes; null unless BC7
+    vk::Buffer blocks;  ///< device-local, room for the BC3 blocks of the whole image
+    vk::Buffer modes;   ///< device-local, 8 bytes per block for the BC7 passes; null unless BC7
     u32 width{};
     u32 height{};
     u32 layers{};

@@ -129,7 +129,6 @@ PresentManager::PresentManager(const vk::Instance& instance_,
     , surface{surface_}
     , blit_supported{CanBlitToSwapchain(device.GetPhysical(), swapchain.GetImageViewFormat())}
     , storage_supported{CanStoreToFrame(device.GetPhysical(), swapchain.GetImageFormat())}
-    , use_present_thread{Settings::values.async_presentation.GetValue()}
 {
     SetImageCount();
 
@@ -162,12 +161,19 @@ PresentManager::PresentManager(const vk::Instance& instance_,
         free_queue.push_back(&frame);
     }
 
-    if (use_present_thread) {
-        present_thread = std::jthread([this](std::stop_token token) { PresentThread(token); });
+    if (Settings::values.async_presentation.GetValue()) {
+        EnablePresentThread();
     }
 }
 
 PresentManager::~PresentManager() = default;
+
+void PresentManager::EnablePresentThread() {
+    if (!use_present_thread) {
+        present_thread = std::jthread([this](std::stop_token token) { PresentThread(token); });
+        use_present_thread = true;
+    }
+}
 
 Frame* PresentManager::GetRenderFrame() {
 

@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <type_traits>
 #include <vector>
 
 #include "video_core/vulkan_common/vulkan.h"
@@ -29,6 +30,17 @@
 #include "common/common_types.h"
 
 namespace Vulkan::Nvn {
+
+/// Preserve exact floating-point bits when deciding whether dynamic state changed.
+template <typename T>
+[[nodiscard]] bool ReplaceDynamicState(T& current, const T& value, bool elide) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    if (elide && std::memcmp(&current, &value, sizeof(T)) == 0) {
+        return false;
+    }
+    std::memcpy(&current, &value, sizeof(T));
+    return true;
+}
 
 /// Levels and layers of an image (a feedback copy, or what a draw samples).
 struct SubresourceSpan {
@@ -45,8 +57,8 @@ struct SubresourceSpan {
 
 /// The epoch that decides whether the scratch copy of a sampled render target is current. The
 /// scratch holds the source as of the epoch it was copied in; anything the guest can order against
-/// the sampled texture starts a new epoch: a change of the bound render targets (a mip chain: pass k
-/// renders level k, the next target change starts the epoch in which level k is sampled), a game
+/// the sampled texture starts a new epoch: a change of the bound render targets (a mip chain: pass
+/// k renders level k, the next target change starts the epoch in which level k is sampled), a game
 /// Barrier, and every pass end except the break of a feedback copy itself (it copies right away).
 struct FeedbackEpoch {
     u64 value{1};
@@ -210,9 +222,8 @@ public:
 private:
     [[nodiscard]] bool SameBuffers(const std::vector<VkDescriptorBufferInfo>& other) const {
         return other.size() == buffers_.size() &&
-               (other.empty() ||
-                std::memcmp(other.data(), buffers_.data(),
-                            other.size() * sizeof(VkDescriptorBufferInfo)) == 0);
+               (other.empty() || std::memcmp(other.data(), buffers_.data(),
+                                             other.size() * sizeof(VkDescriptorBufferInfo)) == 0);
     }
 
     VkPipelineLayout layout_{VK_NULL_HANDLE};

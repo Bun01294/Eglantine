@@ -8,6 +8,7 @@
 
 #include "video_core/host_shaders/bc7_encoder_comp_spv.h"
 #include "video_core/host_shaders/bc_encoder_comp_spv.h"
+#include "video_core/host_shaders/nvn_bc_copy_comp_spv.h"
 #include "video_core/renderer_vulkan/nvn/nvn_bc_encode.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
@@ -21,7 +22,7 @@ struct PushConstants {
     u32 blocks_y;
     u32 width;
     u32 height;
-    u32 mode; ///< BcBlocks, | MODE_REFINE
+    u32 mode;       ///< BcBlocks, | MODE_REFINE
     u32 out_offset; ///< in 8-byte units
 };
 static_assert(sizeof(PushConstants) == 24);
@@ -62,6 +63,77 @@ u32 ParseBc7Quality(const char* text) {
         return static_cast<u32>(text[0] - '0');
     }
     return BC7_QUALITY_DEFAULT;
+}
+
+void BcGpuEncoder::RecordCopy(vk::CommandBuffer cmd, VkImageView source, VkImageView destination,
+                              VkImageView scratch, std::array<s32, 2> source_origin,
+                              std::array<s32, 2> destination_origin,
+                              std::array<s32, 2> block_origin, std::array<s32, 2> copy_size,
+                              std::array<s32, 2> scratch_size, u32 layers) {
+    struct CopyConstants {
+        std::array<s32, 2> source, destination, block, size, scratch;
+    };
+    const auto& logical = device.GetLogical();
+    if (!copy_pipeline) {
+        std::array<VkDescriptorSetLayoutBinding, 3> bindings{};
+        for (u32 i = 0; i < bindings.size(); ++i) {
+            bindings[i] = {.binding = i,
+                           .descriptorType = i == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                                    : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                           .descriptorCount = 1,
+                           .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT};
+        }
+        copy_set_layout = logical.CreateDescriptorSetLayout({
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+            .bindingCount = static_cast<u32>(bindings.size()),
+            .pBindings = bindings.data(),
+        });
+        const VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(CopyConstants)};
+        copy_pipeline_layout = logical.CreatePipelineLayout({
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .setLayoutCount = 1,
+            .pSetLayouts = copy_set_layout.address(),
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &range,
+        });
+        copy_module = logical.CreateShaderModule({
+            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            .codeSize = sizeof(NVN_BC_COPY_COMP_SPV),
+            .pCode = NVN_BC_COPY_COMP_SPV,
+        });
+        copy_pipeline = logical.CreateComputePipeline(
+            {
+                .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                          .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                          .module = *copy_module,
+                          .pName = "main"},
+                .layout = *copy_pipeline_layout,
+            },
+            VK_NULL_HANDLE);
+    }
+    const std::array<VkDescriptorImageInfo, 3> images{{
+        {VK_NULL_HANDLE, source, VK_IMAGE_LAYOUT_GENERAL},
+        {VK_NULL_HANDLE, destination, VK_IMAGE_LAYOUT_GENERAL},
+        {VK_NULL_HANDLE, scratch, VK_IMAGE_LAYOUT_GENERAL},
+    }};
+    std::array<VkWriteDescriptorSet, 3> writes{};
+    for (u32 i = 0; i < writes.size(); ++i) {
+        writes[i] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                     .dstBinding = i,
+                     .descriptorCount = 1,
+                     .descriptorType = i == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                              : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                     .pImageInfo = &images[i]};
+    }
+    const CopyConstants constants{source_origin, destination_origin, block_origin, copy_size,
+                                  scratch_size};
+    cmd.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *copy_pipeline);
+    cmd.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_COMPUTE, *copy_pipeline_layout, 0, writes);
+    cmd.PushConstants(*copy_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, constants);
+    cmd.Dispatch((static_cast<u32>(scratch_size[0]) + 7) / 8,
+                 (static_cast<u32>(scratch_size[1]) + 7) / 8, layers);
 }
 
 BcBlocks BcBlocksOf(AstcStandin standin, bool opaque) {

@@ -6,6 +6,7 @@
 // (nvn_vertex_stage.h). Pure logic, no device.
 
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
@@ -34,11 +35,36 @@ struct Descriptors {
     std::vector<PassBoundState::WriteSig> writes{{0, 6, 1}, {1, 1, 2}};
     std::vector<VkDescriptorBufferInfo> buffers{{Handle<VkBuffer>(0x10), 0, 256}};
     std::vector<PassBoundState::ImageSig> images{
-        {Handle<VkSampler>(0x20), Handle<VkImageView>(0x30), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {Handle<VkSampler>(0x21), Handle<VkImageView>(0x31), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+        {Handle<VkSampler>(0x20), Handle<VkImageView>(0x30),
+         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        {Handle<VkSampler>(0x21), Handle<VkImageView>(0x31),
+         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
 };
 
 } // namespace
+
+TEST_CASE("NVN dynamic values retain exact float bits and the force-record path",
+          "[nvn][pass_state]") {
+    using Vulkan::Nvn::ReplaceDynamicState;
+    float width = 0.0f;
+    CHECK_FALSE(ReplaceDynamicState(width, 0.0f, true));
+    CHECK(ReplaceDynamicState(width, -0.0f, true));
+    CHECK(std::bit_cast<u32>(width) == 0x80000000u);
+    CHECK_FALSE(ReplaceDynamicState(width, -0.0f, true));
+    CHECK(ReplaceDynamicState(width, -0.0f, false));
+    const float nan = std::bit_cast<float>(0x7fc00001u);
+    CHECK(ReplaceDynamicState(width, nan, true));
+    CHECK_FALSE(ReplaceDynamicState(width, nan, true));
+    CHECK(ReplaceDynamicState(width, std::bit_cast<float>(0x7fc00002u), true));
+    VideoCommon::Nvn::ViewportRect current{0.0f, 0.0f, 640.0f, 480.0f};
+    auto next = current;
+    CHECK_FALSE(ReplaceDynamicState(current, next, true));
+    next.width = 1280.0f;
+    CHECK(ReplaceDynamicState(current, next, true));
+    CHECK(current.width == 1280.0f);
+    CHECK_FALSE(ReplaceDynamicState(current, next, true));
+    CHECK(ReplaceDynamicState(current, next, false));
+}
 
 TEST_CASE("NVN pass state: descriptors are skipped only when identical on the same layout",
           "[nvn][pass_state]") {
@@ -121,7 +147,8 @@ TEST_CASE("NVN pass state: a full flip target list replaces the entry used longe
     CHECK(list[0].target.lock() == images[List::CAPACITY - 1]);
 }
 
-TEST_CASE("NVN pass state: push constants survive layouts that keep the range", "[nvn][pass_state]") {
+TEST_CASE("NVN pass state: push constants survive layouts that keep the range",
+          "[nvn][pass_state]") {
     PassBoundState state;
     const auto a = Handle<VkPipelineLayout>(0x100);
     const auto b = Handle<VkPipelineLayout>(0x200);
@@ -253,9 +280,10 @@ struct Records {
     std::vector<u64> words;
 
     template <typename Payload>
-    void Add(VC::Op op, const Payload& payload, std::initializer_list<VC::BufferRange> ranges = {}) {
-        const size_t bytes = sizeof(VC::RecordHeader) + sizeof(Payload) +
-                             ranges.size() * sizeof(VC::BufferRange);
+    void Add(VC::Op op, const Payload& payload,
+             std::initializer_list<VC::BufferRange> ranges = {}) {
+        const size_t bytes =
+            sizeof(VC::RecordHeader) + sizeof(Payload) + ranges.size() * sizeof(VC::BufferRange);
         const size_t size = (bytes + 7) / 8 * 8;
         const size_t at = words.size();
         words.resize(at + size / 8, 0);
@@ -335,7 +363,7 @@ TEST_CASE("NVN vertex staging: one copy per address, the largest size, within th
     list.Draws(1);
     list.BindVertex(0, {{0x10000, 0x300}}); // the same start, bound larger
     list.Draws(1);
-    list.BindVertex(0, {{0x10000, 0x200}}); // smaller again: the copy already covers it
+    list.BindVertex(0, {{0x10000, 0x200}});  // smaller again: the copy already covers it
     list.BindVertex(1, {{0x20000, 0x2000}}); // above max_range_bytes: stays in host memory
     list.BindVertex(2, {{0x30000, 0}});      // size 0: nothing to read
     list.BindVertex(3, {{0x40000, 0x1000}, {0x50000, 0x1000}, {0x60000, 0x1000}});
@@ -388,16 +416,16 @@ TEST_CASE("NVN vertex staging: index ranges of the draws that bind their guest i
           "[nvn][pass_state]") {
     Records list;
     list.BindVertex(0, {{0x10000, 0x400}});
-    list.DrawIndexed(4, 1, 0x30, 0x80000);            // triangles, 16-bit: 0x60 bytes
-    list.DrawIndexed(4, 2, 0x10, 0x80000);            // the same start, 32-bit: 0x40, kept 0x60
-    list.DrawIndexed(4, 2, 0x40, 0x90000);            // 32-bit: 0x100 bytes
-    list.DrawIndexed(4, 0, 0x20, 0xA0000);            // 8-bit: only where the device binds them
-    list.DrawIndexed(7, 1, 0x40, 0xB0000);            // quads: converted, never bound
-    list.DrawIndexed(2, 1, 0x40, 0xB1000);            // line loop: converted
-    list.DrawIndexed(8, 1, 0x40, 0xB2000);            // quad strip: converted
-    list.DrawIndexed(4, 1, 0x40, 0xC0000, 0xD0000);   // indirect: the count is on the GPU
-    list.DrawIndexed(4, 3, 0x40, 0xC1000);            // no such index type
-    list.DrawIndexed(4, 1, 0x1000, 0xE0000);          // 0x2000 bytes: above max_range_bytes
+    list.DrawIndexed(4, 1, 0x30, 0x80000);          // triangles, 16-bit: 0x60 bytes
+    list.DrawIndexed(4, 2, 0x10, 0x80000);          // the same start, 32-bit: 0x40, kept 0x60
+    list.DrawIndexed(4, 2, 0x40, 0x90000);          // 32-bit: 0x100 bytes
+    list.DrawIndexed(4, 0, 0x20, 0xA0000);          // 8-bit: only where the device binds them
+    list.DrawIndexed(7, 1, 0x40, 0xB0000);          // quads: converted, never bound
+    list.DrawIndexed(2, 1, 0x40, 0xB1000);          // line loop: converted
+    list.DrawIndexed(8, 1, 0x40, 0xB2000);          // quad strip: converted
+    list.DrawIndexed(4, 1, 0x40, 0xC0000, 0xD0000); // indirect: the count is on the GPU
+    list.DrawIndexed(4, 3, 0x40, 0xC1000);          // no such index type
+    list.DrawIndexed(4, 1, 0x1000, 0xE0000);        // 0x2000 bytes: above max_range_bytes
     list.End();
 
     Vulkan::Nvn::VertexStageScan scan;
@@ -501,9 +529,9 @@ TEST_CASE("NVN vertex staging: copies outlive only pass ends that cannot write p
     using Vulkan::Nvn::BreakCause;
     using Vulkan::Nvn::StagedVertexSurvives;
     // Image or state changes only: later passes of the command buffer reuse the copies.
-    for (const BreakCause cause : {BreakCause::SetRenderTargets, BreakCause::FeedbackCopy,
-                                   BreakCause::LayoutChange, BreakCause::MaskedClear,
-                                   BreakCause::ContentsUpload}) {
+    for (const BreakCause cause :
+         {BreakCause::SetRenderTargets, BreakCause::FeedbackCopy, BreakCause::LayoutChange,
+          BreakCause::MaskedClear, BreakCause::ContentsUpload}) {
         CHECK(StagedVertexSurvives(cause, false, false));
         // Not after a pass that wrote through shaders or still has counter reports to write.
         CHECK_FALSE(StagedVertexSurvives(cause, true, false));
@@ -520,7 +548,8 @@ TEST_CASE("NVN vertex staging: copies outlive only pass ends that cannot write p
     }
 }
 
-TEST_CASE("NVN vertex staging: a mesh indirect conversion break keeps the copies only for the span window",
+TEST_CASE("NVN vertex staging: a mesh indirect conversion break keeps the copies only for the span "
+          "window",
           "[nvn][pass_state]") {
     using Vulkan::Nvn::BreakCause;
     using Vulkan::Nvn::StagedVertexSurvives;
@@ -578,8 +607,9 @@ TEST_CASE("NVN vertex staging span: the window goes on past render target change
     CHECK(VC::RecordOp(stop) == VC::Op::Dispatch);
 }
 
-TEST_CASE("NVN vertex staging span: after a target change a barrier, condition or call ends the window",
-          "[nvn][pass_state]") {
+TEST_CASE(
+    "NVN vertex staging span: after a target change a barrier, condition or call ends the window",
+    "[nvn][pass_state]") {
     const auto keeps = [](VC::Op) { return true; };
     for (const VC::Op stopper : {VC::Op::Barrier, VC::Op::SetRenderCondition, VC::Op::CallList}) {
         Records list;
@@ -648,7 +678,8 @@ TEST_CASE("NVN vertex staging: shader copy tasks cover whole 16-byte units, 64 K
     CHECK(tasks[0].count == 2);
 }
 
-TEST_CASE("NVN pass state: state ops keep the pass, the provoking vertex too", "[nvn][pass_state]") {
+TEST_CASE("NVN pass state: state ops keep the pass, the provoking vertex too",
+          "[nvn][pass_state]") {
     using Vulkan::Nvn::DrawContext;
     namespace VC = VideoCommon::Nvn;
     CHECK(DrawContext::OpKeepsPass(VC::Op::SetSampleMask));

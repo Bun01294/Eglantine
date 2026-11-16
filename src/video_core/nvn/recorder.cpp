@@ -47,6 +47,9 @@ void DescriptorTable::Set(u32 base, u32 id, u64 serial) {
     if (index >= entries.size()) {
         entries.resize(index + 1, 0);
     }
+    if (entries[index] == serial) {
+        return;
+    }
     entries[index] = serial;
     dirty = true;
 }
@@ -613,17 +616,17 @@ bool Recorder::Impl::Expand(u64 handle, std::vector<u64>& out, std::vector<Actio
         out.reserve(out.size() + words.size()); // about as long as the list itself
     }
     size_t action_index = 0;
-    size_t i = 0;
-    while (i < words.size()) {
-        const auto* header = reinterpret_cast<const RecordHeader*>(&words[i]);
-        const size_t count = header->size / 8;
-        if (header->op == static_cast<u16>(Op::End) || count == 0 || i + count > words.size()) {
-            break;
-        }
-        while (action_index < list->actions.size() && list->actions[action_index].word <= i) {
+    const auto copy = [&](size_t begin, size_t end) {
+        out.insert(out.end(), words.begin() + begin, words.begin() + end);
+    };
+    const auto expand_record = [&](size_t offset) {
+        const auto* header = reinterpret_cast<const RecordHeader*>(&words[offset]);
+        const size_t next = offset + header->size / 8;
+        while (action_index < list->actions.size() && list->actions[action_index].word <= offset) {
             actions.push_back(list->actions[action_index++]);
         }
-        if (header->op == static_cast<u16>(Op::CallList)) {
+        const Op op = RecordOp(header);
+        if (op == Op::CallList) {
             const u64 callee = RecordPayload<CallListPayload>(header)->handle;
             if (depth + 1 > MAX_CALL_DEPTH) {
                 ++stats.call_depth_exceeded;
@@ -633,16 +636,26 @@ bool Recorder::Impl::Expand(u64 handle, std::vector<u64>& out, std::vector<Actio
             }
         } else {
             const size_t start = out.size();
-            out.insert(out.end(), words.begin() + i, words.begin() + i + count);
-            if ((header->flags & RECORD_FLAG_DEFERRED) && IsDeferrableOp(RecordOp(header))) {
+            copy(offset, next);
+            if ((header->flags & RECORD_FLAG_DEFERRED) && IsDeferrableOp(op)) {
                 ResolveDeferred(&out[start]);
             }
         }
-        i += count;
+        return next;
+    };
+    if (batch_command_copies.load(std::memory_order_relaxed)) {
+        size_t begin = 0;
+        for (size_t offset : list->expansion_offsets) {
+            copy(begin, offset);
+            begin = expand_record(offset);
+        }
+        copy(begin, list->record_end);
+    } else {
+        for (size_t offset = 0; offset < list->record_end;) {
+            offset = expand_record(offset);
+        }
     }
-    while (action_index < list->actions.size()) {
-        actions.push_back(list->actions[action_index++]);
-    }
+    actions.insert(actions.end(), list->actions.begin() + action_index, list->actions.end());
     return true;
 }
 
@@ -797,6 +810,10 @@ Recorder::~Recorder() {
 
 void Recorder::SetDeviceModes(u32 window_origin, u32 depth_mode) {
     impl->sink.SetDeviceModes(window_origin, depth_mode);
+}
+
+void Recorder::SetCommandListBatching(bool enabled) {
+    impl->batch_command_copies.store(enabled, std::memory_order_relaxed);
 }
 
 void Recorder::SetUniformSnapshot(UniformSnapshotMode mode) {

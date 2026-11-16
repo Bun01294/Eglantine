@@ -45,6 +45,15 @@ u32 Mip(u32 size, u32 level) {
     return (std::max)(size >> level, 1u);
 }
 
+template <typename T>
+bool ReplaceState(T& current, const T& value, bool elide) {
+    if (elide && current == value) {
+        return false;
+    }
+    current = value;
+    return true;
+}
+
 template <typename Prefix, typename Element>
 std::span<const Element> Array(const VC::RecordHeader* header, const Prefix* prefix, u32 count) {
     const u32 available =
@@ -201,22 +210,40 @@ bool DrawContext::Handle(const VC::RecordHeader* header) {
             const auto* p = VC::RecordPayload<VC::SetViewportsPayload>(header);
             const auto values =
                 Array<VC::SetViewportsPayload, VC::ViewportRect>(header, p, p->count);
-            for (u32 i = 0; i < values.size() && p->first + i < MAX_VIEWPORTS; ++i) {
-                viewports[p->first + i] = values[i];
-                viewports_set |= 1u << (p->first + i);
+            bool changed = false;
+            for (u32 i = 0;
+                 i < values.size() && p->first < MAX_VIEWPORTS && i < MAX_VIEWPORTS - p->first;
+                 ++i) {
+                const u32 slot = p->first + i;
+                const u32 bit = 1u << slot;
+                changed |= (viewports_set & bit) == 0;
+                changed |=
+                    ReplaceDynamicState(viewports[slot], values[i], !Debug::Get().no_state_elide);
+                viewports_set |= bit;
             }
-            dynamic_dirty |= DIRTY_VIEWPORT;
+            if (changed) {
+                dynamic_dirty |= DIRTY_VIEWPORT;
+            }
         }
         return true;
     case Op::SetScissors:
         if (fits(sizeof(VC::SetScissorsPayload))) {
             const auto* p = VC::RecordPayload<VC::SetScissorsPayload>(header);
             const auto values = Array<VC::SetScissorsPayload, VC::ScissorRect>(header, p, p->count);
-            for (u32 i = 0; i < values.size() && p->first + i < MAX_VIEWPORTS; ++i) {
-                scissors[p->first + i] = values[i];
-                scissors_set |= 1u << (p->first + i);
+            bool changed = false;
+            for (u32 i = 0;
+                 i < values.size() && p->first < MAX_VIEWPORTS && i < MAX_VIEWPORTS - p->first;
+                 ++i) {
+                const u32 slot = p->first + i;
+                const u32 bit = 1u << slot;
+                changed |= (scissors_set & bit) == 0;
+                changed |=
+                    ReplaceDynamicState(scissors[slot], values[i], !Debug::Get().no_state_elide);
+                scissors_set |= bit;
             }
-            dynamic_dirty |= DIRTY_SCISSOR;
+            if (changed) {
+                dynamic_dirty |= DIRTY_SCISSOR;
+            }
         }
         return true;
     case Op::SetDepthRanges:
@@ -224,10 +251,16 @@ bool DrawContext::Handle(const VC::RecordHeader* header) {
             const auto* p = VC::RecordPayload<VC::SetDepthRangesPayload>(header);
             const auto values =
                 Array<VC::SetDepthRangesPayload, VC::DepthRange>(header, p, p->count);
-            for (u32 i = 0; i < values.size() && p->first + i < MAX_VIEWPORTS; ++i) {
-                depth_ranges[p->first + i] = values[i];
+            bool changed = false;
+            for (u32 i = 0;
+                 i < values.size() && p->first < MAX_VIEWPORTS && i < MAX_VIEWPORTS - p->first;
+                 ++i) {
+                changed |= ReplaceDynamicState(depth_ranges[p->first + i], values[i],
+                                               !Debug::Get().no_state_elide);
             }
-            dynamic_dirty |= DIRTY_VIEWPORT;
+            if (changed) {
+                dynamic_dirty |= DIRTY_VIEWPORT;
+            }
         }
         return true;
     case Op::BindProgram:
@@ -277,10 +310,10 @@ bool DrawContext::Handle(const VC::RecordHeader* header) {
     case Op::SetPolygonOffset:
         if (fits(sizeof(VC::SetPolygonOffsetPayload))) {
             const auto* p = VC::RecordPayload<VC::SetPolygonOffsetPayload>(header);
-            polygon_offset[0] = p->factor;
-            polygon_offset[1] = p->units;
-            polygon_offset[2] = p->clamp;
-            dynamic_dirty |= DIRTY_BIAS;
+            const f32 values[]{p->factor, p->units, p->clamp};
+            if (ReplaceDynamicState(polygon_offset, values, !Debug::Get().no_state_elide)) {
+                dynamic_dirty |= DIRTY_BIAS;
+            }
         }
         return true;
     case Op::Draw:
@@ -368,22 +401,24 @@ bool DrawContext::Handle(const VC::RecordHeader* header) {
         return true;
     case Op::SetBlendColor:
         if (fits(sizeof(VC::SetBlendColorPayload))) {
-            std::memcpy(blend_color, VC::RecordPayload<VC::SetBlendColorPayload>(header)->color,
-                        sizeof(blend_color));
-            dynamic_dirty |= DIRTY_BLEND;
+            if (ReplaceDynamicState(blend_color,
+                                    VC::RecordPayload<VC::SetBlendColorPayload>(header)->color,
+                                    !Debug::Get().no_state_elide)) {
+                dynamic_dirty |= DIRTY_BLEND;
+            }
         }
         return true;
     case Op::SetDepthClamp:
         if (fits(sizeof(VC::EnablePayload))) {
-            fixed.depth_clamp = VC::RecordPayload<VC::EnablePayload>(header)->enable ? 1 : 0;
-            pipeline_dirty = true;
+            const u32 value = VC::RecordPayload<VC::EnablePayload>(header)->enable ? 1u : 0u;
+            pipeline_dirty |= ReplaceState(fixed.depth_clamp, value, impl.mario_kart_world);
         }
         return true;
     case Op::SetAlphaRef:
         if (fits(sizeof(VC::SetAlphaRefPayload))) {
-            fixed.alpha_ref_bits =
+            const u32 value =
                 std::bit_cast<u32>(VC::RecordPayload<VC::SetAlphaRefPayload>(header)->reference);
-            pipeline_dirty = true;
+            pipeline_dirty |= ReplaceState(fixed.alpha_ref_bits, value, impl.mario_kart_world);
         }
         return true;
     case Op::PushConstants:
@@ -399,9 +434,10 @@ bool DrawContext::Handle(const VC::RecordHeader* header) {
     case Op::SetPrimitiveRestart:
         if (fits(sizeof(VC::SetPrimitiveRestartPayload))) {
             const auto* p = VC::RecordPayload<VC::SetPrimitiveRestartPayload>(header);
-            fixed.primitive_restart = p->enable ? 1 : 0;
-            fixed.restart_index = p->enable ? p->index : 0;
-            pipeline_dirty = true;
+            const u32 enabled = p->enable ? 1u : 0u;
+            const u32 index = p->enable ? p->index : 0u;
+            pipeline_dirty |= ReplaceState(fixed.primitive_restart, enabled, impl.mario_kart_world);
+            pipeline_dirty |= ReplaceState(fixed.restart_index, index, impl.mario_kart_world);
         }
         return true;
     case Op::SetViewportSwizzles:
@@ -414,34 +450,36 @@ bool DrawContext::Handle(const VC::RecordHeader* header) {
         return true;
     case Op::SetRasterizerDiscard:
         if (fits(sizeof(VC::EnablePayload))) {
-            fixed.rasterizer_discard = VC::RecordPayload<VC::EnablePayload>(header)->enable ? 1 : 0;
-            pipeline_dirty = true;
+            const u32 value = VC::RecordPayload<VC::EnablePayload>(header)->enable ? 1u : 0u;
+            pipeline_dirty |= ReplaceState(fixed.rasterizer_discard, value, impl.mario_kart_world);
         }
         return true;
     case Op::SetSampleMask:
         if (fits(sizeof(VC::U32Payload))) {
-            fixed.sample_mask = VC::RecordPayload<VC::U32Payload>(header)->value;
-            pipeline_dirty = true;
+            const u32 value = VC::RecordPayload<VC::U32Payload>(header)->value;
+            pipeline_dirty |= ReplaceState(fixed.sample_mask, value, impl.mario_kart_world);
         }
         return true;
     case Op::SetProvokingVertex:
         if (fits(sizeof(VC::U32Payload))) {
             const u32 last = VC::RecordPayload<VC::U32Payload>(header)->value & 1;
-            fixed.provoking_first = last != 0 ? 0 : 1;
-            pipeline_dirty = true;
+            const u32 value = last != 0 ? 0u : 1u;
+            pipeline_dirty |= ReplaceState(fixed.provoking_first, value, impl.mario_kart_world);
         }
         return true;
     case Op::SetPointSize:
         if (fits(sizeof(VC::F32Payload))) {
-            fixed.point_size_bits =
+            const u32 value =
                 std::bit_cast<u32>(VC::RecordPayload<VC::F32Payload>(header)->value);
-            pipeline_dirty = true;
+            pipeline_dirty |= ReplaceState(fixed.point_size_bits, value, impl.mario_kart_world);
         }
         return true;
     case Op::SetLineWidth:
         if (fits(sizeof(VC::F32Payload))) {
-            line_width = VC::RecordPayload<VC::F32Payload>(header)->value;
-            dynamic_dirty |= DIRTY_LINE;
+            if (ReplaceDynamicState(line_width, VC::RecordPayload<VC::F32Payload>(header)->value,
+                                    !Debug::Get().no_state_elide)) {
+                dynamic_dirty |= DIRTY_LINE;
+            }
         }
         return true;
     case Op::DrawTexture:
@@ -457,12 +495,14 @@ bool DrawContext::Handle(const VC::RecordHeader* header) {
 // ---------------------------------------------------------------------------------------------
 
 void DrawContext::SetProgram(const VC::BindProgramPayload& p) {
+    bool changed = false;
     for (u32 stage = 0; stage < BIND_STAGES; ++stage) {
         if ((p.stages >> stage) & 1) {
+            changed |= stages[stage].program_serial != p.program_serial;
             stages[stage].program_serial = p.program_serial;
         }
     }
-    pipeline_dirty = true;
+    pipeline_dirty |= !impl.mario_kart_world || changed;
 }
 
 void DrawContext::BindState(const VC::RecordHeader* header) {
@@ -474,41 +514,63 @@ void DrawContext::BindState(const VC::RecordHeader* header) {
                          fmt::format("bad state object (kind {}, size {})", p->kind, p->size));
         return;
     }
+    const auto assign = [&](auto& destination, const auto& value) {
+        return ReplaceState(destination, value, impl.mario_kart_world);
+    };
+    bool changed = false;
     switch (static_cast<VC::StateKind>(p->kind)) {
     case VC::StateKind::Blend: {
         u64 word;
         std::memcpy(&word, bytes, sizeof(word));
         const u32 target = VC::BlendState::TargetIndex(word);
-        fixed.blend[target] = word;
+        changed = assign(fixed.blend[target], word);
         break;
     }
-    case VC::StateKind::Color:
-        std::memcpy(&fixed.color, bytes, sizeof(u32));
-        break;
-    case VC::StateKind::ChannelMask:
-        std::memcpy(&fixed.channel_mask, bytes, sizeof(u32));
-        break;
-    case VC::StateKind::Multisample:
-        fixed.multisample.fill(0);
-        std::memcpy(fixed.multisample.data(), bytes, VC::MultisampleState::SIZE);
-        break;
-    case VC::StateKind::Polygon:
-        std::memcpy(&fixed.polygon, bytes, sizeof(u32));
-        break;
-    case VC::StateKind::DepthStencil:
-        std::memcpy(&fixed.depth_stencil, bytes, sizeof(u64));
+    case VC::StateKind::Color: {
+        u32 word;
+        std::memcpy(&word, bytes, sizeof(word));
+        changed = assign(fixed.color, word);
         break;
     }
-    pipeline_dirty = true;
+    case VC::StateKind::ChannelMask: {
+        u32 word;
+        std::memcpy(&word, bytes, sizeof(word));
+        changed = assign(fixed.channel_mask, word);
+        break;
+    }
+    case VC::StateKind::Multisample: {
+        decltype(fixed.multisample) words{};
+        std::memcpy(words.data(), bytes, VC::MultisampleState::SIZE);
+        changed = assign(fixed.multisample, words);
+        break;
+    }
+    case VC::StateKind::Polygon: {
+        u32 word;
+        std::memcpy(&word, bytes, sizeof(word));
+        changed = assign(fixed.polygon, word);
+        break;
+    }
+    case VC::StateKind::DepthStencil: {
+        u64 word;
+        std::memcpy(&word, bytes, sizeof(word));
+        changed = assign(fixed.depth_stencil, word);
+        break;
+    }
+    }
+    pipeline_dirty |= changed;
 }
 
 void DrawContext::BindVertexAttribs(const VC::RecordHeader* header) {
     const auto* p = VC::RecordPayload<VC::BindVertexAttribsPayload>(header);
     const auto words = Array<VC::BindVertexAttribsPayload, u32>(header, p, p->count);
-    fixed.attributes.fill(0);
+    decltype(fixed.attributes) attributes{};
     for (u32 i = 0; i < words.size() && i < MAX_VERTEX_ATTRIBUTES; ++i) {
-        fixed.attributes[i] = words[i];
+        attributes[i] = words[i];
     }
+    if (impl.mario_kart_world && fixed.attributes == attributes) {
+        return;
+    }
+    fixed.attributes = attributes;
     vertex_layout_dirty = true;
     pipeline_dirty = true;
 }
@@ -517,12 +579,18 @@ void DrawContext::BindVertexStreams(const VC::RecordHeader* header) {
     const auto* p = VC::RecordPayload<VC::BindVertexStreamsPayload>(header);
     const auto values =
         Array<VC::BindVertexStreamsPayload, VC::VertexStreamState>(header, p, p->count);
-    fixed.stream_stride.fill(0);
-    fixed.stream_divisor.fill(0);
+    decltype(fixed.stream_stride) strides{};
+    decltype(fixed.stream_divisor) divisors{};
     for (u32 i = 0; i < values.size() && i < MAX_VERTEX_STREAMS; ++i) {
-        fixed.stream_stride[i] = values[i].stride;
-        fixed.stream_divisor[i] = values[i].divisor;
+        strides[i] = values[i].stride;
+        divisors[i] = values[i].divisor;
     }
+    if (impl.mario_kart_world && fixed.stream_stride == strides &&
+        fixed.stream_divisor == divisors) {
+        return;
+    }
+    fixed.stream_stride = strides;
+    fixed.stream_divisor = divisors;
     vertex_layout_dirty = true;
     pipeline_dirty = true;
 }
@@ -544,10 +612,13 @@ void DrawContext::BindBuffers(const VC::RecordHeader* header, bool uniform) {
     }
     const auto ranges = Array<VC::BindBuffersPayload, VC::BufferRange>(header, p, p->count);
     auto& table = uniform ? stages[p->stage].uniform : stages[p->stage].storage;
+    bool changed = false;
     for (u32 i = 0; i < ranges.size() && p->first + i < table.size(); ++i) {
+        changed |= table[p->first + i].address != ranges[i].address ||
+                   table[p->first + i].size != ranges[i].size;
         table[p->first + i] = {ranges[i].address, ranges[i].size};
     }
-    if (!uniform) {
+    if (!uniform && (!impl.mario_kart_world || changed)) {
         storage_gen[p->stage] = ++bank_clock;
     }
 }
@@ -560,53 +631,64 @@ void DrawContext::BindHandles(const VC::RecordHeader* header, VC::Op op) {
     }
     const auto handles = Array<VC::BindHandlesPayload, u64>(header, p, p->count);
     StageBindings& stage = stages[p->stage];
-    handle_gen[p->stage] = ++bank_clock;
+    bool changed = false;
     for (u32 i = 0; i < handles.size(); ++i) {
         const u32 slot = p->first + i;
         switch (op) {
         case VC::Op::BindTextures:
             if (slot < stage.combined.size()) {
+                changed |= stage.combined[slot] != handles[i];
                 stage.combined[slot] = handles[i];
             }
             break;
         case VC::Op::BindSeparateTextures:
             if (slot < stage.separate_texture.size()) {
+                changed |= stage.separate_texture[slot] != handles[i];
                 stage.separate_texture[slot] = handles[i];
             }
             break;
         case VC::Op::BindSeparateSamplers:
             if (slot < stage.separate_sampler.size()) {
+                changed |= stage.separate_sampler[slot] != handles[i];
                 stage.separate_sampler[slot] = handles[i];
             }
             break;
         default:
             if (slot < stage.image.size()) {
+                changed |= stage.image[slot] != handles[i];
                 stage.image[slot] = handles[i];
             }
             break;
         }
     }
+    if (!impl.mario_kart_world || changed) {
+        handle_gen[p->stage] = ++bank_clock;
+    }
 }
 
 void DrawContext::SetStencil(const VC::SetStencilPayload& p) {
+    bool changed = false;
     for (u32 face = 0; face < 2; ++face) {
         if (((p.face >> face) & 1) == 0) {
             continue;
         }
         StencilFace& state = stencil[face];
+        const u32 value = static_cast<u32>(p.value) & 0xFF;
         switch (p.which) {
         case 0:
-            state.value_mask = static_cast<u32>(p.value) & 0xFF;
+            changed |= ReplaceDynamicState(state.value_mask, value, !Debug::Get().no_state_elide);
             break;
         case 1:
-            state.write_mask = static_cast<u32>(p.value) & 0xFF;
+            changed |= ReplaceDynamicState(state.write_mask, value, !Debug::Get().no_state_elide);
             break;
         default:
-            state.reference = static_cast<u32>(p.value) & 0xFF;
+            changed |= ReplaceDynamicState(state.reference, value, !Debug::Get().no_state_elide);
             break;
         }
     }
-    dynamic_dirty |= DIRTY_STENCIL;
+    if (changed) {
+        dynamic_dirty |= DIRTY_STENCIL;
+    }
 }
 
 void DrawContext::PushConstantsOp(const VC::RecordHeader* header) {
@@ -618,6 +700,10 @@ void DrawContext::PushConstantsOp(const VC::RecordHeader* header) {
         host->HostUnsupported("PushConstants",
                               fmt::format("range {:#x}+{:#x} exceeds the {}-byte block", p->offset,
                                           size, PUSH_CONSTANT_BLOCK_SIZE));
+        return;
+    }
+    if (impl.mario_kart_world &&
+        std::memcmp(block.data() + p->offset, reinterpret_cast<const u8*>(p + 1), size) == 0) {
         return;
     }
     std::memcpy(block.data() + p->offset, reinterpret_cast<const u8*>(p + 1), size);
@@ -1914,6 +2000,7 @@ std::shared_ptr<GraphicsPipeline> DrawContext::ResolvePipeline(u32 mode, u32 ele
                                                                bool& awaiting_async) {
     const DrawOracle oracle{*this};
     if (!pipeline_dirty && pipeline && mode == last_mode && pipeline->QueriesMatch(oracle)) {
+        ++counters.pipeline_state_reuses;
         return pipeline;
     }
     // A mesh-task draw uses the task, mesh and fragment programs bound; a vertex draw the vertex
@@ -2414,6 +2501,11 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
     const VkPipeline handle = active->Handle();
     if (bound_pipeline != handle) {
         cmd.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, handle);
+        if (bound_pipeline == VK_NULL_HANDLE) {
+            // A masked clear or another untracked graphics pipeline may have replaced dynamic
+            // values with static state. Restore all of them before this draw.
+            dynamic_dirty = ~0u;
+        }
         if (bound_pipeline == VK_NULL_HANDLE || active->mesh) {
             // A pipeline bound by something else (the clear pipelines), a fresh pass/command
             // buffer, or a task/mesh pipeline (it has no vertex input state, so binding it may

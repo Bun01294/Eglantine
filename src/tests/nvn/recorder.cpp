@@ -3,12 +3,15 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <thread>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include "video_core/nvn/guest_layouts.h"
 #include "video_core/nvn/recorder.h"
@@ -187,6 +190,36 @@ struct Fixture {
 
 } // namespace
 
+TEST_CASE("MKW command-list batching preserves large repeated submissions", "[nvn][mkw]") {
+    std::vector<u64> expected;
+    for (bool batch : {false, true}) {
+        Fixture f;
+        f.recorder.SetCommandListBatching(batch);
+        const u64 handle = f.Record(0, [&] {
+            for (u32 i = 0; i < 2048; ++i) {
+                f.recorder.DrawArrays(Fixture::CMD, 4, i, 3 + i % 20, 1, 0);
+            }
+        }, 0x40000);
+        REQUIRE(handle != 0);
+        const auto start = std::chrono::steady_clock::now();
+        for (u32 i = 0; i < 200; ++i) {
+            const u64 seq = f.recorder.QueueSubmitCommands(Fixture::QUEUE, std::array{handle});
+            REQUIRE(seq != 0);
+            REQUIRE(f.sink.submissions.size() == 1);
+            const std::vector<u64>& words = f.sink.submissions[0].lists[0];
+            if (expected.empty()) {
+                expected = words;
+            }
+            REQUIRE(words == expected);
+            f.sink.Complete(seq);
+            f.sink.submissions.clear();
+        }
+        const double us = std::chrono::duration<double, std::micro>(
+                              std::chrono::steady_clock::now() - start).count() / 200;
+        std::printf("MKW 2048-record submit: batching=%u %.2f us (includes verification)\n", batch, us);
+    }
+}
+
 TEST_CASE("nvn recorder: tagged objects, serials and re-initialization", "[nvn]") {
     Fixture f;
     REQUIRE(f.sink.memory == &f.memory);
@@ -288,10 +321,16 @@ TEST_CASE("nvn recorder: descriptor pool bases and snapshots", "[nvn]") {
     const u64 second = f.Record(0, [] {});
     const u64 third = f.Record(0, [] {});
     REQUIRE(f.recorder.QueueSubmitCommands(Fixture::QUEUE, std::array{second}) != 0);
+    // Re-registering the same objects must retain the immutable table, including a view.
+    f.recorder.RegisterTexture(Obj(20), 5, Obj(11), 0);
+    f.recorder.RegisterTexture(Obj(20), 6, Obj(10), SCRATCH);
+    f.recorder.RegisterSampler(Obj(30), 2, Obj(31));
     REQUIRE(f.recorder.QueueSubmitCommands(Fixture::QUEUE, std::array{third}) != 0);
     REQUIRE(f.sink.submissions.size() == 3);
     CHECK(f.sink.submissions[1].texture_pool_snapshot.Values().data() ==
           f.sink.submissions[2].texture_pool_snapshot.Values().data());
+    CHECK(f.sink.submissions[1].sampler_pool_snapshot.Values().data() ==
+          f.sink.submissions[2].sampler_pool_snapshot.Values().data());
     CHECK(f.sink.submissions[0].texture_pool_snapshot.Values().data() !=
           f.sink.submissions[2].texture_pool_snapshot.Values().data());
 
@@ -424,6 +463,7 @@ TEST_CASE("nvn recorder: full recording sequence", "[nvn]") {
 
 TEST_CASE("nvn recorder: data is copied at record time", "[nvn]") {
     Fixture f;
+    f.recorder.SetCommandListBatching(GENERATE(false, true));
     f.recorder.AddCommandMemory(Fixture::CMD, Fixture::POOL, 0, 0x1000);
     f.recorder.BeginRecording(Fixture::CMD);
 
@@ -499,6 +539,7 @@ TEST_CASE("nvn recorder: data is copied at record time", "[nvn]") {
 
 TEST_CASE("nvn recorder: queue order and nested call expansion", "[nvn]") {
     Fixture f;
+    f.recorder.SetCommandListBatching(GENERATE(false, true));
     REQUIRE(f.recorder.QueueInitialize(Obj(3)));
     const u64 queue_a = Fixture::QUEUE;
     const u64 queue_b = Obj(3);
@@ -776,6 +817,7 @@ TEST_CASE("nvn recorder: the holder report names re-initialised and list-held te
 
 TEST_CASE("nvn recorder: deferred handles are read at submit", "[nvn]") {
     Fixture f;
+    f.recorder.SetCommandListBatching(GENERATE(false, true));
     REQUIRE(f.recorder.TexturePoolInitialize(Obj(20), Fixture::POOL, 0x20000, 64));
     REQUIRE(f.recorder.TexturePoolInitialize(Obj(21), Fixture::POOL, 0x30000, 64));
     const std::array<u64, 2> before{0x00100002, 7};
@@ -808,6 +850,7 @@ TEST_CASE("nvn recorder: deferred handles are read at submit", "[nvn]") {
 
 TEST_CASE("nvn recorder: completion applies event and report writes in order", "[nvn]") {
     Fixture f;
+    f.recorder.SetCommandListBatching(GENERATE(false, true));
     constexpr u64 event_offset = 0x20000;
     constexpr u64 report_address = STORAGE + 0x21000;
     REQUIRE(f.recorder.EventInitialize(Obj(10), Fixture::POOL, event_offset));

@@ -62,6 +62,9 @@
 
 namespace Vulkan {
 class FSR;
+class FSR3;
+class SGSR;
+class WindowAdaptPass;
 namespace Dlss {
 class Loader;
 }
@@ -156,6 +159,7 @@ struct Pool {
         /// nothing wrote it since that the tracker does not see: unchanged unless the tracker
         /// reports a write, so it is not hashed again (Recorder::MirrorTakeCpuWrites).
         bool trusted{};
+        u64 raw_epoch{}; ///< MKW: raw completion epoch of this page's last comparison
     };
     static constexpr u64 MIRROR_PAGE = 4096;
     std::vector<MirrorPage> mirror_pages;
@@ -816,6 +820,7 @@ struct Context::Impl {
         std::atomic<u64> virtual_maps{};
         std::atomic<u64> virtual_unresolved{};
         std::atomic<u64> virtual_sparse_binds{};
+        std::atomic<u64> sparse_write_pool_checks{};
         std::atomic<u64> texels_flushed{};
         std::atomic<u64> image_transitions{}; ///< image layout transitions recorded (PrepareImagesSpan)
         std::atomic<u64> ops_unsupported{};
@@ -935,6 +940,13 @@ struct Context::Impl {
     VkBufferUsageFlags pool_usage{POOL_BUFFER_USAGE};
 
     // --- replay thread only ---
+    bool mario_kart_world{};
+    std::optional<bool> mkw_bc3_atlas_supported;
+    bool MkwBc3AtlasSupported();
+    bool mkw_coalesce_early_submit{};
+    // Sparse binds on the Vulkan queue must wait for older command buffers using the image.
+    VkSemaphore mkw_last_submit_semaphore{VK_NULL_HANDLE};
+    u64 mkw_last_submit_value{};
     std::unordered_map<u64, std::shared_ptr<Pool>> pools;
     std::map<u64, std::shared_ptr<Pool>> pools_by_address;
     /// Bumped whenever a pool is created, destroyed or backed (the raw global table depends on
@@ -1046,6 +1058,18 @@ struct Context::Impl {
     };
     mutable std::array<ResolveSlot, 16> resolve_cache{};
     mutable u32 resolve_next{0};
+    struct ExactResolveSlot {
+        u64 generation{~u64{0}};
+        u64 mappings{};
+        u64 address{};
+        u64 size{};
+        Pool* pool{};
+        u64 offset{};
+    };
+    mutable std::array<ExactResolveSlot, 256> mkw_resolve_cache{};
+    u64 mkw_mapping_generation{};
+    mutable u64 mkw_resolve_hits{};
+    mutable u64 mkw_resolve_misses{};
     std::vector<Retired> retired;
     /// Stand-ins whose format change waits for the next submission (Storage::pending_standin).
     std::vector<std::weak_ptr<Storage>> pending_standins;
@@ -1116,6 +1140,10 @@ struct Context::Impl {
     /// pools that hold one. Replay thread (the pool is shared with the threads releasing storages).
     std::shared_ptr<SparsePagePool> sparse_pages;
     std::set<u64> sparse_virtual_pools;
+    // MKW CPU flushes visit only virtual pools that map the physical pool being flushed.
+    std::unordered_map<u64, std::vector<u64>> mkw_sparse_physical_users;
+    bool mkw_sparse_users_dirty{true};
+    [[nodiscard]] std::span<const u64> MkwSparseVirtualUsers(u64 physical_serial);
     /// Sparse tiles compared with their guest bytes in the present `sparse_verify_tick`.
     u64 sparse_verify_tick{~u64{0}};
     u32 sparse_verify_count{0};
@@ -1146,6 +1174,15 @@ struct Context::Impl {
         u32 width{};
         u32 height{};
     } present_scratch;
+    std::shared_ptr<WindowAdaptPass> window_filter;
+    Settings::ScalingFilter window_filter_setting{static_cast<Settings::ScalingFilter>(~0u)};
+    VkFormat window_filter_format{VK_FORMAT_UNDEFINED};
+    VkExtent2D window_filter_extent{};
+    bool window_filter_failed{};
+    std::shared_ptr<::Vulkan::FSR> window_fsr;
+    std::shared_ptr<::Vulkan::FSR3> window_fsr3;
+    std::shared_ptr<::Vulkan::SGSR> window_sgsr;
+
 
     // --- counters and render conditions (NvnIndirect; nvn_counters.cpp, nvn_exec.cpp) ---
     std::unique_ptr<CounterEngine> counters_engine;

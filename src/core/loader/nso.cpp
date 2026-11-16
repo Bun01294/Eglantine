@@ -213,10 +213,20 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
     // Mario Kart World selects a 1- or 2-vblank frame mode in its main loop. Force its native
     // 30 FPS mode, or let it choose dynamically using the whole frame time (CPU + GPU wait).
     // Match the instruction sequence instead of relying on a title-version-specific address.
-    const bool mkw_dynamic = Settings::values.mkw_dynamic_fps.GetValue();
+    const bool mkw_main = name == "main" &&
+                          process.GetProgramId() == Settings::MarioKartWorldProgramId;
+    const bool mkw_30 = Settings::values.mkw_30fps.GetValue();
+    const bool mkw_vtx_pacing =
+        mkw_main && process.IsApplication() &&
+#ifdef HAS_NCE
+        patches == nullptr &&
+#endif
+        Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan &&
+        Settings::ResolveNvnHle().hle;
+    const bool mkw_dynamic =
+        mkw_vtx_pacing ? !mkw_30 : Settings::values.mkw_dynamic_fps.GetValue();
     bool mkw_dynamic_fps_patch_applied = false;
-    if ((mkw_dynamic || Settings::values.mkw_30fps.GetValue()) && name == "main" &&
-        process.GetProgramId() == Settings::MarioKartWorldProgramId) {
+    if (mkw_main && (mkw_dynamic || mkw_30)) {
         constexpr u32 ModeLoadInsn = 0xB9421268; // ldr w8, [x19, #0x210]
         const u32 mode = mkw_dynamic ? 0U : 2U;
         const u32 mode_instruction = 0x52800008U | (mode << 5); // mov w8, #mode

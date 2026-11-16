@@ -14,6 +14,7 @@
 
 #include <fmt/ranges.h>
 
+#include "common/game_presets.h"
 #include "common/logging.h"
 #include <ranges>
 #include "common/scope_exit.h"
@@ -231,6 +232,12 @@ try
                                 "[nvn] settings the HLE graphics path does not apply: {} (set "
                                 "Graphics path to Emulated GPU to use them)",
                                 fmt::join(gaps, "; "));
+                }
+                if (Settings::GetCurrentProgramID() == Settings::MarioKartWorldProgramId &&
+                    !present_manager.UsesPresentThread()) {
+                    present_manager.EnablePresentThread();
+                    LOG_INFO(Render_Vulkan,
+                             "[nvn] Mario Kart World: using the Vulkan presentation worker");
                 }
             } catch (const std::exception& exception) {
                 nvn_context.reset();
