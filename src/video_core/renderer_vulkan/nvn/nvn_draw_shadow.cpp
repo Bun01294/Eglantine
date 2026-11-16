@@ -115,16 +115,18 @@ DrawContext::ShadowDecision DrawContext::ClassifyShadows(const DrawPlan& plan) {
 }
 
 void DrawContext::ApplyShadows(DrawPlan& plan, bool allow_create) {
-    // 1. Shadows that another use of the plan conflicts with go back to host memory.
-    const ShadowDecision decision = ClassifyShadows(plan);
-    if (decision.flush_needed) {
-        const auto cause = plan.raw_global ? &DrawCounters::shadow_flush_raw
-                                           : &DrawCounters::shadow_flush_conflict;
-        // Its own batch: a shadow created below may cover bytes a write-back here writes.
-        const ShadowCopyBatch batch{*this};
-        for (size_t i = shadows.size(); i-- > 0;) {
-            if (decision.flush_mask.test(i)) {
-                FlushShadow(i, cause);
+    // In an open pass PrepareOutsidePass already confirmed that no live shadow conflicts.
+    // Outside a pass, image and buffer preparation may have changed the live shadows.
+    if (allow_create) {
+        const ShadowDecision decision = ClassifyShadows(plan);
+        if (decision.flush_needed) {
+            const auto cause = plan.raw_global ? &DrawCounters::shadow_flush_raw
+                                               : &DrawCounters::shadow_flush_conflict;
+            const ShadowCopyBatch batch{*this};
+            for (size_t i = shadows.size(); i-- > 0;) {
+                if (decision.flush_mask.test(i)) {
+                    FlushShadow(i, cause);
+                }
             }
         }
     }

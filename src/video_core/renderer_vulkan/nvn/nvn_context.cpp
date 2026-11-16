@@ -1508,6 +1508,7 @@ ContextStats Context::Stats() const {
         .mirror_ranges_clean = s.mirror_ranges_clean.load(relaxed),
         .mirror_pages_hashed = s.mirror_pages_hashed.load(relaxed),
         .mirror_pages_trusted = s.mirror_pages_trusted.load(relaxed),
+        .mirror_pages_gpu_owned = s.mirror_pages_gpu_owned.load(relaxed),
         .vram_mirrors = s.vram_mirrors.load(relaxed),
         .vram_mirror_refused = s.vram_mirror_refused.load(relaxed),
         .vram_copy_in_runs = s.vram_copy_in_runs.load(relaxed),
@@ -2076,6 +2077,7 @@ void Context::CollectStats(std::vector<VideoCommon::Nvn::SinkStat>& out) const {
     out.push_back({"mirror range uses that needed no copy", s.mirror_ranges_clean});
     out.push_back({"mirror guest pages compared", s.mirror_pages_hashed});
     out.push_back({"mirror guest pages trusted (no write tracked)", s.mirror_pages_trusted});
+    out.push_back({"mirror guest pages not hashed (pending GPU writes)", s.mirror_pages_gpu_owned});
     out.push_back({"pool mirrors (VRAM copies of imported pools)", s.vram_mirrors});
     out.push_back({"pool mirrors: refused (budget, allocation, no CPU write tracking)",
                    s.vram_mirror_refused});

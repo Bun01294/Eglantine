@@ -630,10 +630,8 @@ private:
     /// pages the guest CPU wrote since the last call into untrusted ones. False: no tracking (every
     /// page is hashed, nothing is trusted).
     bool MirrorTakeCpuWrites(Pool& pool);
-    /// Whether no unfinished submission writes `page` of a mirror pool (its write-back, which the
-    /// tracker does not see, is done). `pending` caches the pool's GPU-written ranges.
-    bool MirrorPageSettled(Pool& pool, u64 page,
-                           std::optional<std::vector<std::pair<u64, u64>>>& pending);
+    /// Classify the page against the pending GPU writes sampled at the first page check.
+    MirrorWriteCoverage MirrorPageWrites(Pool& pool, u64 page, bool& pending_read);
     /// The replay wrote a pool range on the GPU (through the pool's own buffer unless
     /// `invalidate_mirror` is false: a pool mirror's write-back, after which the mirror and the
     /// guest bytes agree).
@@ -871,6 +869,7 @@ private:
     u32 early_pieces{0};
     size_t flushed_arena{0};   ///< flight.arena chunks before this index were flushed already
     size_t flushed_staging{0}; ///< the same for flight.staging
+    std::vector<std::pair<u64, u64>> mirror_pending_writes;
     std::vector<std::pair<VkBuffer, u64>> deferred_zero; ///< (buffer, offset) of 8-byte zero-fills
     const VC::Submission* lookahead_submission{};
     size_t lookahead_list{0};
@@ -1249,22 +1248,20 @@ bool Recorder::MirrorTakeCpuWrites(Pool& pool) {
     return true;
 }
 
-bool Recorder::MirrorPageSettled(Pool& pool, u64 page,
-                                 std::optional<std::vector<std::pair<u64, u64>>>& pending) {
-    if (!pending) {
+MirrorWriteCoverage Recorder::MirrorPageWrites(Pool& pool, u64 page, bool& pending_read) {
+    if (!pending_read) {
         // Taken before the page is hashed: the completion writes a range back before it drops it
         // from gpu_dirty, so a range missing here is in the guest bytes the hash reads.
-        pending.emplace();
+        mirror_pending_writes.clear();
         std::scoped_lock lock{pool.dirty_mutex};
         for (const Pool::Dirty& dirty : pool.gpu_dirty) {
-            pending->emplace_back(dirty.begin, dirty.end);
+            mirror_pending_writes.emplace_back(dirty.begin, dirty.end);
         }
+        pending_read = true;
     }
     const u64 begin = page * Pool::MIRROR_PAGE;
-    const u64 end = begin + Pool::MIRROR_PAGE;
-    return std::none_of(pending->begin(), pending->end(), [&](const auto& range) {
-        return range.first < end && range.second > begin;
-    });
+    const u64 end = (std::min)(begin + Pool::MIRROR_PAGE, pool.size);
+    return ClassifyMirrorWrites(begin, end, mirror_pending_writes);
 }
 
 bool Recorder::MirrorNeedsUpload(Pool& pool, u64 offset, u64 size) {
@@ -1272,12 +1269,13 @@ bool Recorder::MirrorNeedsUpload(Pool& pool, u64 offset, u64 size) {
         return false;
     }
     const bool tracked = MirrorTakeCpuWrites(pool);
-    std::optional<std::vector<std::pair<u64, u64>>> pending;
+    bool pending_read = false;
     const u32 stamp = static_cast<u32>(flight.seq) + 1;
     const u64 first = offset / Pool::MIRROR_PAGE;
     const u64 last = (std::min)(offset + size, pool.size) - 1;
     u64 hashed = 0;
     u64 trusted = 0;
+    u64 gpu_owned = 0;
     bool dirty = false;
     for (u64 index = first; index <= last / Pool::MIRROR_PAGE; ++index) {
         Pool::MirrorPage& page = pool.mirror_pages[static_cast<size_t>(index)];
@@ -1290,7 +1288,12 @@ bool Recorder::MirrorNeedsUpload(Pool& pool, u64 offset, u64 size) {
             ++trusted;
             continue;
         }
-        const bool settled = tracked && MirrorPageSettled(pool, index, pending);
+        const auto coverage = MirrorPageWrites(pool, index, pending_read);
+        if (coverage == MirrorWriteCoverage::Full) {
+            ++gpu_owned;
+            continue;
+        }
+        const bool settled = tracked && coverage == MirrorWriteCoverage::None;
         ++hashed;
         if (page.valid && page.hash == GuestPageHash(pool, index)) {
             page.checked = stamp;
@@ -1307,6 +1310,9 @@ bool Recorder::MirrorNeedsUpload(Pool& pool, u64 offset, u64 size) {
     if (trusted != 0) {
         impl.stats.mirror_pages_trusted.fetch_add(trusted, std::memory_order_relaxed);
     }
+    if (gpu_owned != 0) {
+        impl.stats.mirror_pages_gpu_owned.fetch_add(gpu_owned, std::memory_order_relaxed);
+    }
     return dirty;
 }
 
@@ -1318,12 +1324,13 @@ void Recorder::UploadRange(Pool& pool, u64 offset, u64 size) {
     // time), as runs of consecutive pages. The mirror is made equal to these pages from here on,
     // so the bookkeeping is updated now.
     const bool tracked = MirrorTakeCpuWrites(pool);
-    std::optional<std::vector<std::pair<u64, u64>>> pending;
+    bool pending_read = false;
     const u32 stamp = static_cast<u32>(flight.seq) + 1;
     const u64 first = offset / Pool::MIRROR_PAGE;
     const u64 last = (std::min)(offset + size, pool.size) - 1;
     u64 hashed = 0;
     u64 trusted = 0;
+    u64 gpu_owned = 0;
     std::vector<std::pair<u64, u64>> parts;
     for (u64 index = first; index <= last / Pool::MIRROR_PAGE; ++index) {
         Pool::MirrorPage& page = pool.mirror_pages[static_cast<size_t>(index)];
@@ -1336,7 +1343,12 @@ void Recorder::UploadRange(Pool& pool, u64 offset, u64 size) {
             ++trusted;
             continue;
         }
-        const bool settled = tracked && MirrorPageSettled(pool, index, pending);
+        const auto coverage = MirrorPageWrites(pool, index, pending_read);
+        if (coverage == MirrorWriteCoverage::Full) {
+            ++gpu_owned;
+            continue; // UploadRange would discard this whole page while the GPU owns it.
+        }
+        const bool settled = tracked && coverage == MirrorWriteCoverage::None;
         ++hashed;
         const u64 hash = GuestPageHash(pool, index);
         const bool changed = !page.valid || page.hash != hash;
@@ -1362,31 +1374,32 @@ void Recorder::UploadRange(Pool& pool, u64 offset, u64 size) {
     if (trusted != 0) {
         impl.stats.mirror_pages_trusted.fetch_add(trusted, std::memory_order_relaxed);
     }
+    if (gpu_owned != 0) {
+        impl.stats.mirror_pages_gpu_owned.fetch_add(gpu_owned, std::memory_order_relaxed);
+    }
     if (parts.empty()) {
         impl.stats.mirror_ranges_clean.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    // The GPU's version is newer than the guest's wherever an unfinished submission wrote.
-    {
-        std::scoped_lock lock{pool.dirty_mutex};
-        for (const Pool::Dirty& dirty : pool.gpu_dirty) {
-            std::vector<std::pair<u64, u64>> next;
-            for (const auto& [begin, end] : parts) {
-                if (dirty.end <= begin || dirty.begin >= end) {
-                    next.emplace_back(begin, end);
-                    continue;
-                }
-                if (dirty.begin > begin) {
-                    next.emplace_back(begin, dirty.begin);
-                }
-                if (dirty.end < end) {
-                    next.emplace_back(dirty.end, end);
-                }
+    // Keep the same ownership snapshot for the hashes and copies. Completion can remove a range
+    // after the snapshot, but those bytes already have the GPU's value in the mirror.
+    for (const auto& [dirty_begin, dirty_end] : mirror_pending_writes) {
+        std::vector<std::pair<u64, u64>> next;
+        for (const auto& [begin, end] : parts) {
+            if (dirty_end <= begin || dirty_begin >= end) {
+                next.emplace_back(begin, end);
+                continue;
             }
-            parts = std::move(next);
-            if (parts.empty()) {
-                return;
+            if (dirty_begin > begin) {
+                next.emplace_back(begin, dirty_begin);
             }
+            if (dirty_end < end) {
+                next.emplace_back(dirty_end, end);
+            }
+        }
+        parts = std::move(next);
+        if (parts.empty()) {
+            return;
         }
     }
     u64 copied = 0;
@@ -1444,7 +1457,7 @@ void Recorder::NotePoolWrite(Pool& pool, u64 offset, u64 size, bool invalidate_m
             pool.gpu_dirty.push_back({offset, offset + size, flight.seq});
         }
         // The write-back (and a report's timestamp) reaches the guest bytes untracked: the pages
-        // are hashed again once it is done (MirrorPageSettled).
+        // are hashed again once it is done (MirrorPageWrites).
         if (size != 0 && offset < pool.size) {
             const u64 end = (std::min)(offset + size, pool.size);
             for (u64 page = offset / Pool::MIRROR_PAGE; page * Pool::MIRROR_PAGE < end; ++page) {

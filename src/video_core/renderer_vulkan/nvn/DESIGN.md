@@ -365,10 +365,10 @@ The guest memory stays the CPU truth.
   ranges unchanged keeps its render pass (`HostMirrorNeedsUpload`, no commands recorded); only a
   changed page ends the pass for the copy (`render_pass_break: mirror upload`).
   `NotifyCpuWrite` (FlushMappedRange) makes the pages it names get compared again within the same
-  submission. The first use of a page copies it. Ranges that an unfinished submission writes
-  (`Pool::gpu_dirty`) are skipped: the mirror is newer than the guest there. The bytes a GPU write
-  puts back into the guest differ from the page's recorded hash, so that page is copied once more
-  at its next use (same bytes).
+  submission. The first CPU upload copies the page. The upload clips out ranges owned by an
+  unfinished submission (`Pool::gpu_dirty`). A page covered by one pending range also skips the
+  hash without caching a comparison. Both decisions use the same per-lookup snapshot. Partial
+  coverage still requires hashing so CPU changes outside the write can reach the mirror.
 - **Page tracker gate** (default; `EDEN_NX2_NVN_MIRROR_HASH_ALWAYS=1` or no `GuestMemory::Track`:
   every page is hashed as above). At its first check a mirror pool is registered with the page
   tracker (`Pool::mirror_track`, every page armed). A page hashed after that, with no GPU write of

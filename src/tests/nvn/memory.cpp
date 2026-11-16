@@ -36,6 +36,7 @@
 #include "video_core/renderer_vulkan/nvn/nvn_context.h"
 #include "video_core/renderer_vulkan/nvn/nvn_format.h"
 #include "video_core/renderer_vulkan/nvn/nvn_impl.h"
+#include "video_core/renderer_vulkan/nvn/nvn_pool_mirror.h"
 #include "video_core/renderer_vulkan/nvn/nvn_sparse.h"
 #include "video_core/renderer_vulkan/nvn/nvn_texture_layout.h"
 #include "video_core/renderer_vulkan/nvn/nvn_upload.h"
@@ -65,6 +66,24 @@ constexpr u32 NVN_FORMAT_D24S8 = 0x35;
 constexpr u32 POOL_CPU_CACHED = 4;
 constexpr u32 POOL_VIRTUAL = 0x200;
 constexpr u32 POOL_CPU_NO_ACCESS = 1;
+
+TEST_CASE("Mirror page ownership requires complete coverage of the actual page",
+          "[nvn][mirror][mirror-owned]") {
+    using Nvn::ClassifyMirrorWrites;
+    using Nvn::MirrorWriteCoverage;
+    const std::array<std::pair<u64, u64>, 2> full{{{0, 8192}, {16384, 32768}}};
+    CHECK(ClassifyMirrorWrites(0, 4096, full) == MirrorWriteCoverage::Full);
+    CHECK(ClassifyMirrorWrites(4096, 8192, full) == MirrorWriteCoverage::Full);
+    CHECK(ClassifyMirrorWrites(8192, 12288, full) == MirrorWriteCoverage::None);
+    CHECK(ClassifyMirrorWrites(4096, 12288, full) == MirrorWriteCoverage::Partial);
+    CHECK(ClassifyMirrorWrites(32768, 36864, full) == MirrorWriteCoverage::None);
+    CHECK(ClassifyMirrorWrites(8192, 8192, full) == MirrorWriteCoverage::None);
+    CHECK(ClassifyMirrorWrites(16384, 16512, full) == MirrorWriteCoverage::Full);
+    const std::array<std::pair<u64, u64>, 2> hole{{{4096, 5000}, {6000, 8192}}};
+    CHECK(ClassifyMirrorWrites(4096, 8192, hole) == MirrorWriteCoverage::Partial);
+    CHECK(ClassifyMirrorWrites(5000, 6000, hole) == MirrorWriteCoverage::None);
+    CHECK(ClassifyMirrorWrites(4096, 8192, {}) == MirrorWriteCoverage::None);
+}
 
 // --- helpers ----------------------------------------------------------------------------------
 

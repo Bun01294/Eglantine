@@ -710,8 +710,10 @@ struct Context::Impl {
         std::atomic<u64> mirror_upload_runs{};           ///< ... in this many copies
         std::atomic<u64> mirror_uploads{};               ///< UploadRange calls that copied anything
         std::atomic<u64> mirror_pages_hashed{};          ///< guest pages compared with the mirror
-        std::atomic<u64> mirror_pages_trusted{};         ///< ... not compared: the tracker saw no write
-        std::atomic<u64> mirror_ranges_clean{};          ///< range uses that needed no copy
+        std::atomic<u64> mirror_pages_trusted{}; ///< ... not compared: the tracker saw no write
+        std::atomic<u64>
+            mirror_pages_gpu_owned{}; ///< ... not compared: pending GPU writes own the page
+        std::atomic<u64> mirror_ranges_clean{}; ///< range uses that needed no copy
         /// VRAM mirrors of imported pools (EDEN_NX2_NVN_POOL_MIRROR).
         std::atomic<u64> vram_mirrors{};            ///< mirrors created
         std::atomic<u64> vram_mirror_refused{};     ///< ... refused (budget, allocation, tracker)

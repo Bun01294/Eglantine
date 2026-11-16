@@ -3513,6 +3513,104 @@ TEST_CASE("NVN mirror pool: only the guest pages that changed are copied again",
     REQUIRE(stats.ops_failed == 0);
 }
 
+TEST_CASE("NVN mirror pool: pending GPU pages skip hashes without losing later CPU changes",
+          "[nvn][compute][mirror][mirror-owned]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    const u64 written_bytes = GENERATE(u64{16}, u64{4096});
+    FakeMemory memory;
+    memory.tracking = false;
+    u8* data = memory.Add(POOL_VA, 64_KiB);
+    std::memset(data, 0xcd, 64_KiB);
+    constexpr u64 OUTPUT_VA = POOL_VA + 1_MiB;
+    u8* output = memory.Add(OUTPUT_VA, 4096);
+    std::atomic<bool> release{false}, entered{false};
+    std::atomic<u32> phase{};
+    Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr,
+                                 {.allow_host_import = false,
+                                  .early_submit = false,
+                                  .mirror_hash_tracked = false,
+                                  .on_queue_submit = [&] {
+                                      u32 expected = 3;
+                                      if (!phase.compare_exchange_strong(expected, 4)) {
+                                          expected = 5;
+                                          phase.compare_exchange_strong(expected, 6);
+                                      }
+                                  }});
+    struct ReleaseCompletion {
+        std::atomic<bool>& release;
+        ~ReleaseCompletion() {
+            release.store(true);
+        }
+    } unblock{release};
+    const auto await = [](const auto& ready) {
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        while (!ready()) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return false;
+            }
+            std::this_thread::sleep_for(1ms);
+        }
+        return true;
+    };
+    context.SetGuestMemory(&memory);
+    context.CreatePool(
+        {.serial = 1, .guest_address = POOL_VA, .size = 64_KiB, .flags = POOL_CPU_CACHED});
+    context.CreatePool(
+        {.serial = 2, .guest_address = OUTPUT_VA, .size = 4096, .flags = POOL_CPU_CACHED});
+    context.CreateProgram(
+        MakeProgram(PROGRAM, FillProgramBase(0x20, 100), {.uniform = 1, .storage = 1}));
+    const auto copy = [&](u64 seq) {
+        std::vector<u64> list;
+        Push(list, VC::Op::CopyBufferToBuffer,
+             VC::CopyBufferToBufferPayload{.src = STORAGE_VA, .dst = OUTPUT_VA, .size = 4096});
+        PushEnd(list);
+        context.Submit(MakeSubmission(seq, std::move(list), {1, 2}));
+    };
+    copy(1);
+    REQUIRE(context.Wait(1, 20s));
+    context.SetCompletionCallback([&](u64 seq) {
+        if (seq == 2) {
+            entered.store(true);
+            while (!release.load()) {
+                std::this_thread::sleep_for(1ms);
+            }
+        }
+    });
+    context.Submit(MakeSubmission(2, {}, {}));
+    REQUIRE(await([&] { return entered.load(); }));
+    std::vector<u64> writes;
+    BindCompute(writes, PROGRAM, STORAGE_VA, written_bytes);
+    Push(writes, VC::Op::Dispatch, VC::DispatchPayload{.x = 1, .y = 1, .z = 1});
+    PushEnd(writes);
+    phase.store(3);
+    context.Submit(MakeSubmission(3, std::move(writes), {PROGRAM, 1}));
+    REQUIRE(await([&] { return phase.load() == 4; }));
+    const u64 skipped_before = context.Stats().mirror_pages_gpu_owned;
+    const u32 pending_word = 0x12345678;
+    memory.CpuWrite(STORAGE_VA + 2048, &pending_word, sizeof(pending_word));
+    phase.store(5);
+    copy(4);
+    REQUIRE(await([&] { return phase.load() == 6; }));
+    const u64 skipped = context.Stats().mirror_pages_gpu_owned - skipped_before;
+    CHECK(skipped == (written_bytes == 4096 ? 1 : 0));
+    release.store(true);
+    REQUIRE(context.Wait(4, 20s));
+    CHECK(WordAt(output, 0) == 100);
+    CHECK(WordAt(output, 2048) == (written_bytes == 4096 ? 0xcdcdcdcdu : pending_word));
+    // After the GPU write-back ends, another CPU store must reach the mirror.
+    const u32 cpu_word = 0x87654321;
+    memory.CpuWrite(STORAGE_VA + 2048, &cpu_word, sizeof(cpu_word));
+    copy(5);
+    REQUIRE(context.Wait(5, 20s));
+    CHECK(WordAt(output, 0) == 100);
+    CHECK(WordAt(output, 2048) == cpu_word);
+    CHECK(context.Stats().ops_failed == 0);
+    CHECK(context.Stats().ops_unsupported == 0);
+}
+
 TEST_CASE("NVN mirror pool: with the page tracker only the pages written are hashed again",
           "[nvn][compute][mirror]") {
     auto vulkan = MakeHeadlessVulkan();
