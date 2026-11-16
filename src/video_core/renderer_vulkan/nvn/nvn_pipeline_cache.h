@@ -78,9 +78,9 @@ inline constexpr u32 STAGE_COUNT = 8;
 /// Highest constant buffer bank + 1 a translated shader can use (Shader::Info::MAX_CBUFS).
 inline constexpr u32 LOG_MAX_CBUFS = static_cast<u32>(Shader::Info::MAX_CBUFS);
 
-/// Content hash of one program stage: CityHash64 over control[0:0x48] with the u32 at +0x30 zeroed
-/// (the control section's own length differs between containers), then the code bytes. 0 is never
-/// returned (0 means "stage absent" in requests).
+/// Content hash of the code and control fields used by ParseControl, excluding the section's own
+/// length and unused bytes. Includes compute descriptor counts and offsets. Never returns 0
+/// (0 means "stage absent" in requests).
 [[nodiscard]] u64 HashProgramStage(std::span<const u8> control, std::span<const u8> code);
 
 /// How a pipeline receives the vertex layout. Chosen once per cache from the device

@@ -1811,6 +1811,11 @@ Per-call, per-draw, per-submit and per-present cost with every debug switch unse
 
 ## Pipeline cache (`nvn_pipeline_cache.h`, tests `src/tests/nvn/pipeline_cache.cpp`)
 
+`HashProgramStage` includes the register count and the compute driver-bank layout (control
+`0xa9`, `0xb1..0xb3`, `0xb6`, `0xba..0xbb`), in addition to the instruction/code bytes and
+the control prefix. Identical compute code with different descriptor table offsets must not
+share a lowered program or pipeline. Truncated compute controls have a distinct identity.
+
 Files: `nvn_pipeline_cache.cpp` (lookups, translation: lower -> `NvnEnvironment` + `TranslateNvnStage`
 -> `ConvertLegacyToGeneric` + `EmitSPIRV`), `nvn_pipeline_vk.cpp` (render passes, descriptor and
 pipeline layouts, `VkPipeline` assembly), `nvn_pipeline_state.*` (NVN enum -> Vulkan, profile,

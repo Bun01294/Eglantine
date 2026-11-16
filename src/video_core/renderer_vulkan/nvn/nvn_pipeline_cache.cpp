@@ -49,9 +49,8 @@
 namespace Vulkan::Nvn {
 
 u64 HashProgramStage(std::span<const u8> control, std::span<const u8> code) {
-    // The control bytes that shape the translated program or its pipeline: 0x00..0x47 (stage, sizes,
-    // descriptor counts) and 0x50..0x6b (per-warp local memory at 0x50, thread group at 0x58..0x63,
-    // shared memory at 0x64). 0x48..0x4f is not read.
+    // Include the control fields ParseControl uses, including the compute driver-bank layout.
+    // Identical instructions with different bank layouts must not share a lowered program.
     constexpr size_t HASHED_CONTROL_BYTES = 0x6c;
     constexpr size_t UNHASHED_BEGIN = 0x48;
     constexpr size_t UNHASHED_END = 0x50;
@@ -64,12 +63,27 @@ u64 HashProgramStage(std::span<const u8> control, std::span<const u8> code) {
     if (count > UNHASHED_BEGIN) {
         std::memset(bytes.data() + UNHASHED_BEGIN, 0, std::min(count, UNHASHED_END) - UNHASHED_BEGIN);
     }
+    if (count > 0x4c) {
+        bytes[0x4c] = control[0x4c]; // register count
+    }
     // The control section's own length differs between containers: zero that word.
     if (count > LENGTH_WORD_OFFSET) {
         std::memset(bytes.data() + LENGTH_WORD_OFFSET, 0,
                     std::min<size_t>(sizeof(u32), count - LENGTH_WORD_OFFSET));
     }
-    const u64 control_hash = Common::CityHash64(reinterpret_cast<const char*>(bytes.data()), count);
+    u64 control_hash = Common::CityHash64(reinterpret_cast<const char*>(bytes.data()), count);
+    if (count > 0x56 && bytes[0x56] == STAGE_COMPUTE) {
+        constexpr std::array<size_t, 7> COMPUTE_FIELDS{0xa9, 0xb1, 0xb2, 0xb3, 0xb6, 0xba, 0xbb};
+        std::array<u8, COMPUTE_FIELDS.size() + 1> layout{};
+        layout.back() = control.size() >= VC::ComputeControlBytes;
+        for (size_t i = 0; i < COMPUTE_FIELDS.size(); ++i) {
+            if (COMPUTE_FIELDS[i] < control.size()) {
+                layout[i] = control[COMPUTE_FIELDS[i]];
+            }
+        }
+        control_hash = Common::CityHash64WithSeed(reinterpret_cast<const char*>(layout.data()),
+                                                  layout.size(), control_hash);
+    }
     const u64 hash = Common::CityHash64WithSeed(reinterpret_cast<const char*>(code.data()),
                                                 code.size(), control_hash);
     return hash != 0 ? hash : 1;

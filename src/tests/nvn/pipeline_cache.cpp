@@ -378,7 +378,7 @@ TEST_CASE("HashProgramStage depends on code and the hashed control bytes only", 
     const u64 base = HashOf(control, code);
     REQUIRE(base != 0);
 
-    SECTION("bytes outside 0x00..0x47 and 0x50..0x6b are ignored") {
+    SECTION("unused bytes are ignored for graphics stages") {
         auto changed = control;
         for (const size_t offset : {size_t{0x48}, size_t{0x4F}, size_t{0x6C}, size_t{0xFF}}) {
             changed[offset] ^= 0xFF;
@@ -387,6 +387,11 @@ TEST_CASE("HashProgramStage depends on code and the hashed control bytes only", 
         // The control section's length differs between containers: a longer section hashes the same
         // as long as the hashed bytes are equal.
         REQUIRE(HashOf(std::vector<u8>(control.begin(), control.begin() + 0x6C), code) == base);
+    }
+    SECTION("the register count matters") {
+        auto changed = control;
+        changed[0x4c] ^= 1;
+        REQUIRE(HashOf(changed, code) != base);
     }
     SECTION("the compute fields at +0x50..+0x6b matter") {
         // Per-warp local memory (0x50), thread group (0x58..0x63) and shared memory (0x64) change
@@ -426,6 +431,22 @@ TEST_CASE("HashProgramStage depends on code and the hashed control bytes only", 
         REQUIRE(HashOf(PatternBytes(0x30, 1), code) != 0);
         REQUIRE(HashOf(PatternBytes(0x33, 1), code) != HashOf(PatternBytes(0x30, 1), code));
     }
+}
+
+TEST_CASE("Shader cache identity includes the compute driver bank layout",
+          "[nvn][shader-refresh]") {
+    std::vector<u8> control(VC::ComputeControlBytes, 0);
+    control[0x56] = static_cast<u8>(VC::ShaderStage::Compute);
+    const std::vector<u8> code = PatternBytes(0x100, 9);
+    const u64 base = HashOf(control, code);
+    for (const size_t offset : {0xa9, 0xb1, 0xb2, 0xb3, 0xb6, 0xba, 0xbb}) {
+        INFO("control offset " << offset);
+        auto changed = control;
+        changed[offset] = 1;
+        CHECK(HashOf(changed, code) != base);
+    }
+    // A missing counts table must not poison a valid program's lowered/pipeline cache entry.
+    CHECK(HashOf(std::vector<u8>(control.begin(), control.begin() + 0x6c), code) != base);
 }
 
 TEST_CASE("MaySkipUnbuiltDraw follows the emulated path's async skip rule", "[nvn]") {
@@ -2205,6 +2226,28 @@ PipelineCacheOptions AsyncOptions(bool async) {
 }
 
 } // Anonymous namespace
+
+TEST_CASE("Compute shader cache separates identical code with different bank layouts",
+          "[nvn][shader-refresh]") {
+    const auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    PipelineCache cache{*vulkan->device, {}};
+    const TestProgram plain = MakeAddProgram(5, 42);
+    TestProgram with_uniform = plain;
+    with_uniform.control[0xb1] = 1;
+    PutWord(with_uniform.control, 0xba, 0x20);
+    with_uniform.hash = HashProgramStage(with_uniform.control, with_uniform.code);
+    REQUIRE(plain.code == with_uniform.code);
+    const auto first = cache.GetCompute(MakeComputeRequest(plain, nullptr));
+    const auto second = cache.GetCompute(MakeComputeRequest(with_uniform, nullptr));
+    REQUIRE(first != nullptr);
+    REQUIRE(second != nullptr);
+    CHECK(first != second);
+    CHECK(cache.Stats().lowered_programs == 2);
+    CHECK(cache.GetCompute(MakeComputeRequest(plain, nullptr)) == first);
+}
 
 TEST_CASE("TextureOracle cannot be frozen unless it says so", "[nvn]") {
     const UnfreezableOracle oracle;
