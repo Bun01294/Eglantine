@@ -2500,6 +2500,37 @@ TEST_CASE("Async compile: the shader notifier counts queued and running compiles
     REQUIRE(cache.Stats().async_queued == 2);
 }
 
+TEST_CASE("Graphics lookahead builds the next pipeline without skipping a draw",
+          "[nvn][pipeline-lookahead]") {
+    const auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    auto options = AsyncOptions(false);
+    options.prefetch_graphics = true;
+    PipelineCache cache{*vulkan->device, options};
+    const auto vertex = MakeAddProgram(0, 12);
+    const auto fragment = MakeTexturedFragment();
+    FreezableOracle oracle;
+    const auto first = MakeGraphicsRequest(vertex, fragment, &oracle);
+    auto next = first;
+    next.targets.color[0] = VK_FORMAT_R32_UINT;
+    REQUIRE(cache.GetGraphics(first, nullptr, [&](u64 current_key) {
+        cache.PrefetchGraphics(first, current_key);
+        cache.PrefetchGraphics(next, current_key);
+        cache.PrefetchGraphics(next, current_key);
+    }));
+    bool waiting = true;
+    REQUIRE(cache.GetGraphics(next, &waiting));
+    CHECK_FALSE(waiting);
+    cache.Flush();
+    const auto stats = cache.Stats();
+    CHECK(stats.compiled_at_runtime == 2);
+    CHECK(stats.prefetch_queued == 1);
+    CHECK(stats.prefetch_used == 1);
+    CHECK(stats.async_not_ready == 0);
+}
+
 TEST_CASE("Async compile off: nothing is counted as building", "[nvn]") {
     const auto vulkan = MakeHeadlessVulkan();
     if (!vulkan) {

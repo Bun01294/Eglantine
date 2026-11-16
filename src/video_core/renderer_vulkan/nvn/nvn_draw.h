@@ -218,6 +218,10 @@ public:
     [[nodiscard]] virtual std::span<const u64> HostRecordsAhead() {
         return {};
     }
+    /// Following command lists in the current submission, sharing its descriptor snapshots.
+    [[nodiscard]] virtual std::span<const std::vector<u64>> HostFollowingLists() {
+        return {};
+    }
     /// Diagnostics (EDEN_NX2_NVN_DUMP_TARGETS): records a copy of one subresource of `storage`
     /// into a host buffer that is written as a TGA when the submission completes (outside a pass).
     virtual void HostDumpImage(Storage& storage, u32 level, u32 layer, VkImageAspectFlags aspect,
@@ -691,6 +695,8 @@ private:
     bool MaskedColorClear(const VC::ClearColorPayload& p, VkRect2D rect, bool gated);
     bool MaskedStencilClear(const VC::ClearDepthStencilPayload& p, VkRect2D rect, bool gated);
     [[nodiscard]] RenderPassKey MakePassKey() const;
+    [[nodiscard]] std::optional<RenderPassKey> LookaheadPassKey(
+        const VC::RecordHeader* header) const;
     [[nodiscard]] bool TargetsUsable() const;
     /// True when the game bound no colour and no depth target (an attachment-less pass).
     [[nodiscard]] bool NamesNoTarget() const;
@@ -702,8 +708,14 @@ private:
     /// (PipelineCacheOptions::async_compile) and the draw may be skipped (MaySkipUnbuiltDraw);
     /// such a draw that may not be skipped waits for the compile. Null without it: it cannot be
     /// built.
+    struct PipelineLookahead {
+        u64 skip_key;
+        RenderPassKey targets;
+    };
     std::shared_ptr<GraphicsPipeline> ResolvePipeline(u32 mode, u32 element_count,
-                                                      bool& awaiting_async);
+                                                      bool& awaiting_async,
+                                                      const PipelineLookahead* lookahead = nullptr);
+    void PrefetchUpcomingGraphics(u32 current_mode, u64 current_key);
     void ApplyDynamicState(const GraphicsPipeline& pipeline);
 
     // ---- descriptors (nvn_draw_descriptors.cpp) ----

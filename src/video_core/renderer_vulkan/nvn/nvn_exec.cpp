@@ -325,6 +325,12 @@ public:
         return next_record < current_list.size() ? current_list.subspan(next_record)
                                                  : std::span<const u64>{};
     }
+    std::span<const std::vector<u64>> HostFollowingLists() override {
+        if (lookahead_submission == nullptr) {
+            return {};
+        }
+        return std::span{lookahead_submission->lists}.subspan(lookahead_list + 1);
+    }
     void HostUploadRange(Pool& pool, u64 offset, u64 size) override {
         UploadRange(pool, offset, size);
     }

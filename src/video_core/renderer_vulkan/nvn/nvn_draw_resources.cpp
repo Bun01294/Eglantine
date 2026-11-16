@@ -12,6 +12,7 @@
 
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
+#include "common/game_presets.h"
 #include "common/logging.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
@@ -168,6 +169,7 @@ void DrawResources::OpenCache(u64 title_id) {
     PipelineCacheOptions options;
     options.title_id = title_id;
     options.revision = Common::g_scm_rev;
+    options.prefetch_graphics = title_id == Settings::MarioKartWorldProgramId && !shader_refresh;
     options.async_compile = !shader_refresh && Settings::values.use_asynchronous_shaders.GetValue();
     options.graphics_pipeline_library = Settings::values.nvn_pipeline_library.GetValue();
     options.sync_diet = Settings::values.nvn_sync_diet.GetValue();

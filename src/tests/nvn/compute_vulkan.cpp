@@ -972,6 +972,81 @@ TEST_CASE("NVN storage shadow: a render pass writing a storage range reaches the
     }
 }
 
+TEST_CASE("MKW graphics lookahead preserves live attachments across passes and lists",
+          "[nvn][pipeline-lookahead]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    FakeMemory memory;
+    u8* data = memory.Add(POOL_VA, 64_KiB);
+    memory.Add(TEXTURE_POOL_VA, 1_MiB);
+    Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr,
+                                 {.early_submit = false});
+    context.SetTitleId(Settings::MarioKartWorldProgramId);
+    context.SetGuestMemory(&memory);
+    context.CreatePool({.serial = 1, .guest_address = POOL_VA, .size = 64_KiB,
+                        .flags = POOL_CPU_CACHED});
+    context.CreatePool({.serial = 2, .guest_address = TEXTURE_POOL_VA, .size = 1_MiB,
+                        .flags = 1 /* CPU_NO_ACCESS */});
+    VC::TextureDesc target{};
+    target.target = 1;
+    target.format = 0x25;
+    target.width = 16;
+    target.height = 16;
+    target.depth = 1;
+    target.levels = 1;
+    target.serial = 10;
+    target.pool_serial = 2;
+    context.CreateTexture(target);
+    target.format = 0x0B; // R32UI
+    target.serial = 11;
+    target.pool_offset = 64_KiB;
+    context.CreateTexture(target);
+    context.CreateProgram(MakeVertexProgram(VERTEX_PROGRAM, StoreProgram(0, 0x1337)));
+
+    const auto bind_target = [](std::vector<u64>& list, u64 serial) {
+        const VC::RenderTargetRef color{.texture = {.serial = serial}};
+        Push(list, VC::Op::SetRenderTargets, VC::SetRenderTargetsPayload{1, 0},
+             {reinterpret_cast<const u8*>(&color), sizeof(color)});
+    };
+    const auto draw = [](std::vector<u64>& list) {
+        Push(list, VC::Op::Draw, VC::DrawPayload{.mode = 4, .count = 3, .instance_count = 1});
+    };
+    std::vector<u64> first;
+    bind_target(first, 10);
+    Push(first, VC::Op::SetRasterizerDiscard, VC::EnablePayload{.enable = 1});
+    Push(first, VC::Op::BindProgram,
+         VC::BindProgramPayload{.program_serial = VERTEX_PROGRAM, .stages = 1});
+    const VC::BufferRange range{POOL_VA + 0x1000, 4096};
+    Push(first, VC::Op::BindStorageBuffers,
+         VC::BindBuffersPayload{.stage = 0, .first = 0, .count = 1},
+         {reinterpret_cast<const u8*>(&range), sizeof(range)});
+    draw(first);
+    PushEnd(first);
+    auto submission = MakeSubmission(1, std::move(first), {VERTEX_PROGRAM, 10, 11, 1, 2});
+
+    auto& next = submission.lists.emplace_back();
+    bind_target(next, 11);
+    Push(next, VC::Op::ClearColor,
+         VC::ClearColorPayload{.index = 0, .mask = 0xF, .is_integer = 1, .color = {0x1234}});
+    draw(next);
+    bind_target(next, 10);
+    draw(next);
+    VC::CopyBufferTexturePayload readback{};
+    readback.buffer = POOL_VA + 0x2000;
+    readback.texture = {.serial = 11};
+    readback.region = {0, 0, 0, 1, 1, 1};
+    Push(next, VC::Op::CopyTextureToBuffer, readback);
+    PushEnd(next);
+    context.Submit(std::move(submission));
+    REQUIRE(context.Wait(1, 60s));
+    CHECK(context.Stats().ops_failed == 0);
+    CHECK(context.Stats().ops_unsupported == 0);
+    CHECK(WordAt(data, 0x1000) == 0x1337);
+    CHECK(WordAt(data, 0x2000) == 0x1234);
+}
+
 TEST_CASE("NVN draw: vertex programs read the draw's base instance from c0[0x644]",
           "[nvn][compute]") {
     // OoT's text vertex program (f1f183d55f7989b9) indexes its glyph records with

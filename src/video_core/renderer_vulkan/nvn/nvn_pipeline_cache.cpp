@@ -27,6 +27,7 @@
 #include "common/cityhash.h"
 #include "common/frame_stats.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/diag_request.h"
 #include "common/thread.h"
@@ -390,6 +391,10 @@ void PipelineCache::Impl::LogCounts() const {
                  "running at once, first job queued to last job done {} ms",
                  async_worker_count, stat_async_peak.load(), span_ms);
     }
+    if (options.prefetch_graphics) {
+        LOG_INFO(Render_Vulkan, "[nvn] graphics lookahead: {} compiles queued, {} pipelines used",
+                 stat_prefetch_queued.load(), stat_prefetch_used.load());
+    }
     if (GplEnabled()) {
         LOG_INFO(Render_Vulkan,
                  "[nvn] pipeline libraries: {} fast links ({} from parts compiled already), {} "
@@ -549,9 +554,8 @@ PipelineCache::Impl::Impl(const Device& device_, PipelineCacheOptions options_)
             workers.reset(new Common::ThreadWorker(threads, "NvnPipelineLoader", {},
                                                    Common::ThreadPlacement::Background));
         }
-        loader = std::jthread([this](std::stop_token stop) { RunLoader(stop); });
     }
-    if (options.async_compile) {
+    if (options.async_compile || options.prefetch_graphics) {
         // Run-time compiles block draws that cannot be skipped by the preload, so they run at
         // normal priority on their own threads (the preload workers are a background queue).
         const s64 hw = static_cast<s64>(std::thread::hardware_concurrency());
@@ -588,6 +592,10 @@ PipelineCache::Impl::Impl(const Device& device_, PipelineCacheOptions options_)
                         "VK_EXT_graphics_pipeline_library with fast linking: pipelines are "
                         "compiled whole");
         }
+    }
+    // RunLoader can inspect the GPL state as soon as it starts.
+    if (disk) {
+        loader = std::jthread([this](std::stop_token stop) { RunLoader(stop); });
     }
     // The counts line is printed once the preload finished (RunLoader), whenever the stats
     // thread collects rows and changed counts, and at destruction.
@@ -680,6 +688,8 @@ PipelineCacheStats PipelineCache::Impl::Stats() const {
     stats.async_not_ready = stat_async_not_ready;
     stats.preload_waits = stat_wait_count;
     stats.preload_wait_ns = stat_wait_ns;
+    stats.prefetch_queued = stat_prefetch_queued;
+    stats.prefetch_used = stat_prefetch_used;
     stats.gpl_fast_links = stat_gpl_fast_links;
     stats.gpl_cached_links = stat_gpl_cached_links;
     stats.gpl_translations_reused = stat_gpl_reused;
@@ -839,6 +849,11 @@ Shader::RuntimeInfo PipelineCache::Impl::MakeRuntimeInfo(
 }
 
 bool PipelineCache::Impl::Translate(const TranslateInput& in, TranslateOutput& out) {
+    const auto reject = [&](u64 hash, u32 stage, std::string_view phase, std::string_view why) {
+        if (!in.speculative) {
+            Reject(hash, stage, phase, why);
+        }
+    };
     const bool is_compute = in.translation == nullptr;
     struct PoolGuard {
         VC::NvnShaderPools& pools;
@@ -899,7 +914,7 @@ bool PipelineCache::Impl::Translate(const TranslateInput& in, TranslateOutput& o
         lowered_programs[stage] = GetLowered(source, stage);
         const auto& lowered_program = lowered_programs[stage].program;
         if (!lowered_program || !lowered_program->error.empty()) {
-            Reject(source.hash, stage, "lower",
+            reject(source.hash, stage, "lower",
                    lowered_program ? lowered_program->error : std::string{"no result"});
             return false;
         }
@@ -917,19 +932,19 @@ bool PipelineCache::Impl::Translate(const TranslateInput& in, TranslateOutput& o
             programs[stage] = VC::TranslateNvnStage(ThreadPools(), *environments[stage],
                                                     current_host_info);
         } catch (const Shader::NotImplementedException& e) {
-            Reject(source.hash, stage, phase, std::string{"NotImplemented: "} + e.what());
+            reject(source.hash, stage, phase, std::string{"NotImplemented: "} + e.what());
             return false;
         } catch (const Shader::LogicError& e) {
-            Reject(source.hash, stage, phase, std::string{"Logic: "} + e.what());
+            reject(source.hash, stage, phase, std::string{"Logic: "} + e.what());
             return false;
         } catch (const Shader::RuntimeError& e) {
-            Reject(source.hash, stage, phase, std::string{"Runtime: "} + e.what());
+            reject(source.hash, stage, phase, std::string{"Runtime: "} + e.what());
             return false;
         } catch (const Shader::InvalidArgument& e) {
-            Reject(source.hash, stage, phase, std::string{"InvalidArgument: "} + e.what());
+            reject(source.hash, stage, phase, std::string{"InvalidArgument: "} + e.what());
             return false;
         } catch (const std::exception& e) {
-            Reject(source.hash, stage, phase, std::string{"Exception: "} + e.what());
+            reject(source.hash, stage, phase, std::string{"Exception: "} + e.what());
             return false;
         }
         if (ShaderLog::Enabled()) {
@@ -944,7 +959,7 @@ bool PipelineCache::Impl::Translate(const TranslateInput& in, TranslateOutput& o
                       "replay");
         }
         if (const std::string limit = MeshLimitExceeded(device, programs[stage]); !limit.empty()) {
-            Reject(source.hash, stage, "limits", limit);
+            reject(source.hash, stage, "limits", limit);
             return false;
         }
     }
@@ -962,7 +977,7 @@ bool PipelineCache::Impl::Translate(const TranslateInput& in, TranslateOutput& o
         layout = VC::BuildDescriptorLayout(infos,
                                            VC::LayoutOptions{profile.support_descriptor_aliasing});
     } catch (const std::exception& e) {
-        Reject(in.programs[order[0]]->hash, order[0], "layout", e.what());
+        reject(in.programs[order[0]]->hash, order[0], "layout", e.what());
         return false;
     }
 
@@ -1000,16 +1015,16 @@ bool PipelineCache::Impl::Translate(const TranslateInput& in, TranslateOutput& o
             program.info.raw_coverage_program = program.info.raw_coverage ? source.hash : 0;
             spirv = EmitSPIRV(translation_profile, runtime_info, program, bindings);
         } catch (const Shader::NotImplementedException& e) {
-            Reject(source.hash, stage, "emit", std::string{"NotImplemented: "} + e.what());
+            reject(source.hash, stage, "emit", std::string{"NotImplemented: "} + e.what());
             return false;
         } catch (const Shader::LogicError& e) {
-            Reject(source.hash, stage, "emit", std::string{"Logic: "} + e.what());
+            reject(source.hash, stage, "emit", std::string{"Logic: "} + e.what());
             return false;
         } catch (const Shader::RuntimeError& e) {
-            Reject(source.hash, stage, "emit", std::string{"Runtime: "} + e.what());
+            reject(source.hash, stage, "emit", std::string{"Runtime: "} + e.what());
             return false;
         } catch (const std::exception& e) {
-            Reject(source.hash, stage, "emit", std::string{"Exception: "} + e.what());
+            reject(source.hash, stage, "emit", std::string{"Exception: "} + e.what());
             return false;
         }
         if (stage == STAGE_GEOMETRY) {
@@ -1018,7 +1033,7 @@ bool PipelineCache::Impl::Translate(const TranslateInput& in, TranslateOutput& o
             const u32 limit = device.GetPhysical().GetProperties().limits.maxGeometryInputComponents;
             const u32 components = GeometryInputComponents(program, runtime_info);
             if (components > limit) {
-                Reject(source.hash, stage, "limits",
+                reject(source.hash, stage, "limits",
                        fmt::format("geometry stage exceeds maxGeometryInputComponents ({} > {})",
                                    components, limit));
                 return false;
@@ -1210,7 +1225,7 @@ void PipelineCache::Impl::RunAsyncGraphics(AsyncGraphicsJob& job) {
     std::shared_ptr<GraphicsPipeline> pipeline;
     if (!stopping.load()) {
         try {
-            pipeline = CompileGraphics(job.request, job.key, job.had_variants);
+            pipeline = CompileGraphics(job.request, job.key, job.had_variants, job.speculative);
         } catch (const std::exception& e) {
             ++stat_failures;
             NoteRow(fmt::format("pipeline: async compile failed: {}", FirstLine(e.what())));
@@ -1218,7 +1233,7 @@ void PipelineCache::Impl::RunAsyncGraphics(AsyncGraphicsJob& job) {
             ++stat_failures;
             NoteRow("pipeline: async compile failed: unknown exception");
         }
-        if (!pipeline) {
+        if (!pipeline && !job.speculative) {
             ++stat_async_failed;
             std::scoped_lock lock{pipeline_mutex};
             failed_graphics.insert(job.key);
@@ -1230,7 +1245,8 @@ void PipelineCache::Impl::RunAsyncGraphics(AsyncGraphicsJob& job) {
 }
 
 std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::GetGraphics(const GraphicsRequest& source,
-                                                                   bool* not_ready, u64& key_hash) {
+    bool* not_ready, u64& key_hash, const std::function<void(u64)>& look_ahead,
+    std::optional<u64> prefetch_skip) {
     if (not_ready != nullptr) {
         *not_ready = false;
     }
@@ -1250,12 +1266,25 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::GetGraphics(const Graphic
     key.Finalize();
     key_hash = key.hash;
 
+    const bool prefetch = prefetch_skip.has_value();
+    if (prefetch && (key_hash == *prefetch_skip || !options.prefetch_graphics ||
+                     !loader_queued.load(std::memory_order_acquire))) {
+        return nullptr;
+    }
+    if (prefetch) {
+        // Bound speculative work so a later frame cannot build up a backlog behind it.
+        std::scoped_lock lock{async_mutex};
+        if (async_outstanding >= async_worker_count) {
+            return nullptr;
+        }
+    }
+
     // A draw that may be skipped (`not_ready`) with asynchronous shaders on is compiled on the
     // workers, the GPL path included: translating, compiling the library parts and linking all
     // run there, and the draw waits for the pipeline like the default path's. Any other lookup
     // (a draw that must not be skipped, asynchronous shaders off) builds on this thread.
     const bool gpl = GplEnabled();
-    const bool async = AsyncEnabled(not_ready);
+    const bool async = prefetch || AsyncEnabled(not_ready);
     // Read before the search: once the preload has registered every cached key, a miss below is
     // not about to be delivered by it, so the key may be compiled instead of waited for.
     const bool preload_registered = !async || loader_queued.load(std::memory_order_acquire);
@@ -1269,6 +1298,9 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::GetGraphics(const Graphic
         if (const auto it = graphics.find(key); it != graphics.end()) {
             for (const auto& candidate : it->second) {
                 if (candidate->QueriesMatch(oracle)) {
+                    if (!prefetch && candidate->prefetched_unused.exchange(false)) {
+                        ++stat_prefetch_used;
+                    }
                     return candidate;
                 }
             }
@@ -1283,6 +1315,7 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::GetGraphics(const Graphic
                 // Claimed under the same lock as the search: no other lookup or finished worker
                 // can slip in between.
                 claim = std::make_shared<PendingKey>();
+                claim->speculative = prefetch;
                 claim->outstanding = 1;
                 pending_graphics.emplace(key, claim);
             }
@@ -1297,16 +1330,24 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::GetGraphics(const Graphic
     }
     if (async) {
         if (!preload_registered || pending) {
-            *not_ready = true;
-            NoteNotReady("draw", key.hashes);
+            if (!prefetch) {
+                *not_ready = true;
+                NoteNotReady("draw", key.hashes);
+            }
             return nullptr;
         }
         if (failed) {
-            NoteRow("pipeline: draw skipped, the pipeline was rejected earlier");
+            if (!prefetch) {
+                NoteRow("pipeline: draw skipped, the pipeline was rejected earlier");
+            }
             return nullptr;
         }
+        SCOPE_EXIT {
+            if (claim) {
+                ReleasePending(pending_graphics, key, claim);
+            }
+        };
         if (AnyStageRejected(key.hashes)) {
-            ReleasePending(pending_graphics, key, claim);
             return nullptr;
         }
         u32 stage_mask = 0;
@@ -1317,10 +1358,11 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::GetGraphics(const Graphic
         }
         std::unique_ptr<TextureOracle> frozen = oracle.Freeze(stage_mask);
         if (!frozen) {
+            if (prefetch) {
+                return nullptr;
+            }
             // An oracle that cannot be copied cannot be used by a worker: compile here.
-            auto result = CompileGraphics(request, key, had_variants);
-            ReleasePending(pending_graphics, key, claim);
-            return result;
+            return CompileGraphics(request, key, had_variants);
         }
         auto job = std::make_shared<AsyncGraphicsJob>();
         job->request.state = request.state;
@@ -1343,12 +1385,24 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::GetGraphics(const Graphic
         job->request.oracle = job->oracle.get();
         job->key = key;
         job->had_variants = had_variants;
-        job->pending = std::move(claim);
+        job->speculative = prefetch;
+        job->pending = claim;
         AsyncQueued();
+        try {
+            async_workers->QueueWork([this, job] { RunAsyncGraphics(*job); });
+        } catch (...) {
+            AsyncDone();
+            throw;
+        }
+        claim.reset();
         ++stat_async_queued;
-        async_workers->QueueWork([this, job] { RunAsyncGraphics(*job); });
-        *not_ready = true;
-        NoteNotReady("draw", key.hashes);
+        if (prefetch) {
+            ++stat_prefetch_queued;
+        }
+        if (!prefetch) {
+            *not_ready = true;
+            NoteNotReady("draw", key.hashes);
+        }
         return nullptr;
     }
     // A miss while the loader is still registering the cached pipelines: wait for it, then
@@ -1359,7 +1413,29 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::GetGraphics(const Graphic
             return hit;
         }
     }
+    bool scanned_ahead = false;
+    const auto scan_ahead = [&] {
+        if (scanned_ahead || failed || !options.prefetch_graphics || !look_ahead) {
+            return;
+        }
+        {
+            std::scoped_lock lock{async_mutex};
+            if (async_outstanding >= async_worker_count) {
+                return;
+            }
+        }
+        scanned_ahead = true;
+        try {
+            look_ahead(key_hash);
+        } catch (const std::exception& error) {
+            NoteIssue(fmt::format("pipeline: graphics lookahead failed: {}", FirstLine(error.what())));
+        }
+    };
     if (pending) {
+        // Keep the other workers busy while replay waits for this speculative build.
+        if (pending->speculative) {
+            scan_ahead();
+        }
         const auto wait_start = std::chrono::steady_clock::now();
         WaitPending(pending);
         NoteWait(wait_start);
@@ -1370,6 +1446,9 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::GetGraphics(const Graphic
     if (failed) {
         NoteRow("pipeline: draw skipped, the pipeline was rejected earlier");
         return nullptr;
+    }
+    if (!had_variants) {
+        scan_ahead();
     }
     auto result = CompileGraphics(request, key, had_variants);
     if (!result && gpl) {
@@ -1412,7 +1491,7 @@ void PipelineCache::Impl::LogRuntimeCompile(const GraphicsKey& key, bool had_var
 }
 
 std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::CompileGraphics(
-    const GraphicsRequest& request, const GraphicsKey& key, bool had_variants) {
+    const GraphicsRequest& request, const GraphicsKey& key, bool had_variants, bool speculative) {
     const auto start = std::chrono::steady_clock::now();
     CompileFailureNote failure{*this, key.hash};
     if (AnyStageRejected(key.hashes)) {
@@ -1430,6 +1509,7 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::CompileGraphics(
     const TranslationState translation_state = MakeTranslationState(
         request.state, request.targets, vertex_input_mode, must_emulate_scaled_formats);
     TranslateInput input;
+    input.speculative = speculative;
     input.translation = &translation_state;
     input.oracle = request.oracle != nullptr ? request.oracle : &DEFAULT_ORACLE;
     for (u32 stage = 0; stage < GRAPHICS_STAGE_COUNT; ++stage) {
@@ -1504,6 +1584,7 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::CompileGraphics(
                                .count(),
                            static_cast<u32>(variants.size()));
         }
+        pipeline->prefetched_unused = speculative;
         variants.push_back(pipeline);
     }
     failure.armed = false;
@@ -1517,7 +1598,8 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::CompileGraphics(
     if (pipeline->fast_linked) {
         QueueOptimize(pipeline, gpl_set, request.state, request.targets);
     }
-    NoteCompileTime(!gpl_set                 ? "graphics"
+    NoteCompileTime(speculative             ? "graphics prefetch"
+                    : !gpl_set               ? "graphics"
                     : pipeline->fast_linked ? "graphics fast-linked"
                                             : "graphics whole (gpl)",
                     key.hash, start, create_start - translate_start, create_end - create_start);
@@ -1753,12 +1835,17 @@ PipelineCache::PipelineCache(const Device& device, PipelineCacheOptions options)
 
 PipelineCache::~PipelineCache() = default;
 
+void PipelineCache::PrefetchGraphics(const GraphicsRequest& request, u64 current_key) {
+    u64 key_hash{};
+    (void)impl->GetGraphics(request, nullptr, key_hash, {}, current_key);
+}
+
 std::shared_ptr<GraphicsPipeline> PipelineCache::GetGraphics(const GraphicsRequest& request,
-                                                             bool* not_ready) {
+    bool* not_ready, const std::function<void(u64)>& look_ahead) {
     const auto begin = Common::FrameStats::Enabled() ? std::chrono::steady_clock::now()
                                                      : std::chrono::steady_clock::time_point{};
     u64 key_hash{};
-    auto result = impl->GetGraphics(request, not_ready, key_hash);
+    auto result = impl->GetGraphics(request, not_ready, key_hash, look_ahead);
     if (Common::FrameStats::Enabled()) {
         const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - begin)

@@ -34,6 +34,7 @@
 #include <atomic>
 #include <cstddef>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -353,6 +354,7 @@ struct GraphicsPipeline : PipelineBase {
     /// `optimized_handle`, and draws recorded from then on bind it. `pipeline` stays alive (draws
     /// in flight may use it) until the pipeline is destroyed.
     bool fast_linked{};
+    std::atomic<bool> prefetched_unused{};
     vk::Pipeline optimized;
     std::atomic<VkPipeline> optimized_handle{VK_NULL_HANDLE};
 
@@ -400,6 +402,8 @@ struct PipelineCacheOptions {
     /// GetCompute get "not ready" until the compile finished and skip the draw/dispatch, and a
     /// lookup that meets a preload still in flight does not wait for it either.
     bool async_compile{false};
+    /// Compile upcoming graphics state on workers while replay builds the current pipeline.
+    bool prefetch_graphics{false};
     /// The nvn_pipeline_library setting: graphics pipelines are built from
     /// VK_EXT_graphics_pipeline_library parts (vertex input, pre-rasterization shaders, fragment
     /// shader, fragment output) that are compiled once and fast-linked, then compiled whole in
@@ -441,6 +445,8 @@ struct PipelineCacheStats {
     u64 async_not_ready{};     ///< lookups answered "not ready" (a draw/dispatch was skipped)
     u64 preload_waits{};       ///< synchronous lookups that waited for the preload or a pending key
     u64 preload_wait_ns{};     ///< ... and the total time they waited
+    u64 prefetch_queued{};
+    u64 prefetch_used{};
     u64 gpl_fast_links{};      ///< GPL path: pipelines fast-linked from libraries
     u64 gpl_cached_links{};    ///< ... of which every library was compiled already
     u64 gpl_translations_reused{}; ///< GPL path: pipelines built from an earlier translation
@@ -474,7 +480,9 @@ public:
     /// path (`UsesGraphicsPipelineLibrary`) too: it translates, compiles the missing library
     /// parts and fast-links on the calling thread.
     [[nodiscard]] std::shared_ptr<GraphicsPipeline> GetGraphics(const GraphicsRequest& request,
-                                                                bool* not_ready = nullptr);
+                                                                bool* not_ready = nullptr,
+                const std::function<void(u64)>& look_ahead = {});
+    void PrefetchGraphics(const GraphicsRequest& request, u64 current_key);
     [[nodiscard]] std::shared_ptr<ComputePipeline> GetCompute(const ComputeRequest& request,
                                                               bool* not_ready = nullptr);
     /// Shader log only (call when `ShaderLog::Enabled()`): the compute program of `request` was
