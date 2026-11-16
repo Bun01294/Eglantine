@@ -2668,7 +2668,6 @@ bool Recorder::RecordBcUpload(Storage& s, std::span<const BcChunk> chunks, bool 
             .layers = s.layers,
             .levels = s.levels,
             .format = s.desc.format,
-            .bytes = s.vram_bytes,
             .kind = AstcStandinName(kind),
         });
         Cmd().WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *times->pool, query);
@@ -2752,6 +2751,9 @@ bool Recorder::RecordBcUpload(Storage& s, std::span<const BcChunk> chunks, bool 
         };
         Cmd().CopyBufferToImage(*scratch->blocks, *s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                 region);
+        if (times) {
+            times->uploads[query / 2].bytes += blocks_size;
+        }
         recorded = true;
     }
     if (times) {
