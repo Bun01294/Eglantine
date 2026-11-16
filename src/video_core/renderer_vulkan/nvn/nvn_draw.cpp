@@ -1158,9 +1158,7 @@ bool DrawContext::BeginPass() {
             // Drawing at the guest size into an image whose twin may be the newer one.
             host->HostMakeNativeCurrent(*attachment.storage);
         }
-        // A render target is written before it is read in nearly every case: its stale guest bytes
-        // are not uploaded (this also creates the lazy image).
-        if (!host->HostEnsureContents(*attachment.storage, true)) {
+        if (!host->HostEnsureAttachmentContents(*attachment.storage)) {
             host->HostFailed("SetRenderTargets", fmt::format("no image for render target {:#x}",
                                                              attachment.texture->serial));
             return false;

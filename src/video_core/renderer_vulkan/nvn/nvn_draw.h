@@ -138,11 +138,14 @@ public:
     virtual void HostTransition(Storage& storage, VkImageLayout layout) = 0;
     /// The same for several images in one barrier call; records nothing when all are in layout
     /// (the caller flushes the pending barrier itself).
-    virtual void HostTransitionMany(std::span<const std::pair<Storage*, VkImageLayout>> images) = 0;
+    virtual void HostTransitionMany(std::span<const std::pair<Storage*, VkImageLayout>> images,
+                                    bool track_writes = true) = 0;
+    virtual void HostNoteImageWrite(Storage& storage) = 0;
     virtual void HostNoteTouched(const std::shared_ptr<Storage>& storage) = 0;
     /// Creates the image and loads the guest contents on first use (outside a render pass only).
     /// False: the image could not be created (the op must be dropped).
     virtual bool HostEnsureContents(Storage& storage, bool will_overwrite) = 0;
+    virtual bool HostEnsureAttachmentContents(Storage& storage) = 0;
     /// True when HostEnsureContents(storage, false) would record commands (first upload, CPU
     /// change, overlapping writes); creates the image. Safe inside a render pass.
     virtual bool HostNeedsCommands(Storage& storage, bool will_overwrite) = 0;

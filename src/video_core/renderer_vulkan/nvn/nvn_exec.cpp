@@ -187,8 +187,8 @@ public:
     /// EDEN_NX2_NVN_WATCH: copies the watched range back for a log line at completion (outside a
     /// pass).
     void WatchSnapshot(std::string tag, u64 peek_address = 0, u32 size_override = 0);
-    void RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>& generated,
-                       const VideoCommon::Nvn::PresentCrop& window_crop);
+    [[nodiscard]] bool RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>& generated,
+                                     const VideoCommon::Nvn::PresentCrop& window_crop);
     /// Copies the present source into the context's scratch image in its raw (UNORM) format. On
     /// return the image is in the TRANSFER_SRC layout, or in GENERAL with a sampled view
     /// (`sampled`: the presentation passes read it).
@@ -289,10 +289,14 @@ public:
         const std::pair<Storage*, VkImageLayout> image{&storage, layout};
         PrepareImagesSpan(std::span{&image, 1}, {}, true, true);
     }
-    void HostTransitionMany(std::span<const std::pair<Storage*, VkImageLayout>> images) override {
+    void HostTransitionMany(std::span<const std::pair<Storage*, VkImageLayout>> images,
+                            bool note_writes) override {
         // Every caller flushes the pending barrier itself after the transitions (before the
         // dispatch: HostFlushBarrierBeforeDispatch), so images already in layout record nothing.
-        PrepareImagesSpan(images, {}, false, true);
+        PrepareImagesSpan(images, {}, false, true, note_writes);
+    }
+    void HostNoteImageWrite(Storage& storage) override {
+        NoteGpuWrite(storage);
     }
     void HostNoteTouched(const std::shared_ptr<Storage>& storage) override {
         NoteTouched(storage);
@@ -300,6 +304,7 @@ public:
     bool HostEnsureContents(Storage& storage, bool will_overwrite) override {
         return EnsureContents(storage, will_overwrite);
     }
+    bool HostEnsureAttachmentContents(Storage& storage) override;
     bool HostNeedsCommands(Storage& storage, bool will_overwrite) override {
         storage.last_used_seq = flight.seq;
         storage.last_used_present = impl.stats.presents.load(std::memory_order_relaxed);
@@ -619,7 +624,7 @@ private:
     /// barrier. When none needs one: the pending barrier alone, unless `flush_if_none` is false.
     void PrepareImagesSpan(std::span<const std::pair<Storage*, VkImageLayout>> images,
                            std::span<const VkImageMemoryBarrier> extra = {},
-                           bool flush_if_none = true, bool defer = false);
+                           bool flush_if_none = true, bool defer = false, bool note_writes = true);
 
     StagingRange AllocStaging(u64 size, u64 alignment);
     void UploadRange(Pool& pool, u64 offset, u64 size);
@@ -1075,11 +1080,11 @@ void Recorder::NoteTouched(const std::shared_ptr<Storage>& storage) {
 
 void Recorder::PrepareImagesSpan(std::span<const std::pair<Storage*, VkImageLayout>> images,
                                  std::span<const VkImageMemoryBarrier> extra, bool flush_if_none,
-                                 bool defer) {
+                                 bool defer, bool note_writes) {
     std::vector<VkImageMemoryBarrier>& barriers = image_barriers;
     barriers.assign(extra.begin(), extra.end());
     for (const auto& [storage, layout] : images) {
-        if (track_writes && (layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL ||
+        if (note_writes && track_writes && (layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL ||
                              layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL ||
                              layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL ||
                              layout == VK_IMAGE_LAYOUT_GENERAL)) {
@@ -1778,6 +1783,38 @@ bool LegacyFirstUpload() {
 }
 
 } // Anonymous namespace
+
+bool Recorder::HostEnsureAttachmentContents(Storage& s) {
+    const bool fresh_color = impl.mario_kart_world && !s.contents_valid && !s.scale_owner &&
+                             !s.sparse && s.aspect == VK_IMAGE_ASPECT_COLOR_BIT &&
+                             (s.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0;
+    if (!EnsureContents(s, true)) {
+        return false;
+    }
+    if (!fresh_color) {
+        return true;
+    }
+    const auto block = FormatBlockInfo(s.desc.format);
+    if (block.width != 1 || block.height != 1) {
+        return true;
+    }
+    // The render pass loads the attachment. Preserve available guest contents and copy any newer
+    // GPU aliases over them. A fresh GPU-only image needs defined pixels under a partial draw.
+    if (CpuReadablePoolOf(impl, s) != nullptr) {
+        UploadStorage(s);
+    }
+    if (s.origin == StorageOrigin::None) {
+        const bool saved = std::exchange(track_writes, false);
+        PrepareImages({{&s, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
+        track_writes = saved;
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0,
+                                            VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+        Cmd().ClearColorImage(*s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, {}, range);
+        barrier_pending = true;
+    }
+    ResolveOverlaps(s);
+    return true;
+}
 
 void Recorder::NoteGpuWrite(Storage& s) {
     if (Storage* const owner = s.scale_owner) {
@@ -5459,7 +5496,7 @@ GpuProf::Tag Recorder::ProfTexture(GpuProf::Kind kind, u64 serial, u32 count) co
     return tag;
 }
 
-void Recorder::RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>& generated,
+bool Recorder::RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>& generated,
                              const VideoCommon::Nvn::PresentCrop& window_crop) {
     VideoCommon::NvnDrawProbe::OnPresent();
     if (impl.vtxcov_diag) {
@@ -5495,11 +5532,20 @@ void Recorder::RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>
     const bool image_ready = twin_only || EnsureContents(guest, false, true);
     Storage& s = image_ready ? PresentSource(guest) : guest;
     const Rescale::Factor present_scale = &s != &guest ? impl.RescaleFactor() : Rescale::Factor{};
-    const bool blittable =
-        image_ready && s.samples == VK_SAMPLE_COUNT_1_BIT && !s.host.depth && !s.host.stencil;
-    if (!blittable) {
-        Unsupported("Present", image_ready ? "multisampled or depth/stencil source"
-                                           : "the source image could not be created");
+    if (!image_ready || !s.image) {
+        Unsupported("Present", "the source image could not be created");
+        return false;
+    }
+    if (s.samples != VK_SAMPLE_COUNT_1_BIT || s.host.depth || s.host.stencil) {
+        Unsupported("Present", "multisampled or depth/stencil source");
+        return false;
+    }
+    if (!s.sparse && s.origin == StorageOrigin::None) {
+        // A failed initial upload can leave an allocated image with no pixels. Try the upload
+        // again on the next use, and leave the last complete picture on screen in the meantime.
+        s.contents_valid = false;
+        Unsupported("Present", "the source image has no contents");
+        return false;
     }
     const VkImageMemoryBarrier frame_in{
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -5559,17 +5605,14 @@ void Recorder::RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>
     const VkFormat filter_format = raw_copy ? raw_format : texture_format;
     const auto filter_twin = &s != &guest ? impl.ScaledTextureOf(texture) : nullptr;
     Texture& filter_texture = filter_twin ? *filter_twin : texture;
-    if (blittable &&
-        RecordWindowFilter(filter_texture, filter_format, frame, crop_rect, picture_rect)) {
+    if (RecordWindowFilter(filter_texture, filter_format, frame, crop_rect, picture_rect)) {
         through_passes = true;
         picture_source = *s.image;
         picture_layout = VK_IMAGE_LAYOUT_GENERAL;
         frame.source_encoding = PresentEncoding(texture_format);
     }
-    if (blittable) {
-        WarnUnsupportedPresentPasses(through_passes);
-    }
-    if (blittable && !through_passes) {
+    WarnUnsupportedPresentPasses(through_passes);
+    if (!through_passes) {
         // The game renders to an sRGB texture, whose raw bytes are already encoded. A blit reads
         // an sRGB source as linear and writes the (UNORM) frame as is, which darkens the picture:
         // blit from a UNORM copy of the bytes instead. A texture can also be a different
@@ -5641,8 +5684,6 @@ void Recorder::RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>
         Cmd().BlitImage(source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, *frame.image,
                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, blit, present_filter);
         picture_source = source;
-    } else if (!blittable) {
-        Cmd().PipelineBarrier(ALL_STAGES, ALL_STAGES, 0, frame_in);
     }
     // The present manager expects the frame image in GENERAL.
     const VkImageMemoryBarrier frame_out{
@@ -5908,6 +5949,7 @@ void Recorder::RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>
             }
         }
     }
+    return true;
 }
 
 Recorder::PictureReadback Recorder::CreatePictureReadback(const Frame& frame, u32 width,
@@ -6482,14 +6524,7 @@ void Context::Impl::ExecutePresent(const VC::PresentRequest& request, InFlight& 
     if (const auto it = textures.find(request.texture_serial); it != textures.end()) {
         texture = it->second.get();
     }
-    // (A texture the Resolution setting drew has its newest pixels in the twin, which may be the
-    // only image it has.)
-    const bool displayable =
-        texture && texture->storage &&
-        (texture->storage->image ||
-         (texture->storage->scaled && Rescale::TwinIsCurrent(texture->storage->scale_state) &&
-          texture->storage->scaled->image)) &&
-        present_target;
+    const bool displayable = texture && texture->storage && present_target;
     Frame* frame = nullptr;
     /// Frames FSR3 / Lossless Scaling generated, presented before `frame`.
     std::vector<Frame*> generated;
@@ -6518,8 +6553,8 @@ void Context::Impl::ExecutePresent(const VC::PresentRequest& request, InFlight& 
         Recorder recorder(*this, request.queue, flight, true);
         recorder.gpu_capture_png = std::move(gpu_capture_png);
         replay_stage.store("present: record", std::memory_order_relaxed);
-        if (frame) {
-            recorder.RecordPresent(*texture, *frame, generated, request.crop);
+        if (frame && !recorder.RecordPresent(*texture, *frame, generated, request.crop)) {
+            present_target->ReleaseFrame(std::exchange(frame, nullptr));
         }
         replay_stage.store("present: finish", std::memory_order_relaxed);
         {

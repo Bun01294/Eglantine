@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -972,6 +973,49 @@ TEST_CASE("NVN storage shadow: a render pass writing a storage range reaches the
     }
 }
 
+TEST_CASE("MKW first color attachment load preserves channels outside a masked clear",
+          "[nvn][attachment-load]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    const bool cpu_visible = GENERATE(false, true);
+    FakeMemory memory;
+    u8* data = memory.Add(POOL_VA, 64_KiB);
+    u8* texture = memory.Add(TEXTURE_POOL_VA, 1_MiB);
+    std::memset(texture, 0x44, 1_MiB);
+    Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr, {});
+    context.SetTitleId(Settings::MarioKartWorldProgramId);
+    context.SetGuestMemory(&memory);
+    context.CreatePool({.serial = 1, .guest_address = POOL_VA, .size = 64_KiB,
+                        .flags = POOL_CPU_CACHED});
+    context.CreatePool({.serial = 2, .guest_address = TEXTURE_POOL_VA, .size = 1_MiB,
+                        .flags = cpu_visible ? static_cast<u32>(POOL_CPU_CACHED)
+                                             : 1u /* CPU_NO_ACCESS */});
+    context.CreateTexture({.target = 1, .format = 0x25, .width = 16, .height = 16,
+                           .depth = 1, .levels = 1, .serial = 10, .pool_serial = 2});
+    std::vector<u64> list;
+    const VC::RenderTargetRef color{.texture = {.serial = 10}};
+    Push(list, VC::Op::SetRenderTargets, VC::SetRenderTargetsPayload{1, 0},
+         {reinterpret_cast<const u8*>(&color), sizeof(color)});
+    Push(list, VC::Op::ClearColor,
+         VC::ClearColorPayload{.index = 0, .mask = 1, .color = {std::bit_cast<u32>(1.0f)}});
+    VC::CopyBufferTexturePayload readback{};
+    readback.buffer = POOL_VA;
+    readback.texture = {.serial = 10};
+    readback.region = {0, 0, 0, 16, 16, 1};
+    Push(list, VC::Op::CopyTextureToBuffer, readback);
+    PushEnd(list);
+    context.Submit(MakeSubmission(1, std::move(list), {10, 1, 2}));
+    REQUIRE(context.Wait(1, 60s));
+    CHECK(context.Stats().ops_failed == 0);
+    CHECK(context.Stats().ops_unsupported == 0);
+    const u32 expected = cpu_visible ? 0x444444FFu : 0x000000FFu;
+    for (size_t i = 0; i < 16u * 16u; ++i) {
+        REQUIRE(WordAt(data, i * sizeof(u32)) == expected);
+    }
+}
+
 TEST_CASE("MKW graphics lookahead preserves live attachments across passes and lists",
           "[nvn][pipeline-lookahead]") {
     auto vulkan = MakeHeadlessVulkan();
@@ -1691,13 +1735,19 @@ TEST_CASE("NVN compute: an R32UI image view of an RGB9E5 texture takes the shade
     FakeMemory memory;
     u8* data = memory.Add(POOL_VA, 64_KiB);
     std::memset(data, 0xCD, 64_KiB);
-    memory.Add(TEXTURE_POOL_VA, 1_MiB);
+    u8* texels = memory.Add(TEXTURE_POOL_VA, 1_MiB);
+    constexpr u32 INITIAL_WORD = 0x80402010;
+    const bool partial = GENERATE(false, true);
+    if (partial) {
+        std::memcpy(texels + 3 * sizeof(u32), &INITIAL_WORD, sizeof(INITIAL_WORD));
+    }
     Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr, {});
     context.SetGuestMemory(&memory);
     context.CreatePool({.serial = 1, .guest_address = POOL_VA, .size = 64_KiB,
                         .flags = POOL_CPU_CACHED});
     context.CreatePool({.serial = 2, .guest_address = TEXTURE_POOL_VA, .size = 1_MiB,
-                        .flags = 1 /* CPU_NO_ACCESS */});
+                        .flags = partial ? static_cast<u32>(POOL_CPU_CACHED)
+                                         : 1u /* CPU_NO_ACCESS */});
     constexpr s32 NVN_FORMAT_RGB9E5F = 0x40;
     constexpr u16 NVN_FORMAT_R32UI = 0x0B;
     constexpr u32 WIDTH = 4;
@@ -1733,7 +1783,8 @@ TEST_CASE("NVN compute: an R32UI image view of an RGB9E5 texture takes the shade
     const u64 handle = IMAGE_ID;
     Push(list, VC::Op::BindImages, VC::BindHandlesPayload{.stage = 5, .first = 0, .count = 1},
          {reinterpret_cast<const u8*>(&handle), sizeof(handle)});
-    Push(list, VC::Op::Dispatch, VC::DispatchPayload{.x = WIDTH, .y = 1, .z = 1});
+    const u32 written = partial ? WIDTH - 1 : WIDTH;
+    Push(list, VC::Op::Dispatch, VC::DispatchPayload{.x = written, .y = 1, .z = 1});
     VC::CopyBufferTexturePayload copy{};
     copy.buffer = POOL_VA + 0x1000;
     copy.texture = {.serial = 10, .level = 0, .layer = 0};
@@ -1753,7 +1804,7 @@ TEST_CASE("NVN compute: an R32UI image view of an RGB9E5 texture takes the shade
     CHECK(stats.ops_unsupported == 0);
     for (u32 x = 0; x < WIDTH; ++x) {
         INFO("texel " << x);
-        CHECK(WordAt(data, 0x1000 + x * 4) == 0x88000000u + x);
+        CHECK(WordAt(data, 0x1000 + x * 4) == (x < written ? 0x88000000u + x : INITIAL_WORD));
     }
 }
 
