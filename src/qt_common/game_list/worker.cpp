@@ -276,8 +276,8 @@ QList<QStandardItem*> MakeGameListEntry(const std::string& path, const std::stri
         });
 
     FileSys::NACP nacp{};
-    if (file_type == Loader::FileType::NUP &&
-        loader.ReadControlData(nacp) == Loader::ResultStatus::Success) {
+    const bool has_nacp = loader.ReadControlData(nacp) == Loader::ResultStatus::Success;
+    if (file_type == Loader::FileType::NUP && has_nacp) {
         const std::string version_string = nacp.GetVersionString();
         if (!version_string.empty()) {
             if (!patch_versions.isEmpty()) {
@@ -288,10 +288,25 @@ QList<QStandardItem*> MakeGameListEntry(const std::string& path, const std::stri
         }
     }
 
+    QString version = has_nacp ? QString::fromStdString(nacp.GetVersionString()) : QString{};
+    static const QRegularExpression update_regex{QStringLiteral(R"(^Update \(([^)]+)\))")};
+    for (const QString& line : patch_versions.split(QLatin1Char('\n'))) {
+        if (const auto match = update_regex.match(line); match.hasMatch()) {
+            version = match.captured(1);
+            break;
+        }
+    }
+
     u64 play_time = play_time_manager.GetPlayTime(program_id);
+    auto* path_item = new GameListItemPath(FormatGameName(path), icon, QString::fromStdString(name),
+                                           file_type_string, program_id, play_time, patch_versions);
+    if (has_nacp) {
+        path_item->setData(QString::fromStdString(nacp.GetDeveloperName()),
+                           GameListItemPath::DeveloperRole);
+    }
+    path_item->setData(version, GameListItemPath::VersionRole);
     return QList<QStandardItem*>{
-        new GameListItemPath(FormatGameName(path), icon, QString::fromStdString(name),
-                             file_type_string, program_id, play_time, patch_versions),
+        path_item,
         new GameListItem(file_type_string),
         new GameListItemSize(size),
         new GameListItemPlayTime(play_time),

@@ -29,6 +29,7 @@
 #include "frontend_common/play_time_manager.h"
 #include "qt_common/config/uisettings.h"
 #include "qt_common/qt_common.h"
+#include "qt_common/util/game_art.h"
 
 enum class GameListItemType {
     Game = QStandardItem::UserType + 1,
@@ -173,6 +174,11 @@ public:
     static constexpr int FullPathRole = SortRole + 2;
     static constexpr int ProgramIdRole = SortRole + 3;
     static constexpr int FileTypeRole = SortRole + 4;
+    /// The game's own icon, kept so a custom icon can be reset without a rescan.
+    static constexpr int OriginalIconRole = SortRole + 5;
+    static constexpr int DeveloperRole = SortRole + 6;
+    /// Display version of the newest enabled update, or of the base game.
+    static constexpr int VersionRole = SortRole + 7;
 
     GameListItemPath() = default;
     GameListItemPath(const QString& game_path, const std::vector<u8>& picture_data,
@@ -211,7 +217,15 @@ public:
         QPixmap picture;
         if (picture.loadFromData(picture_data.data(), static_cast<u32>(picture_data.size()))) {
             picture = picture.scaled(size, size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+            setData(picture, OriginalIconRole);
             setData(picture, Qt::DecorationRole);
+        }
+        if (QtCommon::GameArt::HasIcon(program_id)) {
+            QPixmap custom(QtCommon::GameArt::IconPath(program_id));
+            if (!custom.isNull()) {
+                setData(custom.scaled(size, size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation),
+                        Qt::DecorationRole);
+            }
         }
     }
 
