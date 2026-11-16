@@ -668,6 +668,7 @@ Context::Impl::~Impl() {
         std::scoped_lock lock{free_staging_mutex};
         free_staging.clear();
     }
+    quad_indirect.reset();
     allocator.reset();
     command_buffer_allocations.clear();
     command_pool.reset();
@@ -1227,6 +1228,16 @@ void Context::Impl::CompleteMain() {
                 } else if (memory) {
                     memory->Write(readback.pool->address + readback.pool_offset, source,
                                   readback.size);
+                }
+                if (mirror_hash_tracked) {
+                    std::scoped_lock lock{readback.pool->dirty_mutex};
+                    auto& landed = readback.pool->landed_writebacks;
+                    if (landed.size() < 1024) {
+                        landed.push_back(
+                            {readback.pool_offset, readback.pool_offset + readback.size});
+                    } else {
+                        landed.assign(1, {0, readback.pool->size}); // not taken for long: all
+                    }
                 }
             }
         }

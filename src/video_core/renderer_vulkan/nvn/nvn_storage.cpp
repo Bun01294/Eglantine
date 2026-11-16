@@ -68,10 +68,27 @@ bool Context::Impl::TakePoolCpuWrites(Pool& pool) {
                 for (Pool::MirrorPage& page : pool.mirror_pages) {
                     page.trusted = false;
                 }
-                // Textures of the pool too: every page counts as written.
-                ++pool.cpu_write_gen;
-                std::fill(pool.page_write_gen.begin(), pool.page_write_gen.end(),
-                          pool.cpu_write_gen);
+            }
+            // Textures of the pool must see raw writes even in Mario Kart World; only the mirror
+            // page exception is Mario Kart World specific.
+            ++pool.cpu_write_gen;
+            std::fill(pool.page_write_gen.begin(), pool.page_write_gen.end(),
+                      pool.cpu_write_gen);
+        }
+    }
+    std::vector<std::pair<u64, u64>> writebacks;
+    {
+        std::scoped_lock lock{pool.dirty_mutex};
+        writebacks.swap(pool.landed_writebacks);
+    }
+    if (!writebacks.empty()) {
+        ++pool.cpu_write_gen;
+        for (const auto& [offset, end] : writebacks) {
+            for (u64 page = offset / Pool::MIRROR_PAGE; page * Pool::MIRROR_PAGE < end; ++page) {
+                const size_t index = static_cast<size_t>(page);
+                if (index < pool.page_write_gen.size()) {
+                    pool.page_write_gen[index] = pool.cpu_write_gen;
+                }
             }
         }
     }
@@ -88,9 +105,7 @@ bool Context::Impl::TakePoolCpuWrites(Pool& pool) {
         // trusted yet.
         memory->Arm(pool.mirror_track, pool.address, pool.size);
         pool.mirror_write_epoch = memory->WriteEpoch(pool.mirror_track);
-        if (pool.mirror_write_epoch) {
-            pool.mirror_epoch_clean = pool.mirror_write_epoch->load(std::memory_order_acquire);
-        }
+        // mirror_epoch_clean stays as it was: the next call collects writes made right after Arm.
         pool.page_write_gen.assign(
             static_cast<size_t>((pool.size + Pool::MIRROR_PAGE - 1) / Pool::MIRROR_PAGE), 0);
         return true;
@@ -311,6 +326,12 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
                     s.page_hashes[static_cast<size_t>(page - first_page)] = page_hash(data, page);
                 }
                 hashed += size;
+                TakePoolCpuWrites(pool);
+                if (PoolWrittenSince(pool, s.pool_offset, size, tracked_gen)) {
+                    // CPU wrote memory between full compare and page hashing: drop the baseline.
+                    s.cpu_trusted_gen = 0;
+                    s.page_hashes.clear();
+                }
             }
         }
         if (changed) {

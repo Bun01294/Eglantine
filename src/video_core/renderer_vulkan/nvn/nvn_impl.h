@@ -149,6 +149,9 @@ struct Pool {
     /// there until the write-back at completion. Guarded by dirty_mutex.
     std::mutex dirty_mutex;
     std::vector<Dirty> gpu_dirty;
+    /// Write-backs that reached guest memory, {offset, end}: added at completion, taken by
+    /// Impl::TakePoolCpuWrites (texture trust). Guarded by dirty_mutex.
+    std::vector<std::pair<u64, u64>> landed_writebacks;
     /// Mirror pools: what the mirror holds, per MIRROR_PAGE bytes of the pool. Replay thread
     /// only once `pending` is false (sized before that).
     struct MirrorPage {

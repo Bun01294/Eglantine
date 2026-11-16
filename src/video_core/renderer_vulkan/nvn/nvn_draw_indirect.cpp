@@ -15,6 +15,7 @@
 #include <fmt/format.h>
 
 #include "video_core/renderer_vulkan/nvn/nvn_draw.h"
+#include "video_core/renderer_vulkan/nvn/nvn_quad_indirect.h"
 
 namespace Vulkan::Nvn {
 namespace {
@@ -178,6 +179,17 @@ void DrawContext::DrawIndirect(const VC::DrawPayload& p) {
         if (args.offset % sizeof(u32) != 0 || call.stride % sizeof(u32) != 0) {
             impl.stats.indirect_unsupported.fetch_add(1, std::memory_order_relaxed);
             host->HostUnsupported(call.op, "quad arguments not aligned to 4 bytes");
+            return;
+        }
+        const u64 alignment = (std::max<u64>)(impl.device.GetStorageBufferAlignment(), 4);
+        const u64 base = args.offset / alignment * alignment;
+        const u64 range = args.offset - base +
+                          (call.max_draws > 0 ? static_cast<u64>(call.max_draws - 1) * call.stride
+                                              : 0) +
+                          QUAD_ARRAYS_COMMAND_SIZE;
+        if (range > impl.device.GetMaxStorageBufferRange()) {
+            impl.stats.indirect_unsupported.fetch_add(1, std::memory_order_relaxed);
+            host->HostUnsupported(call.op, "quad arguments exceed maxStorageBufferRange");
             return;
         }
         EndPass(BreakCause::MeshIndirectConvert);

@@ -1343,7 +1343,8 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                             } else {
                                 DrawPlan::FeedbackCopy* entry = nullptr;
                                 for (DrawPlan::FeedbackCopy& existing : plan.feedback) {
-                                    if (existing.source == texture->storage) {
+                                    if (existing.source == texture->storage &&
+                                        existing.retype_layers == 0 && !existing.retype_row) {
                                         entry = &existing;
                                         break;
                                     }
@@ -1406,7 +1407,8 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                         // hardware returns for a single texel), refreshed by a copy per draw. One
                         // sampled as 1D (Hyrule Warriors' vertex shaders on its 8x8 default
                         // texture): a 1D image holding its first row.
-                        const bool row = binding.type == Shader::TextureType::Color1D;
+                        const bool row = binding.type == Shader::TextureType::Color1D &&
+                                         impl.device.IsKhrMaintenance5Supported();
                         const bool typed_target =
                             row || binding.type == Shader::TextureType::Color3D ||
                             binding.type == Shader::TextureType::ColorCube ||
@@ -1630,13 +1632,13 @@ VkBufferView DrawContext::TexelBufferView(const Texture* texture) {
         const VC::TextureDesc& desc = texture->desc;
         const u64 bytes =
             u64{desc.width} * VideoCore::Surface::BytesPerBlock(texture->host.pixel_format);
+        format = texture->host.format;
         if (const auto it = impl.pools.find(desc.pool_serial); it != impl.pools.end() && bytes != 0) {
             const u64 guest = it->second->address + desc.pool_offset;
             source = impl.GuestPointer(guest, bytes);
             if (source != nullptr) {
                 address = guest;
                 size = bytes;
-                format = texture->host.format;
             }
         }
         if (source == nullptr) {
