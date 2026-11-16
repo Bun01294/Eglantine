@@ -448,9 +448,9 @@ struct PipelineCacheStats {
     u64 gpl_optimized{};       ///< whole compiles published in place of a fast-linked pipeline
     u64 gpl_shader_sets_warmed{}; ///< GPL path: shader sets whose library parts the preload compiled
     u64 programs_prepared{};   ///< program stages lowered when the game created the program
-    u64 graphics_pipelines{};  ///< pipelines held now (never evicted)
+    u64 graphics_pipelines{};  ///< pipelines held now
     u64 compute_pipelines{};
-    u64 lowered_programs{};    ///< lowered stage programs held now (never evicted)
+    u64 lowered_programs{}; ///< lowered stage programs held now
 };
 
 /// Thread-safety: see the file comment.
@@ -511,6 +511,14 @@ public:
     /// Blocks until the preload and the asynchronous compiles finished and the queued disk writes
     /// are on disk (shutdown, tests).
     void Flush();
+
+    /// Replay thread only, with no concurrent lookups: waits for cache workers, then drops all
+    /// shader translations, pipelines, rejections, library parts and driver compilation data.
+    /// Render passes and disk files stay valid. In-flight work must retain its pipeline
+    /// shared_ptrs.
+    void ClearShaders();
+    /// Changes after ClearShaders; local pipeline memos must be invalidated before another draw.
+    [[nodiscard]] u64 ShaderGeneration() const noexcept;
 
     [[nodiscard]] PipelineCacheStats Stats() const;
 

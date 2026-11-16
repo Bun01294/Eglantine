@@ -387,6 +387,12 @@ struct Values {
                                           true,
                                           false};
 
+    // VTX-HLE diagnostic/workaround: start without disk caches and recompile shaders every minute.
+    // Read at game start; synchronous compilation keeps the refresh from losing one-time draws.
+    SwitchableSetting<bool> nvn_shader_refresh{
+        linkage, false, "nvn_shader_refresh", Category::Renderer, Specialization::Default,
+        true,    false};
+
     // Graphics Settings
     ResolutionScalingInfo resolution_info{};
     SwitchableSetting<ResolutionSetup> resolution_setup{linkage, ResolutionSetup::Res1X,

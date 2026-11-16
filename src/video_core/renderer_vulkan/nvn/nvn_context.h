@@ -185,6 +185,8 @@ struct ContextOptions {
     /// (nvn_barrier_track.h; DESIGN.md "Barrier merging"). The value of EDEN_NX2_TRY_BARRIER_MERGE
     /// (0 off, 1 all, 2..4 one part: BarrierMergeMask). Unset: the switch decides.
     std::optional<u32> barrier_merge{};
+    /// Interval of the opt-in shader refresh mode (zero: every present, for headless diagnostics).
+    std::chrono::seconds shader_refresh_interval{60};
 };
 
 /// Counters for things the replay cannot do (yet) or had to work around. All monotonic.

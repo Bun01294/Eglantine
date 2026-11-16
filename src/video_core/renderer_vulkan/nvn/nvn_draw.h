@@ -949,6 +949,7 @@ private:
     };
     std::array<PipelineMemo, 8> pipeline_memo;
     u32 pipeline_memo_next{0};
+    u64 shader_generation{};
     /// The driver (c0) and handle (c2) banks of the graphics stages are rebuilt only when what
     /// they are made of changed (storage buffer table, push constants, handle tables, raw global
     /// table): the arena copy of the last build is reused by every draw of the submission until
@@ -1002,6 +1003,7 @@ private:
     std::shared_ptr<vk::DescriptorPool> set_pool;
     u32 set_pool_used{};
     const GraphicsPipeline* last_kept{nullptr};
+    const ComputePipeline* last_compute_kept{nullptr};
     /// The submission and raw global table generation whose pools were last noted as used.
     u64 raw_noted_seq{~u64{0}};
     u64 raw_noted_generation{~u64{0}};

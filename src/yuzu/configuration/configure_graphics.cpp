@@ -236,7 +236,8 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         return id == Settings::values.graphics_path.Id() ||
                id == Settings::values.nvn_in_pass_queries.Id() ||
                id == Settings::values.nvn_pipeline_library.Id() ||
-               id == Settings::values.nvn_sync_diet.Id();
+               id == Settings::values.nvn_sync_diet.Id() ||
+               id == Settings::values.nvn_shader_refresh.Id();
     };
 
     for (const auto setting : Settings::values.linkage.by_category[Settings::Category::Renderer]) {
@@ -386,10 +387,11 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
                 const auto it = hold_path.find(setting.Id());
                 return it != hold_path.end() ? it->second : nullptr;
             };
-            const std::array<QWidget*, 3> hle_only{
+            const std::array<QWidget*, 4> hle_only{
                 find_path_widget(Settings::values.nvn_in_pass_queries),
                 find_path_widget(Settings::values.nvn_pipeline_library),
-                find_path_widget(Settings::values.nvn_sync_diet)};
+                find_path_widget(Settings::values.nvn_sync_diet),
+                find_path_widget(Settings::values.nvn_shader_refresh)};
             const auto update_path_options = [path_box, hle_only]() {
                 const bool hle = static_cast<Settings::GraphicsPath>(
                                      path_box->currentData().toUInt()) ==

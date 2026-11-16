@@ -1855,8 +1855,10 @@ std::string Context::DescribeMemory() const {
         std::scoped_lock lock{impl->draw_resources->cache_mutex};
         if (const auto& cache = impl->draw_resources->cache_instance) {
             const PipelineCacheStats p = cache->Stats();
-            text += fmt::format("; pipelines graphics {} compute {}, lowered programs {}",
-                                p.graphics_pipelines, p.compute_pipelines, p.lowered_programs);
+            text += fmt::format(
+                "; pipelines graphics {} compute {}, lowered programs {}, shader refreshes {}",
+                p.graphics_pipelines, p.compute_pipelines, p.lowered_programs,
+                cache->ShaderGeneration());
         }
     }
     return text;

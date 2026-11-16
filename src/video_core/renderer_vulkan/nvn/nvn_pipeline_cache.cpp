@@ -629,6 +629,43 @@ void PipelineCache::Impl::Flush() {
     writer.Flush();
 }
 
+void PipelineCache::Impl::ClearShaders() {
+    Flush();
+    auto fresh_cache = device.GetLogical().CreatePipelineCache({
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+    });
+    auto fresh_libraries =
+        library_cache ? std::make_unique<GraphicsPipelineLibraryCache>(device) : nullptr;
+    const auto before = Stats();
+    {
+        std::scoped_lock lock{pipeline_mutex};
+        graphics.clear();
+        compute.clear();
+        failed_graphics.clear();
+        failed_compute.clear();
+    }
+    {
+        std::scoped_lock lock{translation_mutex};
+        translations.clear();
+    }
+    library_cache = std::move(fresh_libraries);
+    {
+        std::scoped_lock lock{lowered_mutex};
+        lowered.clear();
+    }
+    {
+        std::scoped_lock lock{reject_mutex};
+        rejected_stages.clear();
+    }
+    vk_cache = std::move(fresh_cache);
+    const u64 generation = ++shader_generation;
+    LOG_INFO(Render_Vulkan,
+             "[nvn] shader cache refreshed: generation {} ({} graphics, {} compute, {} lowered); "
+             "next use recompiles",
+             generation, before.graphics_pipelines, before.compute_pipelines,
+             before.lowered_programs);
+}
+
 PipelineCacheStats PipelineCache::Impl::Stats() const {
     PipelineCacheStats stats;
     stats.loaded = stat_loaded;
@@ -1790,6 +1827,14 @@ void PipelineCache::NoteIssue(const std::string& reason) {
 
 void PipelineCache::Flush() {
     impl->Flush();
+}
+
+void PipelineCache::ClearShaders() {
+    impl->ClearShaders();
+}
+
+u64 PipelineCache::ShaderGeneration() const noexcept {
+    return impl->shader_generation.load(std::memory_order_relaxed);
 }
 
 PipelineCacheStats PipelineCache::Stats() const {

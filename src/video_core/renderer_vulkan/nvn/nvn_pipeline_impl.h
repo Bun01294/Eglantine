@@ -317,6 +317,7 @@ struct PipelineCache::Impl {
     std::shared_ptr<ComputePipeline> GetCompute(const ComputeRequest& request, bool* not_ready);
     VkRenderPass GetRenderPass(const RenderPassKey& key);
     void Flush();
+    void ClearShaders();
     PipelineCacheStats Stats() const;
     void CollectRows(std::vector<Row>& out) const;
 
@@ -596,6 +597,7 @@ struct PipelineCache::Impl {
     std::filesystem::path disk_path;
     std::filesystem::path vk_cache_path;
     vk::PipelineCache vk_cache;
+    std::atomic<u64> shader_generation{};
 
     std::atomic<u64> stat_loaded{};
     mutable std::atomic<u64> logged_loaded{~u64{0}};

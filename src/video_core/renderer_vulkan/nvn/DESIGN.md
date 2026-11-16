@@ -1816,6 +1816,17 @@ Per-call, per-draw, per-submit and per-present cost with every debug switch unse
 the control prefix. Identical compute code with different descriptor table offsets must not
 share a lowered program or pipeline. Truncated compute controls have a distinct identity.
 
+The opt-in `nvn_shader_refresh` setting starts without disk caches or asynchronous draw skips.
+At present boundaries, after 60 seconds, `ClearShaders` drains preload, asynchronous, preparation
+and optimization workers and the disk writer, then clears graphics/compute pipelines, lowered
+programs, failed entries, translated shader sets, GPL parts and the driver compilation cache.
+It keeps render passes (framebuffers reference them), textures and GPU-written results. Existing
+flights retain pipeline shared pointers until completion. `ShaderGeneration` invalidates each
+queue's local pipeline and memo before its next draw, including its binding-state tracking.
+The diagnostic memory summary and log expose the refresh count. `ContextOptions` can shorten
+the interval for headless tests; the UI mode uses 60 seconds. Disk files remain untouched in
+this mode. The game-list Vulkan cache removal includes the emulated and NVN cache file names.
+
 Files: `nvn_pipeline_cache.cpp` (lookups, translation: lower -> `NvnEnvironment` + `TranslateNvnStage`
 -> `ConvertLegacyToGeneric` + `EmitSPIRV`), `nvn_pipeline_vk.cpp` (render passes, descriptor and
 pipeline layouts, `VkPipeline` assembly), `nvn_pipeline_state.*` (NVN enum -> Vulkan, profile,

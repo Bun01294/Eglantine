@@ -19,4 +19,23 @@ inline constexpr std::array<char, 8> NVN_DRIVER_CACHE_MAGIC{'N', 'V', 'N', 'V',
                                                              'K', 'C', 'H', '1'};
 inline constexpr std::string_view NVN_DRIVER_CACHE_FILE_NAME = "nvn_pipelines.vkcache";
 
+inline constexpr std::array<std::string_view, 4> EMULATED_VULKAN_CACHE_FILES{
+    "vulkan.bin", "vulkan_mesh.bin", "vulkan_used.bin", "vulkan_pipelines.bin",
+};
+
+[[nodiscard]] constexpr bool IsNvnPipelineCacheFile(std::string_view name) {
+    return name == NVN_DRIVER_CACHE_FILE_NAME ||
+           (name.starts_with("nvn_pipelines.") && name.ends_with(".bin"));
+}
+
+/// Files removed by the title's Remove Vulkan Pipeline Cache action, across both graphics paths.
+[[nodiscard]] constexpr bool IsVulkanPipelineCacheFile(std::string_view name) {
+    for (const auto legacy : EMULATED_VULKAN_CACHE_FILES) {
+        if (name == legacy) {
+            return true;
+        }
+    }
+    return IsNvnPipelineCacheFile(name);
+}
+
 } // namespace VideoCommon

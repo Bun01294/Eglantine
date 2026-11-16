@@ -106,6 +106,7 @@ VkFormat DummyFormat() {
 } // namespace
 
 DrawResources::DrawResources(Context::Impl& impl_) : impl{impl_}, clears{impl_.device} {
+    shader_refresh = Settings::values.nvn_shader_refresh.GetValue();
     dummy_buffer = impl.CreateHostBuffer(DUMMY_BUFFER_SIZE, ARENA_USAGE, MemoryUsage::Upload);
     std::memset(dummy_buffer.Mapped().data(), 0, DUMMY_BUFFER_SIZE);
     dummy_buffer.Flush();
@@ -142,7 +143,8 @@ PipelineCache& DrawResources::Cache() {
     if (!cache_instance) {
         std::scoped_lock lock{cache_mutex};
         PipelineCacheOptions options;
-        options.async_compile = Settings::values.use_asynchronous_shaders.GetValue();
+        options.async_compile =
+            !shader_refresh && Settings::values.use_asynchronous_shaders.GetValue();
         options.graphics_pipeline_library = Settings::values.nvn_pipeline_library.GetValue();
         options.sync_diet = Settings::values.nvn_sync_diet.GetValue();
         options.shader_notify = impl.options.shader_notify;
@@ -166,7 +168,7 @@ void DrawResources::OpenCache(u64 title_id) {
     PipelineCacheOptions options;
     options.title_id = title_id;
     options.revision = Common::g_scm_rev;
-    options.async_compile = Settings::values.use_asynchronous_shaders.GetValue();
+    options.async_compile = !shader_refresh && Settings::values.use_asynchronous_shaders.GetValue();
     options.graphics_pipeline_library = Settings::values.nvn_pipeline_library.GetValue();
     options.sync_diet = Settings::values.nvn_sync_diet.GetValue();
     options.shader_notify = impl.options.shader_notify;
@@ -183,7 +185,12 @@ void DrawResources::OpenCache(u64 title_id) {
              options.sync_diet ? "one barrier (nvn_sync_diet)"
                                : "barrier plus the render passes' two external dependencies");
     options.driver_cache_file = Settings::values.use_vulkan_driver_pipeline_cache.GetValue();
-    if (!Settings::values.use_disk_shader_cache.GetValue()) {
+    if (shader_refresh) {
+        options.driver_cache_file = false;
+        LOG_INFO(Render_Vulkan,
+                 "[nvn] periodic shader refresh on: fresh synchronous compiles every 60 seconds; "
+                 "disk caches are not read or written");
+    } else if (!Settings::values.use_disk_shader_cache.GetValue()) {
         // As on the emulated GPU (no LoadDiskResources, no cache file): nothing is read from or
         // written to the profile's shader directory; every pipeline is translated and compiled
         // when a draw first needs it.
@@ -210,6 +217,26 @@ void DrawResources::OpenCache(u64 title_id) {
     cache_instance = std::move(cache);
 }
 DrawResources::~DrawResources() = default;
+
+void DrawResources::MaybeRefreshShaders() {
+    if (!shader_refresh || !cache_instance) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (last_shader_refresh == std::chrono::steady_clock::time_point{}) {
+        last_shader_refresh = now;
+    } else if (now - last_shader_refresh >= impl.options.shader_refresh_interval) {
+        try {
+            cache_instance->ClearShaders();
+        } catch (const std::exception& e) {
+            // A failed replacement allocation leaves the old cache usable. The present's GPU
+            // work is already submitted: do not fail its flight because a refresh failed.
+            LOG_WARNING(Render_Vulkan,
+                        "[nvn] shader cache refresh failed; keeping current shaders: {}", e.what());
+        }
+        last_shader_refresh = std::chrono::steady_clock::now();
+    }
+}
 
 void DrawResources::TracePass(u32 width, u32 height) {
     ++frame_trace.passes[{width, height}];

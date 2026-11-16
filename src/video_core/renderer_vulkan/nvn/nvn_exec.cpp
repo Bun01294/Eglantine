@@ -6544,6 +6544,7 @@ void Context::Impl::ExecutePresent(const VC::PresentRequest& request, InFlight& 
         if (draw_resources) {
             draw_resources->NoteAsyncSkips(presents_recorded);
             draw_resources->CheckSink(presents_recorded);
+            draw_resources->MaybeRefreshShaders();
             if (VideoCommon::Nvn::TimestampTraceEnabled()) {
                 draw_resources->TracePresent(presents_recorded);
             }

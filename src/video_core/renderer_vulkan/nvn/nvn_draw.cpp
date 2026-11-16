@@ -136,6 +136,7 @@ void DrawContext::BeginSubmission(DrawHost& host_, const VC::Submission& submiss
     set_pool.reset();
     set_pool_used = 0;
     last_kept = nullptr;
+    last_compute_kept = nullptr;
     resources.RefreshSamplerSetting();
 }
 
@@ -1998,6 +1999,17 @@ RenderPassKey DrawContext::MakePassKey() const {
 
 std::shared_ptr<GraphicsPipeline> DrawContext::ResolvePipeline(u32 mode, u32 element_count,
                                                                bool& awaiting_async) {
+    const u64 generation = resources.Cache().ShaderGeneration();
+    if (shader_generation != generation) {
+        pipeline.reset();
+        pipeline_memo = {};
+        pipeline_memo_next = 0;
+        pipeline_dirty = true;
+        bound_pipeline = VK_NULL_HANDLE;
+        bound_state.Reset();
+        last_kept = nullptr;
+        shader_generation = generation;
+    }
     const DrawOracle oracle{*this};
     if (!pipeline_dirty && pipeline && mode == last_mode && pipeline->QueriesMatch(oracle)) {
         ++counters.pipeline_state_reuses;

@@ -28,6 +28,13 @@ in two ways, chosen per game with **Graphics → Graphics path**:
   the Emulated GPU path applies them as before.
 - With VTX-HLE selected the page also shows its own options: occlusion queries inside render
   passes (on), fast-linked pipelines (off) and fewer GPU syncs between render passes (on).
+- **Refresh shaders every minute** (off by default) starts with fresh shaders, then drops shader
+  translations and compiled pipelines every 60 seconds at a frame boundary. Draws wait for their
+  new pipelines, which can briefly stutter. Use it to test black areas developing during continued
+  play. It preserves textures and GPU results. The periodic refresh runs entirely in memory.
+  Enable it before starting the game.
+- The game list's **Remove Vulkan Pipeline Cache** removes both graphics paths' caches, including
+  VTX-HLE's translation-key files and driver cache. **Remove All Pipeline Caches** also includes them.
 
 VTX-HLE needs the Vulkan renderer and a device with buffer device addresses and 64-bit shader
 integers. On other devices, with another renderer, or if the replay cannot start, the game runs on

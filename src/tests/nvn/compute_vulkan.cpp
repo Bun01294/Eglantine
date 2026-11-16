@@ -3090,16 +3090,31 @@ TEST_CASE("NVN draw: without render targets a draw rasterizes over NVN's no-targ
 }
 
 TEST_CASE("NVN draw: unchanged dynamic state survives a masked clear",
-          "[nvn][compute][pass_state]") {
+          "[nvn][compute][pass_state][shader-refresh]") {
     auto vulkan = MakeHeadlessVulkan();
     if (!vulkan) {
         SKIP("no Vulkan device");
     }
+    bool refresh = false;
+    SECTION("masked clear in the same submission") {}
+    SECTION("shader refresh between submissions") {
+        refresh = true;
+    }
+    struct RestoreRefresh {
+        bool previous = Settings::values.nvn_shader_refresh.GetValue();
+        ~RestoreRefresh() {
+            Settings::values.nvn_shader_refresh.SetValue(previous);
+        }
+    } restore;
+    Settings::values.nvn_shader_refresh.SetValue(refresh);
     FakeMemory memory;
     u8* data = memory.Add(POOL_VA, 64_KiB);
     memory.Add(TEXTURE_POOL_VA, 1_MiB);
     Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr,
-                                 {.early_submit = false});
+                                 {.early_submit = false, .shader_refresh_interval = 0s});
+    if (refresh) {
+        context.SetTitleId(0x1234); // exercise OpenCache with refresh mode, without profile files
+    }
     context.SetGuestMemory(&memory);
     context.CreatePool(
         {.serial = 1, .guest_address = POOL_VA, .size = 64_KiB, .flags = POOL_CPU_CACHED});
@@ -3127,6 +3142,7 @@ TEST_CASE("NVN draw: unchanged dynamic state survives a masked clear",
     Push(list, VC::Op::BindProgram,
          VC::BindProgramPayload{.program_serial = VERTEX_PROGRAM, .stages = 1u << 0});
     Push(list, VC::Op::SetPointSize, VC::F32Payload{.value = 1.0f});
+    u64 seq = 0;
     for (u32 draw = 0; draw < 2; ++draw) {
         if (draw != 0) {
             VC::ClearColorPayload clear{};
@@ -3144,14 +3160,78 @@ TEST_CASE("NVN draw: unchanged dynamic state survives a masked clear",
         Push(list, VC::Op::ReportCounter,
              VC::ReportCounterPayload{.address = POOL_VA + draw * 16,
                                       .counter_type = SAMPLES_PASSED});
+        if (refresh) {
+            PushEnd(list);
+            context.Submit(MakeSubmission(++seq, std::move(list), {VERTEX_PROGRAM, 10, 1, 2}));
+            list.clear();
+            REQUIRE(context.Wait(seq, 60s));
+            CHECK(context.DescribeMemory().find("pipelines graphics 1") != std::string::npos);
+            for (u32 i = 0; i < 2; ++i) {
+                context.Present({.seq = ++seq, .queue = 0});
+            }
+            // A present's GPU completion may precede its cache maintenance on the replay thread.
+            context.Submit(MakeSubmission(++seq, {}, {}));
+            REQUIRE(context.Wait(seq, 60s));
+        }
     }
-    PushEnd(list);
-    context.Submit(MakeSubmission(1, std::move(list), {VERTEX_PROGRAM, 10, 1, 2}));
-    REQUIRE(context.Wait(1, 60s));
+    if (!refresh) {
+        PushEnd(list);
+        context.Submit(MakeSubmission(++seq, std::move(list), {VERTEX_PROGRAM, 10, 1, 2}));
+        REQUIRE(context.Wait(seq, 60s));
+    } else {
+        CHECK(context.DescribeMemory().find("shader refreshes 3") != std::string::npos);
+    }
     CHECK(context.Stats().ops_failed == 0);
     CHECK(context.Stats().ops_unsupported == 0);
     CHECK(WordAt(data, 0) == 1);
     CHECK(WordAt(data, 16) == 1);
+}
+
+TEST_CASE("Shader refresh retains queued compute pipelines until GPU completion",
+          "[nvn][compute][shader-refresh]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    struct RestoreRefresh {
+        bool previous = Settings::values.nvn_shader_refresh.GetValue();
+        ~RestoreRefresh() {
+            Settings::values.nvn_shader_refresh.SetValue(previous);
+        }
+    } restore;
+    Settings::values.nvn_shader_refresh.SetValue(true);
+    FakeMemory memory;
+    u8* data = memory.Add(POOL_VA, 64_KiB);
+    Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr,
+                                 {.early_submit = false, .shader_refresh_interval = 0s});
+    context.SetGuestMemory(&memory);
+    context.SetTitleId(0x1234);
+    context.CreatePool(
+        {.serial = 1, .guest_address = POOL_VA, .size = 64_KiB, .flags = POOL_CPU_CACHED});
+    context.CreateProgram(
+        MakeProgram(PROGRAM, FillProgramBase(0x20, 100), {.uniform = 1, .storage = 1}));
+    constexpr u32 FLIGHTS = 8;
+    constexpr u32 GROUP_COUNT = 16;
+    u64 seq = 0;
+    for (u32 flight = 0; flight < FLIGHTS; ++flight) {
+        std::vector<u64> list;
+        BindCompute(list, PROGRAM, POOL_VA + 0x1000 + flight * 0x100, GROUP_COUNT * sizeof(u32));
+        Push(list, VC::Op::Dispatch, VC::DispatchPayload{.x = GROUP_COUNT, .y = 1, .z = 1});
+        PushEnd(list);
+        context.Submit(MakeSubmission(++seq, std::move(list), {PROGRAM, 1}));
+        context.Present({.seq = ++seq, .queue = 0});
+        context.Present({.seq = ++seq, .queue = 0});
+    }
+    context.Submit(MakeSubmission(++seq, {}, {}));
+    REQUIRE(context.Wait(seq, 60s));
+    CHECK(context.DescribeMemory().find("shader refreshes 15") != std::string::npos);
+    for (u32 flight = 0; flight < FLIGHTS; ++flight) {
+        for (u32 word = 0; word < GROUP_COUNT; ++word) {
+            CHECK(WordAt(data, 0x1000 + flight * 0x100 + word * sizeof(u32)) == 100 + word);
+        }
+    }
+    CHECK(context.Stats().ops_failed == 0);
+    CHECK(context.Stats().ops_unsupported == 0);
 }
 
 TEST_CASE("NVN draw: with asynchronous shaders only the draws the emulated path may skip are "

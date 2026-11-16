@@ -161,6 +161,11 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Drops the two full GPU syncs each render pass carried at its start and end; the one "
               "barrier between passes stays, so the picture is the same. Slightly less GPU time per "
               "frame. VTX-HLE only. Takes effect at the next game start."));
+    INSERT(Settings, nvn_shader_refresh, tr("Refresh shaders every minute"),
+           tr("Starts with fresh shaders and rebuilds them every 60 seconds while playing. "
+              "Use to test black areas that appear after continued play. May cause brief stutters; "
+              "draws wait for compilation. Existing disk caches are left untouched. VTX-HLE only. "
+              "Takes effect at the next game start."));
     INSERT(Settings, resolution_setup, tr("Resolution:"),
            tr("Forces to render at a different resolution.\n"
               "Higher resolutions require more VRAM and bandwidth.\n"
