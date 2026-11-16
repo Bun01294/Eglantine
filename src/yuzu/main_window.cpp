@@ -2853,6 +2853,7 @@ void MainWindow::OnEmulationStopped() {
         firmware_label->setVisible(true);
     }
 
+    const QString stopped_game_path = current_game_path;
     current_game_path.clear();
 
     // When closing the game, destroy the GLWindow to clear the context after the game is closed
@@ -2870,6 +2871,9 @@ void MainWindow::OnEmulationStopped() {
     } else if (!boot_in_progress) {
         game_list->SetScanEnabled(true);
         game_list->PopulateAsync(UISettings::values.game_dirs);
+        if (!stopped_game_path.isEmpty()) {
+            game_list->ShowGameDetailsForPath(stopped_game_path);
+        }
     }
 }
 

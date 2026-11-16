@@ -8,14 +8,12 @@
 #include <QFileInfo>
 #include <QGridLayout>
 #include <QHBoxLayout>
-#include <QKeyEvent>
 #include <QLabel>
 #include <QListWidget>
 #include <QMenu>
 #include <QMimeData>
 #include <QPainter>
 #include <QPainterPath>
-#include <QScrollArea>
 #include <QScrollBar>
 #include <QSlider>
 #include <QStyle>
@@ -140,15 +138,6 @@ public:
         return RecentThumbSize + QSize(8, 8);
     }
 };
-
-QLabel* MakeHeading(QWidget* parent, qreal scale) {
-    auto* label = new QLabel(parent);
-    QFont font = label->font();
-    font.setBold(true);
-    font.setPointSizeF(font.pointSizeF() * scale);
-    label->setFont(font);
-    return label;
-}
 
 } // namespace
 
@@ -277,38 +266,22 @@ void BackgroundDropZone::dropEvent(QDropEvent* event) {
 }
 
 HomeCustomizePanel::HomeCustomizePanel(HomeBackground* background_, QWidget* parent)
-    : QFrame{parent}, background{background_} {
-    setObjectName(QStringLiteral("HomeCustomizePanel"));
-    setStyleSheet(QStringLiteral("#HomeCustomizePanel { border: none; border-left: 1px solid "
-                                 "palette(mid); background: palette(window); }"));
-    // GameList animates the maximum width to slide the panel in and out.
-    setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Preferred);
-    setMinimumWidth(0);
-    setAutoFillBackground(true);
-
-    auto* outer = new QVBoxLayout(this);
-    outer->setContentsMargins(1, 0, 0, 0);
-    outer->setSpacing(0);
-
-    auto* scroll = new QScrollArea(this);
-    scroll->setWidgetResizable(true);
-    scroll->setFrameShape(QFrame::NoFrame);
-    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    outer->addWidget(scroll);
-
-    auto* content = new QWidget(scroll);
-    scroll->setWidget(content);
+    : HomeSidePanel{parent}, background{background_} {
+    QWidget* content = Content();
     auto* layout = new QVBoxLayout(content);
     layout->setContentsMargins(16, 12, 16, 16);
     layout->setSpacing(8);
 
     // Header
     auto* header = new QHBoxLayout;
+    header->setSpacing(8);
+    title_icon = new QLabel(content);
     title_label = MakeHeading(content, 1.4);
     close_button = new QToolButton(content);
     close_button->setAutoRaise(true);
-    close_button->setIcon(style()->standardIcon(QStyle::SP_TitleBarCloseButton));
+    close_button->setIconSize(QSize(16, 16));
     connect(close_button, &QToolButton::clicked, this, &HomeCustomizePanel::CloseRequested);
+    header->addWidget(title_icon);
     header->addWidget(title_label, 1);
     header->addWidget(close_button);
     layout->addLayout(header);
@@ -406,12 +379,8 @@ HomeCustomizePanel::HomeCustomizePanel(HomeBackground* background_, QWidget* par
     layout->addStretch(1);
 
     RetranslateUI();
-    RefreshModeIcons();
+    RefreshGlyphs();
     SyncFromSettings();
-}
-
-QSize HomeCustomizePanel::sizeHint() const {
-    return {PanelWidth, QFrame::sizeHint().height()};
 }
 
 void HomeCustomizePanel::SyncFromSettings() {
@@ -537,12 +506,16 @@ void HomeCustomizePanel::OnRecentContextMenu(const QPoint& pos) {
     menu.exec(recent_list->viewport()->mapToGlobal(pos));
 }
 
-void HomeCustomizePanel::RefreshModeIcons() {
-    const QColor color = palette().color(QPalette::ButtonText);
+void HomeCustomizePanel::RefreshGlyphs() {
+    const QPalette& pal = palette();
     const qreal dpr = devicePixelRatioF();
+    const QColor color = pal.color(QPalette::ButtonText);
     for (size_t i = 0; i < Modes.size(); ++i) {
         mode_buttons[i]->setIcon(MakeModeIcon(Modes[i], color, dpr));
     }
+    close_button->setIcon(HomeGlyphs::Close(color, dpr));
+    title_icon->setPixmap(
+        HomeGlyphs::Brush(pal.color(QPalette::Highlight), dpr, 22).pixmap(QSize(22, 22), dpr));
 }
 
 void HomeCustomizePanel::UpdateIconSizeLabel() {
@@ -555,7 +528,7 @@ void HomeCustomizePanel::UpdateIconSizeLabel() {
 }
 
 void HomeCustomizePanel::RetranslateUI() {
-    title_label->setText(tr("Home Screen"));
+    title_label->setText(tr("Customization"));
     background_label->setText(tr("Background"));
     close_button->setToolTip(tr("Close"));
     drop_zone->setToolTip(tr("Click to choose a background, or drop an image or video here"));
@@ -568,26 +541,12 @@ void HomeCustomizePanel::RetranslateUI() {
     UpdateIconSizeLabel();
 }
 
-void HomeCustomizePanel::keyPressEvent(QKeyEvent* event) {
-    if (event->key() == Qt::Key_Escape) {
-        emit CloseRequested();
-        return;
-    }
-    QFrame::keyPressEvent(event);
+void HomeCustomizePanel::OnLanguageChanged() {
+    RetranslateUI();
 }
 
-void HomeCustomizePanel::changeEvent(QEvent* event) {
-    // The style sheet set in the constructor sends a StyleChange before the children exist.
-    if (!icon_size_slider) {
-        QFrame::changeEvent(event);
-        return;
-    }
-    if (event->type() == QEvent::LanguageChange) {
-        RetranslateUI();
-    } else if (event->type() == QEvent::PaletteChange || event->type() == QEvent::StyleChange) {
-        RefreshModeIcons();
-        thumbnail_cache.clear();
-        RefreshRecents();
-    }
-    QFrame::changeEvent(event);
+void HomeCustomizePanel::OnPaletteChanged() {
+    RefreshGlyphs();
+    thumbnail_cache.clear();
+    RefreshRecents();
 }

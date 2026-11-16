@@ -11,6 +11,7 @@
 
 #include "common/common_types.h"
 #include "common/settings_enums.h"
+#include "yuzu/game/home_side_panel.h"
 
 class HomeBackground;
 class QButtonGroup;
@@ -50,16 +51,13 @@ private:
     bool drag_active = false;
 };
 
-/// Sidebar opened from the home screen's context menu. Every change applies immediately.
-class HomeCustomizePanel : public QFrame {
+/// Sidebar opened from the home screen's brush button or context menu. Every change applies
+/// immediately.
+class HomeCustomizePanel : public HomeSidePanel {
     Q_OBJECT
 
 public:
-    static constexpr int PanelWidth = 320;
-
     explicit HomeCustomizePanel(HomeBackground* background, QWidget* parent = nullptr);
-
-    QSize sizeHint() const override;
 
     /// Reflects the current settings (mode, icon size, background, recents).
     void SyncFromSettings();
@@ -70,16 +68,15 @@ signals:
     void RecentBackgroundRemoved(const QString& path);
     void GameListModeRequested(Settings::GameListMode mode);
     void GameIconSizeRequested(u32 size);
-    void CloseRequested();
 
 protected:
-    void keyPressEvent(QKeyEvent* event) override;
-    void changeEvent(QEvent* event) override;
+    void OnPaletteChanged() override;
+    void OnLanguageChanged() override;
 
 private:
     void Browse();
     void RefreshRecents();
-    void RefreshModeIcons();
+    void RefreshGlyphs();
     void RetranslateUI();
     void UpdateIconSizeLabel();
     QPixmap Thumbnail(const QString& path);
@@ -87,6 +84,7 @@ private:
 
     HomeBackground* background;
 
+    QLabel* title_icon = nullptr;
     QLabel* title_label = nullptr;
     QToolButton* close_button = nullptr;
     QLabel* background_label = nullptr;

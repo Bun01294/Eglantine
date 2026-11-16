@@ -257,6 +257,8 @@ add_executable(yuzu
     game/carousel.h game/carousel.cpp
     game/home_background.h game/home_background.cpp
     game/home_customize_panel.h game/home_customize_panel.cpp
+    game/home_side_panel.h game/home_side_panel.cpp
+    game/game_details_panel.h game/game_details_panel.cpp
 )
 
 set_target_properties(yuzu PROPERTIES OUTPUT_NAME "eglantine")
