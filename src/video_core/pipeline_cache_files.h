@@ -2,6 +2,7 @@
 #pragma once
 
 #include <array>
+#include <filesystem>
 #include <string_view>
 
 #include "common/common_types.h"
@@ -19,6 +20,7 @@ inline constexpr std::array<char, 8> NVN_DRIVER_CACHE_MAGIC{'N', 'V', 'N', 'V',
                                                              'K', 'C', 'H', '1'};
 inline constexpr std::string_view NVN_DRIVER_CACHE_FILE_NAME = "nvn_pipelines.vkcache";
 
+inline constexpr std::string_view MKW_EMULATED_CACHE_SUBDIR = "mkw_zero_depth_v1";
 inline constexpr std::array<std::string_view, 4> EMULATED_VULKAN_CACHE_FILES{
     "vulkan.bin", "vulkan_mesh.bin", "vulkan_used.bin", "vulkan_pipelines.bin",
 };
@@ -37,5 +39,12 @@ inline constexpr std::array<std::string_view, 4> EMULATED_VULKAN_CACHE_FILES{
     }
     return IsNvnPipelineCacheFile(name);
 }
+
+enum class NvnCacheTransition { Unchanged, Cleared, Failed };
+
+/// An emulated-path cache is evidence of a previous run. Consume it at VTX-HLE startup so
+/// subsequent VTX-HLE launches can reuse the cache they built.
+NvnCacheTransition ClearShaderCachesForNvn(const std::filesystem::path& title_dir,
+                                          bool mario_kart_world);
 
 } // namespace VideoCommon

@@ -21,6 +21,8 @@ in two ways, chosen per game with **Graphics → Graphics path**:
 
 - Configure → Graphics → Graphics path, or the same setting in a game's properties. It takes
   effect at the next game start.
+- The first VTX-HLE launch after Emulated GPU has built a shader cache clears the game's shader
+  caches. Later VTX-HLE launches can reuse the cache built on the new path.
 - `EDEN_NX2_NVN_HLE=1` forces VTX-HLE on and `EDEN_NX2_NVN_HLE=0` forces it off for any game, over
   the setting.
 - While VTX-HLE is selected, the settings it does not apply are greyed out, with the reason in the

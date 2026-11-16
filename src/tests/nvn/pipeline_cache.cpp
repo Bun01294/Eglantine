@@ -2500,6 +2500,45 @@ TEST_CASE("Async compile: the shader notifier counts queued and running compiles
     REQUIRE(cache.Stats().async_queued == 2);
 }
 
+TEST_CASE("VTX-HLE clears the title shader caches once after emulated GPU use",
+          "[nvn][vtxhle][shader-cache-transition]") {
+    using namespace VideoCommon;
+    TempDirectory directory;
+    const auto title = directory.path / "0400c3f00006e000";
+    const auto other = directory.path / "other-title";
+    const auto legacy = title / MKW_EMULATED_CACHE_SUBDIR;
+    std::filesystem::create_directories(legacy);
+    std::filesystem::create_directories(other);
+    const auto portable = title / "nvn_pipelines.k1234.bin";
+    const auto driver = title / NVN_DRIVER_CACHE_FILE_NAME;
+    const auto unrelated = title / "notes.txt";
+    std::ofstream(portable) << "nvn";
+    std::ofstream(driver) << "driver";
+    std::ofstream(unrelated) << "notes";
+    std::ofstream(other / "vulkan.bin") << "other";
+    CHECK(ClearShaderCachesForNvn(title, true) == NvnCacheTransition::Unchanged);
+    CHECK(std::filesystem::exists(portable));
+    CHECK(std::filesystem::exists(driver));
+
+    for (auto name : EMULATED_VULKAN_CACHE_FILES) {
+        std::ofstream(legacy / name) << "legacy";
+    }
+    std::ofstream(title / "opengl.bin") << "gl";
+    CHECK(ClearShaderCachesForNvn(title, true) == NvnCacheTransition::Cleared);
+    CHECK_FALSE(std::filesystem::exists(portable));
+    CHECK_FALSE(std::filesystem::exists(driver));
+    CHECK_FALSE(std::filesystem::exists(title / "opengl.bin"));
+    CHECK(std::filesystem::is_empty(legacy));
+    CHECK(std::filesystem::exists(unrelated));
+    CHECK(std::filesystem::exists(other / "vulkan.bin"));
+
+    std::ofstream(portable) << "fresh NVN cache";
+    CHECK(ClearShaderCachesForNvn(title, true) == NvnCacheTransition::Unchanged);
+    CHECK(std::filesystem::exists(portable));
+    CHECK(ClearShaderCachesForNvn(directory.path / "missing", false) ==
+          NvnCacheTransition::Unchanged);
+}
+
 TEST_CASE("Graphics lookahead builds the next pipeline without skipping a draw",
           "[nvn][pipeline-lookahead]") {
     const auto vulkan = MakeHeadlessVulkan();
