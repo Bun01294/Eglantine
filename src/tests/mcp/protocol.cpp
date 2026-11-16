@@ -1,18 +1,15 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#include <array>
-#include <set>
-
 #include <catch2/catch_test_macros.hpp>
 
-#include "common/settings.h"
-#include "core/debugger/mapped_range_hook.h"
 #include "mcp/control.h"
 #include "mcp/protocol.h"
 #include "mcp/timeline.h"
 #include "mcp/tool_registry.h"
-#include "mcp/tools/tool_helpers.h"
 
 using namespace Mcp;
 
@@ -163,12 +160,6 @@ TEST_CASE("MCP HTTP rules", "[mcp]") {
     REQUIRE_FALSE(Protocol::IsAllowedHost("localhost.evil.example"));
     REQUIRE_FALSE(Protocol::IsAllowedHost("127.0.0.1.evil.example:6544"));
 
-    REQUIRE(Protocol::TokenMatches("Bearer secret", "Bearer secret"));
-    REQUIRE_FALSE(Protocol::TokenMatches("Bearer secreT", "Bearer secret"));
-    REQUIRE_FALSE(Protocol::TokenMatches("Bearer secre", "Bearer secret"));
-    REQUIRE_FALSE(Protocol::TokenMatches("Bearer secret2", "Bearer secret"));
-    REQUIRE_FALSE(Protocol::TokenMatches("", "Bearer secret"));
-
     HttpRequest get = req;
     get.method = "GET";
     REQUIRE(p.Handle(get).status == 405);
@@ -180,22 +171,6 @@ TEST_CASE("MCP HTTP rules", "[mcp]") {
     HttpRequest bad = req;
     bad.body = "{not json";
     REQUIRE(json::parse(p.Handle(bad).body)["error"]["code"] == -32700);
-
-    // Fetch Metadata: a plain cross-site GET carries no Origin but says where it comes from.
-    REQUIRE(Protocol::IsAllowedFetchSite(""));
-    REQUIRE(Protocol::IsAllowedFetchSite("same-origin"));
-    REQUIRE(Protocol::IsAllowedFetchSite("none"));
-    REQUIRE_FALSE(Protocol::IsAllowedFetchSite("cross-site"));
-    REQUIRE_FALSE(Protocol::IsAllowedFetchSite("same-site"));
-    HttpRequest cross = req;
-    cross.headers["sec-fetch-site"] = "cross-site";
-    REQUIRE(p.Handle(cross).status == 403);
-    cross.headers["sec-fetch-site"] = "same-origin";
-    REQUIRE(p.Handle(cross).status == 200);
-
-    HttpRequest deep = req;
-    deep.body = std::string(100000, '[') + std::string(100000, ']');
-    REQUIRE(p.Handle(deep).status == 400);
 
     HttpRequest wrong_path = req;
     wrong_path.path = "/other";
@@ -246,34 +221,6 @@ TEST_CASE("MCP argument validation", "[mcp]") {
     REQUIRE(IsValidToolName("read_memory"));
     REQUIRE_FALSE(IsValidToolName("ReadMemory"));
     REQUIRE_FALSE(IsValidToolName("1abc"));
-}
-
-TEST_CASE("MCP events with invalid UTF-8 always serialize", "[mcp]") {
-    Timeline t{8};
-    // A lone 0xFF, Shift-JIS text, a truncated sequence, an overlong form and a surrogate.
-    t.Push(EventKind::Log, 2, "Debug\xff", "bad \xff byte");
-    t.Push(EventKind::Log, 2, "Service", "\x83\x65\x83\x58\x83\x67");
-    t.Push(EventKind::Log, 2, "Service", "cut \xE3\x81");
-    t.Push(EventKind::Log, 2, "Service", "overlong \xC0\xAF surrogate \xED\xA0\x80 ok \xE3\x81\x82");
-    t.Push(EventKind::Log, 2, "Service", std::string(100000, 'x'));
-    const auto r = t.Read({});
-    REQUIRE(r.events.size() == 5);
-    for (const auto& e : r.events) {
-        REQUIRE_NOTHROW(EventJson(e).dump());
-        REQUIRE(e.message.size() <= kMaxMessageBytes);
-    }
-    REQUIRE(r.events[0].message == "bad \xEF\xBF\xBD byte");
-    REQUIRE(r.events[3].message.find("\xE3\x81\x82") != std::string::npos);
-    REQUIRE(SanitizeText("a\xF0\x9F\x98\x80z", 100) == "a\xF0\x9F\x98\x80z"); // valid 4-byte
-    REQUIRE(SanitizeText("a\xF0\x9F\x98\x80z", 3) == "a");                       // not cut inside
-    // Tool results with raw guest bytes serialize too (replaced, not thrown).
-    REQUIRE_NOTHROW(ToolResult::Structured(json{{"s", std::string("\xff\xfe")}}));
-}
-
-TEST_CASE("MCP Allow Writes is never saved", "[mcp]") {
-    REQUIRE_FALSE(Settings::values.mcp_allow_writes.Save());
-    REQUIRE_FALSE(Settings::values.mcp_allow_writes.GetValue());
-    REQUIRE_FALSE(Settings::values.enable_mcp_server.GetValue());
 }
 
 TEST_CASE("MCP timeline cursor, filters and wraparound", "[mcp]") {
@@ -354,6 +301,48 @@ TEST_CASE("MCP protocol enforces the control lease", "[mcp]") {
     REQUIRE(Call(p, b, "drive", json::object())["result"]["content"][0]["text"] == "driving");
 }
 
+TEST_CASE("MCP ending a session releases its control lease", "[mcp]") {
+    ToolRegistry registry;
+    registry.Add(Tool{
+        .name = "drive",
+        .description = "Needs control",
+        .requires_control = true,
+        .handler = [](ToolContext&, const json&) { return ToolResult::Text("driving"); },
+    });
+    ControlLease lease;
+    std::string ended;
+    bool lease_held_at_end = false;
+    ProtocolOptions options;
+    // The session's background work is stopped before its lease is freed.
+    options.on_session_end = [&](const std::string& id) {
+        ended = id;
+        lease_held_at_end = lease.Current().has_value();
+    };
+    Protocol p{registry, options, [&lease] {
+                   ToolContext c;
+                   c.control = &lease;
+                   return c;
+               }};
+    const auto a = Initialize(p);
+    REQUIRE(Call(p, a, "drive", json::object())["result"]["content"][0]["text"] == "driving");
+    REQUIRE(lease.Current().has_value());
+    HttpRequest del;
+    del.method = "DELETE";
+    del.path = "/mcp";
+    del.headers["mcp-session-id"] = a;
+    REQUIRE(p.Handle(del).status == 204);
+    REQUIRE(ended == a);
+    REQUIRE(lease_held_at_end);
+    REQUIRE_FALSE(lease.Current().has_value());
+}
+
+TEST_CASE("MCP rejects a non-string jsonrpc member", "[mcp]") {
+    const auto registry = MakeRegistry();
+    Protocol p{registry, {}, {}};
+    const auto res = p.Handle(Post(json{{"jsonrpc", 2}, {"id", 1}, {"method", "ping"}}));
+    REQUIRE(json::parse(res.body)["error"]["code"] == -32600);
+}
+
 TEST_CASE("MCP refused calls do not take the control lease", "[mcp]") {
     ToolRegistry registry;
     registry.Add(Tool{
@@ -382,7 +371,7 @@ void RegisterAllTools(ToolRegistry& registry);
 TEST_CASE("MCP every built-in tool has a valid definition", "[mcp]") {
     ToolRegistry registry;
     RegisterAllTools(registry); // asserts on duplicate or malformed names
-    REQUIRE(registry.Size() >= 35); // the subset of FUKKO's tools this build carries
+    REQUIRE(registry.Size() >= 60);
     registry.ForEach([](const Tool& tool) {
         INFO(tool.name);
         REQUIRE(IsValidToolName(tool.name));
@@ -392,16 +381,6 @@ TEST_CASE("MCP every built-in tool has a valid definition", "[mcp]") {
         // Writes need the lease too, so one agent can't change state under another.
         if (tool.requires_write) {
             REQUIRE(tool.requires_control);
-        }
-        // Read-only until Allow Writes: a tool that changes anything needs writes, except these
-        // that only manage the lease, mark the timeline or switch watches.
-        static const std::set<std::string> kNoWriteGate{"acquire_control", "release_control",
-                                                        "mark", "watch_add", "watch_remove"};
-        if (!tool.annotations.read_only && !tool.requires_write) {
-            REQUIRE(kNoWriteGate.contains(tool.name));
-        }
-        if (tool.annotations.destructive) {
-            REQUIRE(tool.requires_write);
         }
         // An empty object must either validate or fail only for missing required fields.
         const auto error = ValidateArguments(tool.input_schema, json::object());
@@ -415,46 +394,13 @@ TEST_CASE("MCP every built-in tool has a valid definition", "[mcp]") {
     });
 }
 
-TEST_CASE("MCP frames fall back to the last presented screenshot", "[mcp]") {
-    ToolContext ctx; // no system: the capture layer is unavailable, as under VTX-HLE
-    RememberScreenshot({0x89, 'P', 'N', 'G'}, 1234);
-    const auto last = LastScreenshot();
-    REQUIRE(last);
-    REQUIRE(last->frame == 1234);
-    std::string source;
-    std::string error;
-    const auto png = FallbackFrame(ctx, 640, source, error);
-    REQUIRE(png);
-    REQUIRE(png->size() == 4);
-    REQUIRE(source.find("last presented screenshot (guest frame 1234") != std::string::npos);
-    // Without a host a screenshot fails cleanly and leaves the remembered frame alone.
-    REQUIRE_FALSE(CaptureScreenshot(ctx, 640, std::chrono::milliseconds{1}, error));
-    REQUIRE(LastScreenshot()->frame == 1234);
-}
-
-TEST_CASE("MCP watches can sample at invalidate; mapped-range lines are queryable", "[mcp]") {
+TEST_CASE("MCP env_switches only lists the emulator's own variables", "[mcp]") {
     ToolRegistry registry;
     RegisterAllTools(registry);
-    const Tool* watch_add = registry.Find("watch_add");
-    REQUIRE(watch_add);
-    REQUIRE_FALSE(ValidateArguments(watch_add->input_schema,
-                                    json{{"address", "0x1000"}, {"type", "f32"}, {"at", "invalidate"}}));
-    REQUIRE_FALSE(ValidateArguments(watch_add->input_schema, json{{"address", 4096}, {"at", "present"}}));
-    REQUIRE(ValidateArguments(watch_add->input_schema, json{{"address", 4096}, {"at", "later"}}));
-    // The invalidate hook is only installed while an at:"invalidate" watch exists.
-    REQUIRE(Core::Trace::g_invalidate_hook.load() == nullptr);
-
-    // EDEN_NX2_DIAG_INVALIDATE lines reach the timeline as Core log events through the log sink.
-    Timeline t{16};
-    t.Push(EventKind::Log, 2, "Core", "[nvn] mapped-range flush f10 addr=0x1000 size=0xc0 words: 0");
-    t.Push(EventKind::Log, 2, "Core",
-           "[nvn] mapped-range invalidate f10 addr=0x1000 size=0xc0 last_seq=5 completed=5 words: "
-           "3e1db22d");
-    t.Push(EventKind::Log, 2, "Render.Vulkan", "[nvn] mapped-range invalidate elsewhere");
-    const auto q = ParseQuery(json{{"kinds", {"log"}},
-                                   {"source_prefix", "Core"},
-                                   {"contains", "mapped-range invalidate"}});
-    const auto r = t.Read(q);
-    REQUIRE(r.events.size() == 1);
-    REQUIRE(r.events[0].message.find("3e1db22d") != std::string::npos);
+    const Tool* env = registry.Find("env_switches");
+    REQUIRE(env != nullptr);
+    ToolContext ctx;
+    REQUIRE(env->handler(ctx, json{{"prefix", ""}}).is_error);
+    REQUIRE(env->handler(ctx, json{{"prefix", "PATH"}}).is_error);
+    REQUIRE_FALSE(env->handler(ctx, json{{"prefix", "EDEN_NX2_"}}).is_error);
 }

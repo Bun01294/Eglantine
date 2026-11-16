@@ -1,23 +1,23 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// Determinism presets (applied by name through Settings::values.linkage, restricted to an
-// allowlist of graphics/CPU/audio/timing settings) and the EDEN_ env switches in effect.
-// Credentials, paths, network, logging and the MCP server's own settings are never exposed or
-// changed.
+// Emulator settings by name (reflection over Settings::values.linkage), debug knobs, determinism
+// presets and the NX2 env switches in effect. Web-service credentials and the MCP server's own
+// security settings are never exposed or changed.
 
 #include <algorithm>
-#include <array>
 #include <cctype>
 #include <cstdlib>
-#include <string_view>
 
 #include <fmt/format.h>
 
 #include "common/settings.h"
 #include "mcp/context.h"
+#include "mcp/control.h"
 #include "mcp/host.h"
-#include "mcp/server.h"
 #include "mcp/timeline.h"
 #include "mcp/tool_registry.h"
 #include "mcp/tools/tool_helpers.h"
@@ -39,71 +39,46 @@ std::string Lower(std::string s) {
     return s;
 }
 
-/// Settings are exposed by ALLOWLIST, not by hiding the dangerous ones: a setting added later
-/// stays unreachable until someone decides it is safe here.
-///
-/// Allowed: whole categories that only tune how the guest is rendered, executed or heard
-/// (Renderer, RendererAdvanced, RendererHacks, RendererExtensions, Cpu, CpuDebug, CpuUnsafe,
-/// Audio, SystemAudio, Core) plus the System settings that make runs repeatable (RNG seed, RTC,
-/// language, region, time zone, docked mode, fast CPU/GPU time).
-///
-/// Never allowed, whatever the category (checked by name on top of the allowlist): anything that
-/// opens the GDB stub, the network or UDP, names a file or directory, dumps or logs (shaders,
-/// NSO/ExeFS, macros, audio commands, FS access, GPU logs, log_filter), identity and secrets
-/// (username, device name, serials, tokens, passwords, keys, dev keys), the web service, the MCP
-/// server's own settings, audio/IO device ids, and the post-process shader chain/preset (file
-/// names). The categories Debugging, DebuggingGraphics, RendererDebug, Paths, DataStorage,
-/// Network, WebService, Miscellaneous, Controls, Ui*, Services, Multiplayer, AddOns, Android and
-/// GpuDriver are not on the allowlist at all.
-bool Allowed(const Settings::BasicSetting& s) {
+/// Settings agents may not read or change: credentials, console identity (serials), and the MCP
+/// server's own access control.
+bool Hidden(const Settings::BasicSetting& s) {
     const std::string name = Lower(s.GetLabel());
-    static constexpr std::array<std::string_view, 17> kDeniedFragments{
-        "dump", "token",    "password", "passwd",  "secret", "serial", "key",   "mcp",        "gdb",
-        "udp",  "airplane", "username", "network", "log",    "web",    "debug", "post_shader"};
-    static constexpr std::array<std::string_view, 8> kDeniedSuffixes{
-        "_path", "_dir", "_file", "_url", "_host", "_server", "_port", "_device"};
-    for (const auto fragment : kDeniedFragments) {
-        if (name.find(fragment) != std::string::npos) {
-            return false;
-        }
-    }
-    for (const auto suffix : kDeniedSuffixes) {
-        if (name.ends_with(suffix) && name != "vulkan_device") {
-            return false;
-        }
-    }
-    switch (s.GetCategory()) {
-    case Settings::Category::Renderer:
-    case Settings::Category::RendererAdvanced:
-    case Settings::Category::RendererHacks:
-    case Settings::Category::RendererExtensions:
-    case Settings::Category::Cpu:
-    case Settings::Category::CpuDebug:
-    case Settings::Category::CpuUnsafe:
-    case Settings::Category::Audio:
-    case Settings::Category::SystemAudio:
-    case Settings::Category::Core:
-        return true;
-    case Settings::Category::System: {
-        static constexpr std::array<std::string_view, 11> kSystem{
-            "custom_rtc",       "custom_rtc_enabled", "custom_rtc_offset", "fast_cpu_time",
-            "fast_gpu_time",    "language_index",     "region_index",      "rng_seed",
-            "rng_seed_enabled", "time_zone_index",    "use_docked_mode"};
-        return std::find(kSystem.begin(), kSystem.end(), name) != kSystem.end();
-    }
-    default:
-        return false;
-    }
+    return s.GetCategory() == Settings::Category::WebService || name.starts_with("mcp_") ||
+           name == "enable_mcp_server" || name.find("token") != std::string::npos ||
+           name.find("password") != std::string::npos || name.find("serial") != std::string::npos;
 }
 
 /// Looks up a setting by its exact config key. Returns nullptr if unknown or Hidden.
 Settings::BasicSetting* Find(const std::string& name) {
     auto& by_key = Settings::values.linkage.by_key;
     const auto it = by_key.find(name);
-    if (it == by_key.end() || !Allowed(*it->second)) {
+    if (it == by_key.end() || Hidden(*it->second)) {
         return nullptr;
     }
     return it->second;
+}
+
+/// Name and value of a setting (enum values by name). With detail, also its category, default,
+/// type, runtime modifiability, raw enum index, range and per-game override state.
+json SettingJson(const Settings::BasicSetting& s, bool detail) {
+    json out{{"name", s.GetLabel()}, {"value", s.IsEnum() ? s.Canonicalize() : s.ToString()}};
+    if (detail) {
+        out["category"] = Settings::TranslateCategory(s.GetCategory());
+        out["default"] = s.DefaultToString();
+        out["type"] = std::string{s.TypeId()};
+        out["runtime_modifiable"] = s.RuntimeModifiable();
+        if (s.IsEnum()) {
+            out["raw"] = s.ToString();
+        }
+        if (s.Ranged()) {
+            out["min"] = s.MinVal();
+            out["max"] = s.MaxVal();
+        }
+        if (s.Switchable()) {
+            out["per_game_override"] = !s.UsingGlobal();
+        }
+    }
+    return out;
 }
 
 /// Sets a setting from text; enum settings also accept their names (LoadString takes indices).
@@ -123,6 +98,48 @@ std::string SetFromString(Settings::BasicSetting& s, const std::string& value) {
     return {};
 }
 
+/// settings_list: visible settings, optionally limited to one category (case-insensitive), a
+/// name substring, or values that differ from their default.
+ToolResult SettingsList(ToolContext&, const json& args) {
+    const std::string filter = Lower(args.value("filter", ""));
+    const std::string category = Lower(args.value("category", ""));
+    const bool changed_only = args.value("changed_only", false);
+    json list = json::array();
+    for (const auto& [cat, settings] : Settings::values.linkage.by_category) {
+        const std::string cat_name = Lower(Settings::TranslateCategory(cat));
+        if (!category.empty() && cat_name != category) {
+            continue;
+        }
+        for (const auto* s : settings) {
+            if (Hidden(*s) || (!filter.empty() && Lower(s->GetLabel()).find(filter) == std::string::npos)) {
+                continue;
+            }
+            if (changed_only && s->ToString() == s->DefaultToString()) {
+                continue;
+            }
+            json entry = SettingJson(*s, false);
+            entry["category"] = Settings::TranslateCategory(cat);
+            list.push_back(std::move(entry));
+        }
+    }
+    return ToolResult::Structured(json{{"settings", std::move(list)}});
+}
+
+/// settings_get: detailed SettingJson per requested name; unknown or hidden names get an error
+/// entry instead of failing the call.
+ToolResult SettingsGet(ToolContext&, const json& args) {
+    json out = json::array();
+    for (const auto& n : args.at("names")) {
+        const auto name = n.get<std::string>();
+        if (auto* s = Find(name)) {
+            out.push_back(SettingJson(*s, true));
+        } else {
+            out.push_back({{"name", name}, {"error", "unknown or hidden setting"}});
+        }
+    }
+    return ToolResult::Structured(json{{"settings", std::move(out)}});
+}
+
 /**
  * Sets each name -> value pair in changes on the calling thread, logging each change on the
  * timeline. Failures are reported per entry and do not stop the others.
@@ -131,29 +148,18 @@ std::string SetFromString(Settings::BasicSetting& s, const std::string& value) {
  *         runtime-modifiable. is_error is set only when a single requested change failed.
  */
 ToolResult ApplyChanges(ToolContext& ctx, const json& changes, bool apply) {
-    if (!changes.is_object() || changes.size() > 64) {
-        return ToolResult::Error("values must be an object of at most 64 settings");
-    }
     json results = json::array();
     bool any_error = false;
     bool needs_reboot = false;
     for (const auto& [name, value] : changes.items()) {
         auto* s = Find(name);
         if (!s) {
-            results.push_back({{"name", name}, {"error", "unknown or not an exposed setting"}});
-            any_error = true;
-            continue;
-        }
-        if (!(value.is_string() || value.is_number() || value.is_boolean()) ||
-            (value.is_string() && value.get_ref<const std::string&>().size() > 128)) {
-            results.push_back({{"name", name},
-                               {"error", "value must be a number, boolean or "
-                                         "short string"}});
+            results.push_back({{"name", name}, {"error", "unknown or hidden setting"}});
             any_error = true;
             continue;
         }
         const std::string before = s->IsEnum() ? s->Canonicalize() : s->ToString();
-        const std::string text = value.is_string()    ? value.get<std::string>()
+        const std::string text = value.is_string() ? value.get<std::string>()
                                  : value.is_boolean() ? (value.get<bool>() ? "true" : "false")
                                                       : value.dump();
         if (std::string error = SetFromString(*s, text); !error.empty()) {
@@ -179,14 +185,64 @@ ToolResult ApplyChanges(ToolContext& ctx, const json& changes, bool apply) {
         ctx.host->ApplySettings();
     }
     json out{{"results", std::move(results)},
-             {"note", "Changed in memory only: this tool never writes the config file (the "
-                      "emulator itself may save its settings when it exits)."}};
+             {"note", "Changed in memory; the emulator may save them to its config when it saves "
+                      "settings (e.g. on exit)."}};
     if (needs_reboot) {
         out["reboot_needed"] = true;
     }
     ToolResult r = ToolResult::Structured(std::move(out));
-    r.is_error = any_error && changes.size() == 1;
+    // Any failed entry fails the call; the per-entry results say which ones applied.
+    r.is_error = any_error;
     return r;
+}
+
+ToolResult SettingsSet(ToolContext& ctx, const json& args) {
+    return ApplyChanges(ctx, args.at("values"), true);
+}
+
+/// debug_knobs: applies 'value', then 'set' and 'clear' bit lists, to the 16-bit knob mask.
+/// Reading is always allowed; an actual change needs MCP writes enabled.
+ToolResult DebugKnobs(ToolContext& ctx, const json& args) {
+    auto& knobs = Settings::values.debug_knobs;
+    const u16 before = knobs.GetValue();
+    u16 value = before;
+    if (args.contains("value")) {
+        value = static_cast<u16>(args["value"].get<u32>());
+    }
+    for (const auto& b : args.value("set", json::array())) {
+        value |= static_cast<u16>(1u << (b.get<u32>() & 0xF));
+    }
+    for (const auto& b : args.value("clear", json::array())) {
+        value &= static_cast<u16>(~(1u << (b.get<u32>() & 0xF)));
+    }
+    if (value != before) {
+        if (!ctx.writes_allowed) {
+            return ToolResult::Error("changing knobs needs MCP writes (Tools > MCP Server > Allow Writes)");
+        }
+        // Reading is free; changing needs the control lease like the other state changes.
+        ControlLease::Holder holder;
+        if (ctx.control != nullptr && !ctx.session_id.empty() &&
+            !ctx.control->Touch(ctx.session_id, holder)) {
+            return ToolResult::Error("another agent holds the control lease (control_status)");
+        }
+        knobs.SetValue(value);
+        if (ctx.timeline) {
+            ctx.timeline->Push(EventKind::State, 0, "mcp",
+                               fmt::format("debug_knobs {:#06x} -> {:#06x}", before, value));
+        }
+    }
+    json bits = json::array();
+    for (u32 i = 0; i < 16; ++i) {
+        if ((value >> i) & 1) {
+            bits.push_back(i);
+        }
+    }
+    return ToolResult::Structured(json{{"value", fmt::format("{:#06x}", value)},
+                                       {"previous", fmt::format("{:#06x}", before)},
+                                       {"bits_on", std::move(bits)},
+                                       {"note", "Code reads them with Settings::GetDebugKnobAt(i): "
+                                                "wrap an experimental path in a knob to A/B it "
+                                                "live without rebuilding."}});
 }
 
 /// set_determinism: maps rng_seed, rtc, language and region onto their settings (enabling the
@@ -217,28 +273,13 @@ ToolResult SetDeterminism(ToolContext& ctx, const json& args) {
     return ApplyChanges(ctx, changes, true);
 }
 
-/// Home directory prefixes in a value are shown as "~": paths in EDEN_ variables otherwise
-/// carry the OS user name.
-std::string ScrubHome(std::string value) {
-    for (const char* home_var : {"USERPROFILE", "HOME"}) {
-        const char* home = std::getenv(home_var);
-        if (home == nullptr || *home == '\0' || std::string_view{home}.size() < 2) {
-            continue;
-        }
-        for (size_t at = value.find(home); at != std::string::npos; at = value.find(home, at)) {
-            value.replace(at, std::string_view{home}.size(), "~");
-        }
-    }
-    return value;
-}
-
-/// env_switches: environment variables of this process whose names start with prefix
-/// (case-sensitive, default "EDEN_").
+/// env_switches: the emulator's own EDEN_* environment variables, optionally narrowed by a longer
+/// prefix. Other variables are never returned (the environment can hold unrelated credentials).
 ToolResult EnvSwitches(ToolContext&, const json& args) {
-    // Only EDEN_ variables, never PATH, USERPROFILE or whatever secrets the environment holds.
     const std::string prefix = args.value("prefix", "EDEN_");
-    if (!prefix.starts_with("EDEN_") || prefix.size() > 64) {
-        return ToolResult::Error("prefix must start with EDEN_");
+    if (!prefix.starts_with("EDEN_")) {
+        return ToolResult::Error("prefix must start with EDEN_ (only the emulator's own "
+                                 "switches are listed)");
     }
     json vars = json::object();
 #ifdef _WIN32
@@ -252,31 +293,89 @@ ToolResult EnvSwitches(ToolContext&, const json& args) {
             continue;
         }
         const auto eq = entry.find('=');
-        const std::string name{entry.substr(0, eq)};
-        std::string upper = name;
-        std::transform(upper.begin(), upper.end(), upper.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-        if (upper.find("TOKEN") != std::string::npos || upper.find("KEY") != std::string::npos ||
-            upper.find("SECRET") != std::string::npos || upper.find("PASS") != std::string::npos ||
-            upper.find("PWD") != std::string::npos) {
-            continue;
-        }
-        std::string value = eq == std::string_view::npos ? "" : std::string{entry.substr(eq + 1)};
-        if (value.size() > 256) {
-            value.resize(256);
-        }
-        vars[name] = ScrubHome(std::move(value));
+        vars[std::string{entry.substr(0, eq)}] =
+            eq == std::string_view::npos ? "" : std::string{entry.substr(eq + 1)};
     }
     return ToolResult::Structured(json{
         {"variables", std::move(vars)},
-        {"note", "Only EDEN_* variables, secrets-looking names skipped, values cut at 256 "
-                 "characters. Most EDEN_NX2_* switches are read once at first use: changing them "
-                 "needs a relaunch with the variable set (the perf HUD is live: perf_report)."}});
+        {"note", "Most EDEN_NX2_* switches are read once at first use: changing them needs a "
+                 "relaunch with the variable set (the GPU profiler is live: gpu_profile)."}});
 }
 
 } // namespace
 
+Settings::BasicSetting* FindAgentSetting(const std::string& name) {
+    return Find(name);
+}
+
+std::string SetSettingFromText(Settings::BasicSetting& setting, const std::string& value) {
+    return SetFromString(setting, value);
+}
+
+/// Registers the settings, debug knob, determinism and environment switch tools.
 void RegisterSettingsTools(ToolRegistry& registry) {
+    registry.Add(Tool{
+        .name = "settings_list",
+        .title = "List settings",
+        .description = "Emulator settings with their current values, by category. filter matches "
+                       "names; changed_only lists only non-default ones (a quick 'what's unusual "
+                       "here'). Credentials and MCP security settings are hidden.",
+        .input_schema = {{"type", "object"},
+                         {"properties",
+                          {{"filter", {{"type", "string"}}},
+                           {"category", {{"type", "string"}, {"description", "e.g. Renderer, Core, System, Debugging"}}},
+                           {"changed_only", {{"type", "boolean"}}}}},
+                         {"additionalProperties", false}},
+        .annotations = {.read_only = true, .idempotent = true},
+        .handler = SettingsList,
+    });
+    registry.Add(Tool{
+        .name = "settings_get",
+        .title = "Get settings",
+        .description = "Details of settings by name: value, default, type, range, whether they can "
+                       "change while a game runs, and per-game overrides.",
+        .input_schema = {{"type", "object"},
+                         {"properties",
+                          {{"names", {{"type", "array"}, {"items", {{"type", "string"}}},
+                                      {"minItems", 1}, {"maxItems", 100}}}}},
+                         {"required", {"names"}},
+                         {"additionalProperties", false}},
+        .annotations = {.read_only = true, .idempotent = true},
+        .handler = SettingsGet,
+    });
+    registry.Add(Tool{
+        .name = "settings_set",
+        .title = "Change settings",
+        .description = "Set settings by name, e.g. {values: {\"resolution_setup\": \"Res1X\", "
+                       "\"use_vsync\": \"Fifo\"}}. Enums take their names or indices. Applied to "
+                       "the running game where possible; others report reboot_needed.",
+        .input_schema = {{"type", "object"},
+                         {"properties",
+                          {{"values", {{"type", "object"},
+                                       {"description", "Setting name -> new value."}}}}},
+                         {"required", {"values"}},
+                         {"additionalProperties", false}},
+        .requires_write = true,
+        .requires_control = true,
+        .handler = SettingsSet,
+    });
+    registry.Add(Tool{
+        .name = "debug_knobs",
+        .title = "Debug knobs",
+        .description = "Read or change the 16 debug knob bits (Settings::GetDebugKnobAt) that "
+                       "experimental code paths can check, to A/B a change live. set / clear take "
+                       "bit numbers, value replaces all. Changing needs writes. A set bit inverts "
+                       "the EDEN_NX2_* variable it belongs to (video_core/nx2_knobs.h): 0 "
+                       "FRONT_BATCH, 1 FRAMES_AHEAD, 2 FENCE_BATCH, 3 INLINE_DEFER, 4 MACRO_COPY, "
+                       "5 FLUSH_DRAWS=32, 6 FLUSH_DRAWS=512, 7 BANK_REUPLOAD off, 8 COND_MACRO off (default on), 9 BACK_WAIT (present waits for the back thread), 10 HOST_IMPORT (native 64 KiB banks read guest memory in place).",
+        .input_schema = {{"type", "object"},
+                         {"properties",
+                          {{"value", {{"type", "integer"}, {"minimum", 0}, {"maximum", 65535}}},
+                           {"set", {{"type", "array"}, {"items", {{"type", "integer"}, {"minimum", 0}, {"maximum", 15}}}}},
+                           {"clear", {{"type", "array"}, {"items", {{"type", "integer"}, {"minimum", 0}, {"maximum", 15}}}}}}},
+                         {"additionalProperties", false}},
+        .handler = DebugKnobs,
+    });
     registry.Add(Tool{
         .name = "set_determinism",
         .title = "Determinism settings",
@@ -285,17 +384,10 @@ void RegisterSettingsTools(ToolRegistry& registry) {
                        "Most take effect on the next boot.",
         .input_schema = {{"type", "object"},
                          {"properties",
-                          {{"rng_seed",
-                            {{"type", "integer"}, {"minimum", 0}, {"maximum", 4294967295LL}}},
+                          {{"rng_seed", {{"type", "integer"}, {"minimum", 0}, {"maximum", 4294967295LL}}},
                            {"rtc", {{"type", "integer"}}},
-                           {"language",
-                            {{"type", "string"},
-                             {"maxLength", 32},
-                             {"description", "e.g. EnglishAmerican, Japanese, or an index"}}},
-                           {"region",
-                            {{"type", "string"},
-                             {"maxLength", 32},
-                             {"description", "e.g. Usa, Europe, Japan, or an index"}}},
+                           {"language", {{"type", "string"}, {"description", "e.g. EnglishAmerican, Japanese, or an index"}}},
+                           {"region", {{"type", "string"}, {"description", "e.g. Usa, Europe, Japan, or an index"}}},
                            {"clear", {{"type", "boolean"}}}}},
                          {"additionalProperties", false}},
         .requires_write = true,
@@ -305,16 +397,12 @@ void RegisterSettingsTools(ToolRegistry& registry) {
     registry.Add(Tool{
         .name = "env_switches",
         .title = "Environment switches",
-        .description = "EDEN_* environment variables in effect for this emulator process, i.e. "
-                       "which EDEN_NX2_* diagnostics and workarounds are on. Other variables "
-                       "are never shown; names containing TOKEN, KEY, SECRET, PASS or PWD are "
-                       "skipped; values are cut at 256 characters.",
+        .description = "The emulator's EDEN_* environment variables, i.e. which EDEN_NX2_* "
+                       "diagnostics and workarounds are on. prefix narrows the list and must start "
+                       "with EDEN_; other variables are never returned.",
         .input_schema = {{"type", "object"},
                          {"properties",
-                          {{"prefix",
-                            {{"type", "string"},
-                             {"maxLength", 64},
-                             {"description", "Must start with EDEN_ (default EDEN_)."}}}}},
+                          {{"prefix", {{"type", "string"}, {"pattern", "^EDEN_"}}}}},
                          {"additionalProperties", false}},
         .annotations = {.read_only = true, .idempotent = true},
         .handler = EnvSwitches,

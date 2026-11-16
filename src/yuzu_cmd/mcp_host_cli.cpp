@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -34,43 +37,25 @@ InputCommon::InputSubsystem* CliMcpHost::GetInputSubsystem() {
     return &input;
 }
 
+std::string CliMcpHost::BootGame(const std::string&) {
+    return "eden-cli runs the game given on its command line; relaunch it with another game";
+}
+
+/// Queues fn for the main thread and waits up to 30 s for its result.
 std::string CliMcpHost::RunOnMain(std::function<std::string()> fn) {
-    // `fn` often captures references into the caller's frame: after a timeout it must never run
-    // later. A task that already started is waited for instead of abandoned.
-    struct Shared {
-        std::mutex mutex;
-        bool abandoned = false;
-        bool started = false;
-    };
-    auto shared = std::make_shared<Shared>();
     auto task = std::make_shared<std::packaged_task<std::string()>>(std::move(fn));
     auto result = task->get_future();
     {
         std::scoped_lock lock{queue_mutex};
-        queue.emplace_back([task, shared] {
-            {
-                std::scoped_lock lock{shared->mutex};
-                if (shared->abandoned) {
-                    return;
-                }
-                shared->started = true;
-            }
-            (*task)();
-        });
+        queue.emplace_back([task] { (*task)(); });
     }
     if (result.wait_for(std::chrono::seconds{30}) != std::future_status::ready) {
-        {
-            std::scoped_lock lock{shared->mutex};
-            if (!shared->started) {
-                shared->abandoned = true;
-                return "timed out waiting for the main thread";
-            }
-        }
-        result.wait(); // already running on the main thread: it finishes soon
+        return "timed out waiting for the main thread";
     }
     return result.get();
 }
 
+/// Runs the queued main thread tasks and samples the perf counters every 500 ms.
 void CliMcpHost::DrainMainThread() {
     std::vector<std::function<void()>> tasks;
     {
@@ -108,6 +93,18 @@ std::string CliMcpHost::Resume() {
     });
 }
 
+std::string CliMcpHost::Stop() {
+    // eden-cli has no "no game" state: stopping the game ends the app.
+    quit_requested = true;
+    return {};
+}
+
+std::string CliMcpHost::Quit() {
+    quit_requested = true;
+    return {};
+}
+
+/// Applies changed settings to the running system on the main thread.
 std::string CliMcpHost::ApplySettings() {
     return RunOnMain([this] {
         if (system.IsPoweredOn()) {
@@ -117,6 +114,7 @@ std::string CliMcpHost::ApplySettings() {
     });
 }
 
+/// Runs fn on the TAS engine on the main thread.
 std::string CliMcpHost::WithTas(bool require_game,
                                 std::function<void(InputCommon::TasInput::Tas&)> fn) {
     return RunOnMain([this, require_game, fn = std::move(fn)]() -> std::string {
@@ -133,6 +131,7 @@ std::string CliMcpHost::WithTas(bool require_game,
     });
 }
 
+/// Asks the renderer for a 16:9 BGRA frame `width` wide and waits up to `timeout` for it.
 std::optional<Mcp::Frame> CliMcpHost::CaptureFrame(u32 width, std::chrono::milliseconds timeout,
                                                    std::string& error) {
     if (!system.IsPoweredOn()) {
@@ -173,12 +172,14 @@ std::optional<Mcp::Frame> CliMcpHost::CaptureFrame(u32 width, std::chrono::milli
         },
         Layout::DefaultFrameLayout(width, height));
     if (future.wait_for(timeout) != std::future_status::ready) {
-        error = "timed out waiting for a frame (paused, loading, or a hidden/null window)";
+        error = "timed out waiting for a frame (paused, loading, or a hidden/null window: "
+                "screenshot_raw works without one)";
         return std::nullopt;
     }
     return capture->frame;
 }
 
+/// Captures a frame and encodes it as an opaque RGBA PNG.
 std::optional<std::vector<u8>> CliMcpHost::CaptureScreenshotPng(u32 max_width,
                                                                 std::chrono::milliseconds timeout,
                                                                 std::string& error) {

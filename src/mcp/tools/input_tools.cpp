@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -7,7 +10,6 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <cmath>
 #include <thread>
 
 #include <fmt/format.h>
@@ -20,7 +22,6 @@
 #include "input_common/main.h"
 #include "mcp/context.h"
 #include "mcp/host.h"
-#include "mcp/server.h"
 #include "mcp/timeline.h"
 #include "mcp/tool_registry.h"
 #include "mcp/tools/tool_helpers.h"
@@ -34,16 +35,26 @@ using VirtualStick = InputCommon::VirtualGamepad::VirtualStick;
 
 /// Button names accepted by the tools, mapped to virtual gamepad buttons.
 constexpr std::array<std::pair<std::string_view, VirtualButton>, 20> kButtons{{
-    {"A", VirtualButton::ButtonA},          {"B", VirtualButton::ButtonB},
-    {"X", VirtualButton::ButtonX},          {"Y", VirtualButton::ButtonY},
-    {"LSTICK", VirtualButton::StickL},      {"RSTICK", VirtualButton::StickR},
-    {"L", VirtualButton::TriggerL},         {"R", VirtualButton::TriggerR},
-    {"ZL", VirtualButton::TriggerZL},       {"ZR", VirtualButton::TriggerZR},
-    {"PLUS", VirtualButton::ButtonPlus},    {"MINUS", VirtualButton::ButtonMinus},
-    {"DLEFT", VirtualButton::ButtonLeft},   {"DUP", VirtualButton::ButtonUp},
-    {"DRIGHT", VirtualButton::ButtonRight}, {"DDOWN", VirtualButton::ButtonDown},
-    {"SL", VirtualButton::ButtonSL},        {"SR", VirtualButton::ButtonSR},
-    {"HOME", VirtualButton::ButtonHome},    {"CAPTURE", VirtualButton::ButtonCapture},
+    {"A", VirtualButton::ButtonA},
+    {"B", VirtualButton::ButtonB},
+    {"X", VirtualButton::ButtonX},
+    {"Y", VirtualButton::ButtonY},
+    {"LSTICK", VirtualButton::StickL},
+    {"RSTICK", VirtualButton::StickR},
+    {"L", VirtualButton::TriggerL},
+    {"R", VirtualButton::TriggerR},
+    {"ZL", VirtualButton::TriggerZL},
+    {"ZR", VirtualButton::TriggerZR},
+    {"PLUS", VirtualButton::ButtonPlus},
+    {"MINUS", VirtualButton::ButtonMinus},
+    {"DLEFT", VirtualButton::ButtonLeft},
+    {"DUP", VirtualButton::ButtonUp},
+    {"DRIGHT", VirtualButton::ButtonRight},
+    {"DDOWN", VirtualButton::ButtonDown},
+    {"SL", VirtualButton::ButtonSL},
+    {"SR", VirtualButton::ButtonSR},
+    {"HOME", VirtualButton::ButtonHome},
+    {"CAPTURE", VirtualButton::ButtonCapture},
 }};
 
 /// JSON array of every button name in kButtons, for schema enums.
@@ -82,27 +93,8 @@ InputCommon::VirtualGamepad* Gamepad(ToolContext& ctx, std::string& error) {
 }
 
 /// Sleeps for ms clamped to 0..60000, returning early if the server is stopping.
-/// Sleeps `ms`; returns false as soon as Allow Writes is switched off or the server stops, so a
-/// long hold cannot outlive the user's revocation (the caller releases what it pressed).
-bool InputSleep(ToolContext& ctx, int ms) {
-    const auto until =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds{std::clamp(ms, 0, 60000)};
-    for (;;) {
-        if (ServerStopping() || !ctx.WritesAllowed()) {
-            return false;
-        }
-        const auto left = until - std::chrono::steady_clock::now();
-        if (left <= std::chrono::steady_clock::duration::zero()) {
-            return true;
-        }
-        std::this_thread::sleep_for(
-            std::min<std::chrono::steady_clock::duration>(left, std::chrono::milliseconds{20}));
-    }
-}
-
-std::string StoppedReason() {
-    return ServerStopping() ? "stopped: the MCP server is shutting down"
-                            : "stopped: writes disabled (Tools > MCP Server > Allow Writes)";
+void SleepMs(int ms) {
+    SleepUnlessStopping(std::chrono::milliseconds{std::clamp(ms, 0, 60000)});
 }
 
 /// Records an Input event on the timeline, if one is attached.
@@ -145,23 +137,16 @@ ToolResult PressButtons(ToolContext& ctx, const json& args) {
     const int hold_ms = args.value("hold_ms", 120);
     const int repeat = args.value("repeat", 1);
     const int gap_ms = args.value("gap_ms", 120);
-    const auto release = [&] {
-        for (const auto b : buttons) {
-            pad->SetButtonState(npad, b, false);
-        }
-    };
     for (int i = 0; i < repeat; ++i) {
-        // Writes can be revoked or the lease lost between presses: ask again before each one.
-        if (std::string refused = WriteGateError(ctx); !refused.empty()) {
-            return ToolResult::Error("stopped: " + refused);
-        }
         for (const auto b : buttons) {
             pad->SetButtonState(npad, b, true);
         }
-        const bool held = InputSleep(ctx, hold_ms);
-        release();
-        if (!held || (i + 1 < repeat && !InputSleep(ctx, gap_ms))) {
-            return ToolResult::Error(StoppedReason());
+        SleepMs(hold_ms);
+        for (const auto b : buttons) {
+            pad->SetButtonState(npad, b, false);
+        }
+        if (i + 1 < repeat) {
+            SleepMs(gap_ms);
         }
     }
     LogInput(ctx, fmt::format("press {} x{} hold {}ms (player npad {})",
@@ -178,68 +163,20 @@ ToolResult SetStick(ToolContext& ctx, const json& args) {
         return ToolResult::Error(error);
     }
     const size_t npad = NpadIndex(args);
-    const auto stick =
-        args.at("stick").get<std::string>() == "right" ? VirtualStick::Right : VirtualStick::Left;
+    const auto stick = args.at("stick").get<std::string>() == "right" ? VirtualStick::Right
+                                                                      : VirtualStick::Left;
     const float x = args.at("x").get<float>();
     const float y = args.at("y").get<float>();
     const int hold_ms = args.value("hold_ms", 0);
     pad->SetStickPosition(npad, stick, x, y);
     if (hold_ms > 0) {
-        const bool held = InputSleep(ctx, hold_ms);
+        SleepMs(hold_ms);
         pad->SetStickPosition(npad, stick, 0.0f, 0.0f);
-        if (!held) {
-            return ToolResult::Error(StoppedReason());
-        }
     }
-    LogInput(ctx, fmt::format("stick {} ({:.2f},{:.2f}) {}", args.at("stick").get<std::string>(), x,
-                              y, hold_ms > 0 ? fmt::format("for {}ms", hold_ms) : "latched"));
+    LogInput(ctx, fmt::format("stick {} ({:.2f},{:.2f}) {}", args.at("stick").get<std::string>(),
+                              x, y, hold_ms > 0 ? fmt::format("for {}ms", hold_ms) : "latched"));
     return ToolResult::Text(hold_ms > 0 ? "stick moved and released"
                                         : "stick latched (call again with 0,0 to center)");
-}
-
-/// Error text for steps that are not what InputStepsSchema describes. Routes come from files
-/// the user can edit by hand, so the handlers do not trust the schema alone. "" when fine.
-std::string ValidateSteps(const json& steps) {
-    // Route steps (hand-editable files) may be longer than the tool schema's 200; the 60 s total
-    // in RunInputSteps still bounds a run.
-    if (!steps.is_array() || steps.size() > 4000) {
-        return "input steps must be an array of at most 4000 steps";
-    }
-    const auto bad_stick = [](const json& v) {
-        return !v.is_array() || v.size() != 2 || !v[0].is_number() || !v[1].is_number() ||
-               std::abs(v[0].get<double>()) > 1.0 || std::abs(v[1].get<double>()) > 1.0;
-    };
-    const auto bad_ms = [](const json& step, const char* key) {
-        if (!step.contains(key)) {
-            return false;
-        }
-        const json& v = step[key];
-        return !v.is_number_integer() || v.get<long long>() < 0 || v.get<long long>() > 30000;
-    };
-    for (const auto& step : steps) {
-        if (!step.is_object()) {
-            return "input step is not an object";
-        }
-        if (step.contains("buttons")) {
-            if (!step["buttons"].is_array() || step["buttons"].size() > 20) {
-                return "input step: buttons must be an array";
-            }
-            for (const auto& b : step["buttons"]) {
-                if (!b.is_string() || !ParseButton(b.get<std::string>())) {
-                    return "input step: unknown button";
-                }
-            }
-        }
-        for (const char* stick : {"left", "right"}) {
-            if (step.contains(stick) && bad_stick(step[stick])) {
-                return "input step: sticks are [x, y] numbers in -1..1";
-            }
-        }
-        if (bad_ms(step, "hold_ms") || bad_ms(step, "wait_ms")) {
-            return "input step: hold_ms/wait_ms are integers in 0..30000";
-        }
-    }
-    return {};
 }
 
 /// Total wall-clock length of a step list in ms, using the same defaults as RunInputSteps.
@@ -251,6 +188,7 @@ long long StepsDurationMs(const json& steps) {
     return total_ms;
 }
 
+/// input_sequence: runs the steps on one player and reports their total duration.
 ToolResult InputSequence(ToolContext& ctx, const json& args) {
     const auto& steps = args.at("steps");
     if (std::string error = RunInputSteps(ctx, NpadIndex(args), steps); !error.empty()) {
@@ -272,8 +210,79 @@ ToolResult ReleaseAll(ToolContext& ctx, const json&) {
     return ToolResult::Text("all virtual buttons released and sticks centered");
 }
 
+/// Returns the frontend's touch screen driver, or nullptr with error set if there is none.
+InputCommon::TouchScreen* Touch(ToolContext& ctx, std::string& error) {
+    auto* input = ctx.host ? ctx.host->GetInputSubsystem() : nullptr;
+    if (!input) {
+        error = "this frontend has no input subsystem";
+        return nullptr;
+    }
+    return input->GetTouchScreen();
+}
+
+/// tap: presses finger 0 at (x, y) for hold_ms, `repeat` times with gap_ms between taps.
+ToolResult Tap(ToolContext& ctx, const json& args) {
+    std::string error;
+    auto* touch = Touch(ctx, error);
+    if (!touch) {
+        return ToolResult::Error(error);
+    }
+    const float x = args.at("x").get<float>();
+    const float y = args.at("y").get<float>();
+    const int repeat = args.value("repeat", 1);
+    for (int i = 0; i < repeat; ++i) {
+        touch->TouchPressed(x, y, 0);
+        SleepMs(args.value("hold_ms", 100));
+        touch->TouchReleased(0);
+        if (i + 1 < repeat) {
+            SleepMs(args.value("gap_ms", 150));
+        }
+    }
+    LogInput(ctx, fmt::format("tap ({:.3f},{:.3f}) x{}", x, y, repeat));
+    return ToolResult::Text(fmt::format("tapped ({:.3f}, {:.3f})", x, y));
+}
+
+/// swipe: drags finger 0 in a straight line, moving it about every 16 ms over duration_ms, then
+/// holds at the end for hold_end_ms before lifting.
+ToolResult Swipe(ToolContext& ctx, const json& args) {
+    std::string error;
+    auto* touch = Touch(ctx, error);
+    if (!touch) {
+        return ToolResult::Error(error);
+    }
+    const auto& from = args.at("from");
+    const auto& to = args.at("to");
+    const int duration = args.value("duration_ms", 300);
+    const int steps = std::max(2, duration / 16);
+    const float x0 = from[0].get<float>(), y0 = from[1].get<float>();
+    const float x1 = to[0].get<float>(), y1 = to[1].get<float>();
+    touch->TouchPressed(x0, y0, 0);
+    for (int i = 1; i <= steps; ++i) {
+        SleepMs(duration / steps);
+        const float t = static_cast<float>(i) / static_cast<float>(steps);
+        touch->TouchMoved(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, 0);
+    }
+    SleepMs(args.value("hold_end_ms", 50));
+    touch->TouchReleased(0);
+    LogInput(ctx, fmt::format("swipe ({:.2f},{:.2f}) -> ({:.2f},{:.2f}) {}ms", x0, y0, x1, y1,
+                              duration));
+    return ToolResult::Text("swiped");
+}
+
+/// get_controller_state: ControllerStateJson for the requested player, or an error if the npad
+/// index has no emulated controller.
+ToolResult ControllerState(ToolContext& ctx, const json& args) {
+    json state = ControllerStateJson(ctx, NpadIndex(args));
+    if (state.is_null()) {
+        return ToolResult::Error("no such controller");
+    }
+    state["note"] = "Values as the game sees them (sticks in -32767..32767).";
+    return ToolResult::Structured(std::move(state));
+}
+
 } // namespace
 
+/// Schema of the shared `player` argument: 1-8, or 9 for handheld.
 json PlayerSchema() {
     return json{{"description", "1-8 for players 1-8 (default 1), or 9 for handheld mode."},
                 {"type", "integer"},
@@ -293,10 +302,8 @@ json InputStepsSchema() {
                 {"items",
                  {{"type", "object"},
                   {"properties",
-                   {{"buttons",
-                     {{"type", "array"},
-                      {"maxItems", 20},
-                      {"items", {{"type", "string"}, {"enum", ButtonEnum()}}}}},
+                   {{"buttons", {{"type", "array"},
+                                 {"items", {{"type", "string"}, {"enum", ButtonEnum()}}}}},
                     {"left", StickArray()},
                     {"right", StickArray()},
                     {"hold_ms", {{"type", "integer"}, {"minimum", 0}, {"maximum", 30000}}},
@@ -304,13 +311,9 @@ json InputStepsSchema() {
                   {"additionalProperties", false}}}};
 }
 
+/// Presses, holds and releases each step's buttons and sticks in turn (at most 60 s in total).
+/// Returns an error message, or empty on success.
 std::string RunInputSteps(ToolContext& ctx, size_t npad, const json& steps) {
-    if (npad > 8) {
-        return "player must be 1-9";
-    }
-    if (std::string invalid = ValidateSteps(steps); !invalid.empty()) {
-        return invalid;
-    }
     std::string error;
     auto* pad = Gamepad(ctx, error);
     if (!pad) {
@@ -320,12 +323,19 @@ std::string RunInputSteps(ToolContext& ctx, size_t npad, const json& steps) {
     if (total_ms > 60000) {
         return "sequence longer than 60 s; split it into several calls";
     }
-    for (const auto& step : steps) {
-        // Writes can be revoked (or the lease lost) while a long sequence runs: ask again before
-        // every input this function sends, which also renews the lease.
-        if (std::string refused = WriteGateError(ctx); !refused.empty()) {
-            return "stopped: " + refused;
+    // Background work passes a stop token: a stopped route lets go of the pad within ~50 ms.
+    const auto wait = [&](int ms) {
+        const auto until = std::chrono::steady_clock::now() +
+                           std::chrono::milliseconds{std::clamp(ms, 0, 60000)};
+        while (std::chrono::steady_clock::now() < until) {
+            if (ServerStopping() || ctx.stop.stop_requested()) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
         }
+        return true;
+    };
+    for (const auto& step : steps) {
         std::vector<VirtualButton> buttons;
         for (const auto& b : step.value("buttons", json::array())) {
             buttons.push_back(*ParseButton(b.get<std::string>()));
@@ -341,7 +351,7 @@ std::string RunInputSteps(ToolContext& ctx, size_t npad, const json& steps) {
             pad->SetStickPosition(npad, VirtualStick::Right, step["right"][0].get<float>(),
                                   step["right"][1].get<float>());
         }
-        const bool held = InputSleep(ctx, step.value("hold_ms", 120));
+        const bool held = wait(step.value("hold_ms", 120));
         for (const auto b : buttons) {
             pad->SetButtonState(npad, b, false);
         }
@@ -351,18 +361,15 @@ std::string RunInputSteps(ToolContext& ctx, size_t npad, const json& steps) {
         if (step.contains("right")) {
             pad->SetStickPosition(npad, VirtualStick::Right, 0.0f, 0.0f);
         }
-        if (!held || !InputSleep(ctx, step.value("wait_ms", 0))) {
-            return StoppedReason();
+        if (!held || !wait(step.value("wait_ms", 0))) {
+            return "stopped";
         }
     }
     LogInput(ctx, fmt::format("sequence of {} steps ({} ms)", steps.size(), total_ms));
     return {};
 }
 
-std::string ValidateInputSteps(const json& steps) {
-    return ValidateSteps(steps);
-}
-
+/// Connection, style, pressed buttons and stick positions of one controller, or null.
 json ControllerStateJson(ToolContext& ctx, size_t npad) {
     if (!ctx.system) {
         return nullptr;
@@ -376,8 +383,8 @@ json ControllerStateJson(ToolContext& ctx, size_t npad) {
     const u64 raw = static_cast<u64>(state.raw);
     const auto bit = [raw](u32 index) { return ((raw >> index) & 1) != 0; };
     static constexpr std::array<std::string_view, 16> names{
-        "A",  "B",  "X",    "Y",     "LSTICK", "RSTICK", "L",      "R",
-        "ZL", "ZR", "PLUS", "MINUS", "DLEFT",  "DUP",    "DRIGHT", "DDOWN"};
+        "A", "B", "X", "Y", "LSTICK", "RSTICK", "L", "R",
+        "ZL", "ZR", "PLUS", "MINUS", "DLEFT", "DUP", "DRIGHT", "DDOWN"};
     for (u32 i = 0; i < names.size(); ++i) {
         if (bit(i)) {
             pressed.push_back(names[i]);
@@ -394,6 +401,7 @@ json ControllerStateJson(ToolContext& ctx, size_t npad) {
     };
 }
 
+/// Registers the button, stick, touch, input sequence and controller state tools.
 void RegisterInputTools(ToolRegistry& registry) {
     const json button_list = {{"type", "array"},
                               {"items", {{"type", "string"}, {"enum", ButtonEnum()}}},
@@ -426,9 +434,8 @@ void RegisterInputTools(ToolRegistry& registry) {
     registry.Add(Tool{
         .name = "set_stick",
         .title = "Move a stick",
-        .description =
-            "Set the left or right stick to (x, y) in -1..1 (up is +y). With hold_ms "
-            "it returns to center afterwards; without, it stays there until moved again.",
+        .description = "Set the left or right stick to (x, y) in -1..1 (up is +y). With hold_ms "
+                       "it returns to center afterwards; without, it stays there until moved again.",
         .input_schema = {{"type", "object"},
                          {"properties",
                           {{"stick", {{"type", "string"}, {"enum", {"left", "right"}}}},
@@ -449,10 +456,9 @@ void RegisterInputTools(ToolRegistry& registry) {
         .title = "Run an input sequence",
         .description = "Run timed steps in order, each pressing buttons and/or holding sticks for "
                        "hold_ms then waiting wait_ms (max 200 steps, 60 s total). For "
-                       "frame-exact input, use the TAS tools (tas_write_script, tas_play).",
+                       "frame-exact input, use TAS tools instead (coming).",
         .input_schema = {{"type", "object"},
-                         {"properties",
-                          {{"steps", InputStepsSchema()}, {"player", PlayerSchema()}}},
+                         {"properties", {{"steps", InputStepsSchema()}, {"player", PlayerSchema()}}},
                          {"required", {"steps"}},
                          {"additionalProperties", false}},
         .requires_game = true,
@@ -473,11 +479,57 @@ void RegisterInputTools(ToolRegistry& registry) {
     });
 
     const json coord = {{"type", "number"}, {"minimum", 0}, {"maximum", 1}};
-    const json point = {{"type", "array"},
-                        {"items", coord},
-                        {"minItems", 2},
-                        {"maxItems", 2},
+    const json point = {{"type", "array"}, {"items", coord}, {"minItems", 2}, {"maxItems", 2},
                         {"description", "[x, y] in 0..1 of the screen (0,0 = top left)."}};
+    registry.Add(Tool{
+        .name = "tap",
+        .title = "Tap the touch screen",
+        .description = "Touch the console screen at (x, y) in 0..1 (top left = 0,0) for hold_ms "
+                       "(handheld touch screen; many menus accept it).",
+        .input_schema = {{"type", "object"},
+                         {"properties",
+                          {{"x", coord},
+                           {"y", coord},
+                           {"hold_ms", {{"type", "integer"}, {"minimum", 16}, {"maximum", 10000}}},
+                           {"repeat", {{"type", "integer"}, {"minimum", 1}, {"maximum", 20}}},
+                           {"gap_ms", {{"type", "integer"}, {"minimum", 16}, {"maximum", 5000}}}}},
+                         {"required", {"x", "y"}},
+                         {"additionalProperties", false}},
+        .requires_game = true,
+        .requires_write = true,
+        .requires_control = true,
+        .handler = Tap,
+    });
+    registry.Add(Tool{
+        .name = "swipe",
+        .title = "Swipe the touch screen",
+        .description = "Drag one finger from 'from' to 'to' (0..1 coordinates) over duration_ms.",
+        .input_schema = {{"type", "object"},
+                         {"properties",
+                          {{"from", point},
+                           {"to", point},
+                           {"duration_ms", {{"type", "integer"}, {"minimum", 32}, {"maximum", 10000}}},
+                           {"hold_end_ms", {{"type", "integer"}, {"minimum", 0}, {"maximum", 5000}}}}},
+                         {"required", {"from", "to"}},
+                         {"additionalProperties", false}},
+        .requires_game = true,
+        .requires_write = true,
+        .requires_control = true,
+        .handler = Swipe,
+    });
+
+    registry.Add(Tool{
+        .name = "get_controller_state",
+        .title = "Controller state",
+        .description = "Buttons pressed and stick positions as the game currently sees them, plus "
+                       "whether the controller is connected. Use it to verify input landed.",
+        .input_schema = {{"type", "object"},
+                         {"properties", {{"player", PlayerSchema()}}},
+                         {"additionalProperties", false}},
+        .annotations = {.read_only = true, .idempotent = true},
+        .requires_game = true,
+        .handler = ControllerState,
+    });
 }
 
 } // namespace Mcp

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -21,19 +24,25 @@ add_library(mcp STATIC
     tool.h
     tool_registry.cpp
     tool_registry.h
+    tools/abtest_tools.cpp
     tools/act_tools.cpp
+    tools/artifact_tools.cpp
     tools/core_tools.cpp
+    tools/debugger_tools.cpp
     tools/emulation_tools.cpp
+    tools/game_state_tools.cpp
     tools/input_tools.cpp
     tools/memory_tools.cpp
+    tools/perf_tools.cpp
     tools/process_tools.cpp
+    tools/debug_tools.cpp
     tools/control_tools.cpp
     tools/settings_tools.cpp
     tools/tas_tools.cpp
     tools/timeline_tools.cpp
-    tools/app_process.h
+    tools/trace_tools.cpp
     tools/tool_helpers.h
 )
 
-target_link_libraries(mcp PUBLIC common core PRIVATE hid_core input_common video_core httplib::httplib nlohmann_json::nlohmann_json)
+target_link_libraries(mcp PUBLIC common core PRIVATE hid_core input_common httplib::httplib nlohmann_json::nlohmann_json)
 create_target_directory_groups(mcp)

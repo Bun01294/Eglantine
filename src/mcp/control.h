@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -25,9 +28,9 @@ public:
         Clock::time_point expires;
     };
 
-    /// default_ttl is how long the lease lasts after its last use unless Acquire sets another.
-    explicit ControlLease(std::chrono::seconds default_ttl = std::chrono::seconds{120})
-        : default_ttl{default_ttl} {}
+    /// ttl is how long the lease lasts after its last use unless Acquire sets another.
+    explicit ControlLease(std::chrono::seconds ttl = std::chrono::seconds{120})
+        : default_ttl{ttl} {}
 
     /// Takes (or renews) the lease for session. Fails if another live session holds it, setting
     /// `holder` to the current holder.

@@ -1,14 +1,16 @@
 """Tiny MCP client for the emulator: python mcp.py <tool> [json-args] [--save-image path]
+
+# SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+# SPDX-License-Identifier: GPL-3.0-or-later
 Keeps the session id in a temp file and re-initializes on 404.
 
 Environment:
-  EGLANTINE_MCP_URL       endpoint, when the emulator runs with --mcp-port (default :6544)
   EGLANTINE_MCP_TOKEN     bearer token, when the emulator's mcp_token setting is set
   EGLANTINE_MCP_SID_FILE  session file; give each agent its own so they hold separate control
                           leases (default: one shared file in the temp directory)"""
 import argparse, base64, json, os, sys, tempfile, urllib.request, urllib.error
 
-URL = os.environ.get("EGLANTINE_MCP_URL") or "http://127.0.0.1:6544/mcp"
+URL = "http://127.0.0.1:6544/mcp"
 SID_FILE = os.environ.get("EGLANTINE_MCP_SID_FILE") or os.path.join(
     tempfile.gettempdir(), "eglantine_mcp_sid.txt")
 TOKEN = os.environ.get("EGLANTINE_MCP_TOKEN", "")
@@ -40,7 +42,7 @@ def init():
 # Read-only tools are safe to repeat, so they retry if the connection is reset mid-reply
 # (some security software interferes with loopback connections).
 RETRY_SAFE = {"status", "screenshot", "screenshot_raw", "capture_frames", "screen_state",
-              "timeline", "perf_report", "summarize_since", "game_info", "read_memory",
+              "timeline", "gpu_profile", "summarize_since", "game_info", "read_memory",
               "list_threads", "process_info", "memory_map", "probe_read", "route_list",
               "tas_status", "get_controller_state", "unimplemented_commands"}
 

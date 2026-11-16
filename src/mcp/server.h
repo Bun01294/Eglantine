@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -9,10 +12,10 @@
 #include <thread>
 
 #include "common/common_types.h"
-#include "mcp/activity.h"
 #include "mcp/control.h"
 #include "mcp/protocol.h"
 #include "mcp/timeline.h"
+#include "mcp/activity.h"
 #include "mcp/tool_registry.h"
 
 namespace Core {
@@ -66,8 +69,9 @@ public:
     [[nodiscard]] std::string Url() const;
 
     /// Enables or disables state-changing tools for agents. Takes effect on the next call.
-    /// Turning writes off also stops background routes, TAS playback and held input.
-    void SetWritesAllowed(bool allowed);
+    void SetWritesAllowed(bool allowed) {
+        writes_allowed.store(allowed);
+    }
 
     Timeline& GetTimeline() {
         return timeline;
@@ -119,16 +123,5 @@ private:
 
 /// Registers every built-in tool.
 void RegisterAllTools(ToolRegistry& registry);
-
-void RegisterCoreTools(ToolRegistry& registry);
-void RegisterEmulationTools(ToolRegistry& registry);
-void RegisterInputTools(ToolRegistry& registry);
-void RegisterControlTools(ToolRegistry& registry);
-void RegisterActTools(ToolRegistry& registry);
-void RegisterTasTools(ToolRegistry& registry);
-void RegisterProcessTools(ToolRegistry& registry);
-void RegisterMemoryTools(ToolRegistry& registry);
-void RegisterSettingsTools(ToolRegistry& registry);
-void RegisterTimelineTools(ToolRegistry& registry);
 
 } // namespace Mcp
