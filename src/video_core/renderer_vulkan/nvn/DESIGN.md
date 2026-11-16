@@ -598,9 +598,9 @@ range of its own (`0x7D00...`, 2 MiB aligned) and `nvnMemoryPoolMapVirtual` reac
   `vkCreateImage` make `EnsureImage` fall back to the ordinary whole-storage path. Smaller sparse
   textures stay ordinary images. Single-aspect depth (D16, D32F) is tiled like colour (the shadow
   arrays of Mario Kart World); depth+stencil is not. The log line `nx2:gpu map path` counts tiles
-  bound/unbound/uploaded/verified; `[nvn] storage census` (every 900 presents) lists the device memory
-  of the storages by kind and the largest ones, and the `[nvn] replay stage` status line has
-  `commit_MB` (process private bytes) next to the device heap usage.
+  bound/unbound/uploaded/verified. `EDEN_NX2_NVN_STORAGE_CENSUS=1` enables a replay-side inventory
+  of the storages by kind and the largest ones every 900 presents. The `[nvn] replay stage`
+  status line has `commit_MB` (process private bytes) next to the device heap usage.
 
 ### Storage cache budget
 
@@ -2301,7 +2301,9 @@ texture/buffer a draw bound, by reason.
   `ImportedChunk::address_buffer`, priority 0), one per pool with its own buffer (CPU_NO_ACCESS,
   priority 1, they cut the chunk ranges around them) and per virtual run, then uploads it to a
   device-local buffer (`RawTableBuffer`, a new one per rebuild; a draw keeps the one it used alive
-  through `InFlight::keepalive`, once per submission). DK has ~300 small GPU-only pools inside
+  through `InFlight::keepalive`, once per submission). Mario Kart World uses a mapped device-local
+  allocation when available, writes and flushes it before submission, and falls back to a staged
+  copy. This also applies to the raw store alias table. DK has ~300 small GPU-only pools inside
   chunk windows: 615 entries, no drops (`raw_global_ranges_dropped` is 0; it counts the entries of
   a table that could not be uploaded). Accesses outside every range are dropped (loads return 0).
   Pool buffers have SHADER_DEVICE_ADDRESS usage and imports allocate with

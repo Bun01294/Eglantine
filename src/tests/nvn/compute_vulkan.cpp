@@ -973,6 +973,49 @@ TEST_CASE("NVN storage shadow: a render pass writing a storage range reaches the
     }
 }
 
+TEST_CASE("Raw GPU addresses still resolve after a table rebuild", "[nvn][raw-table-rebuild]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    if (!vulkan->device->IsBufferDeviceAddressSupported() ||
+        !vulkan->device->IsShaderInt64Supported() ||
+        !vulkan->device->IsDescriptorAliasingSupported()) {
+        SKIP("raw-global memory is unsupported on this Vulkan device");
+    }
+    const bool mkw = GENERATE(false, true);
+    ShadowRig rig(*vulkan);
+    rig.context.SetTitleId(mkw ? Settings::MarioKartWorldProgramId : Settings::OcarinaOfTimeProgramId);
+    constexpr u64 source_a = POOL_VA + 128_KiB;
+    constexpr u64 source_b = POOL_VA + 256_KiB;
+    constexpr u32 first = 0x12345678;
+    constexpr u32 second = 0x87654321;
+    std::memcpy(rig.memory.Add(source_a, 64_KiB), &first, sizeof(first));
+    std::memcpy(rig.memory.Add(source_b, 64_KiB), &second, sizeof(second));
+    const auto queue_read = [&](u64 seq, u64 source, u64 destination) {
+        std::vector<u64> list;
+        BindCompute(list, PROGRAM_RAW_READ, destination, 4096);
+        PushRawAddress(list, source);
+        Push(list, VC::Op::Dispatch, VC::DispatchPayload{.x = 1, .y = 1, .z = 1});
+        PushEnd(list);
+        rig.context.Submit(MakeSubmission(seq, std::move(list), {1, PROGRAM_RAW_READ, seq + 1}));
+    };
+    rig.context.CreatePool({.serial = 2, .guest_address = source_a, .size = 64_KiB,
+                            .flags = 1 /* CPU_NO_ACCESS */});
+    queue_read(1, source_a, POOL_VA + 4096);
+    rig.context.CreatePool({.serial = 3, .guest_address = source_b, .size = 64_KiB,
+                            .flags = 1 /* CPU_NO_ACCESS */});
+    queue_read(2, source_b, POOL_VA + 8192);
+    REQUIRE(rig.context.Wait(2, 60s));
+    CHECK(WordAt(rig.data, 4096) == first);
+    CHECK(WordAt(rig.data, 8192) == second);
+    const auto stats = rig.context.Stats();
+    CHECK(stats.ops_failed == 0);
+    CHECK(stats.ops_unsupported == 0);
+    CHECK(stats.raw_global_rebuilds >= 2);
+    CHECK(stats.raw_global_ranges_dropped == 0);
+}
+
 TEST_CASE("MKW first color attachment load preserves channels outside a masked clear",
           "[nvn][attachment-load]") {
     auto vulkan = MakeHeadlessVulkan();

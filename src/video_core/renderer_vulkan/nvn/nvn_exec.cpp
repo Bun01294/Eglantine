@@ -6492,7 +6492,7 @@ void Context::Impl::ProcessSubmit(CmdSubmit&& submit) {
 
 void Context::Impl::ProcessPresent(CmdPresent&& present) {
     const u64 presented = stats.presents.fetch_add(1, std::memory_order_relaxed);
-    if (presented % 900 == 899) {
+    if (presented % 900 == 899 && Debug::Get().storage_census) {
         LogStorageCensus();
     }
     if ((bc_timing || smart_bc.enabled) && presented % 60 == 59) {
