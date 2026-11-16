@@ -519,8 +519,8 @@ void PerformanceOverlay::Paint(QPainter& p, const QSize& size) {
     // Host resources: process CPU and GPU load, RAM and VRAM against what the machine has
     y += 2;
     x = Pad;
-    const auto percent = [](const std::optional<double>& value) {
-        return value ? QStringLiteral("%1%").arg(*value, 0, 'f', 0) : QStringLiteral("-");
+    const auto percent = [](const std::optional<double>& load) {
+        return load ? QStringLiteral("%1%").arg(*load, 0, 'f', 0) : QStringLiteral("-");
     };
     const auto gib = [](u64 bytes) {
         return QString::number(static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0), 'f', 1);
@@ -583,8 +583,8 @@ void PerformanceOverlay::Paint(QPainter& p, const QSize& size) {
         p.fillRect(bar_x, bar_y, bar_w, bar_h, BarTrack);
         p.fillRect(bar_x, bar_y, static_cast<int>(bar_w * std::min(group.busy_max, 100.0) / 100.0),
                    bar_h, BusyColour(group.busy_max));
-        const QString percent = QStringLiteral("%1%").arg(group.busy_max, 0, 'f', 0);
-        text(cx + column_width - fm.horizontalAdvance(percent), cy, percent, White, m_font);
+        const QString busy_text = QStringLiteral("%1%").arg(group.busy_max, 0, 'f', 0);
+        text(cx + column_width - fm.horizontalAdvance(busy_text), cy, busy_text, White, m_font);
     }
     y += per_column * LineHeight;
     if (hidden > 0) {

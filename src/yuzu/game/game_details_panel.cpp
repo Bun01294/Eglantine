@@ -514,12 +514,12 @@ void PathLinkLabel::Elide() {
 }
 
 GameDetailsPanel::GameDetailsPanel(QWidget* parent) : HomeSidePanel{parent} {
-    QWidget* content = Content();
-    auto* content_layout = new QVBoxLayout(content);
+    QWidget* scroll_content = Content();
+    auto* content_layout = new QVBoxLayout(scroll_content);
     content_layout->setContentsMargins(0, 0, 0, 0);
     content_layout->setSpacing(0);
 
-    header = new GameDetailsHeader(content);
+    header = new GameDetailsHeader(scroll_content);
     connect(header, &GameDetailsHeader::CloseRequested, this, &GameDetailsPanel::CloseRequested);
     content_layout->addWidget(header);
 
@@ -534,9 +534,9 @@ GameDetailsPanel::GameDetailsPanel(QWidget* parent) : HomeSidePanel{parent} {
     body->addSpacing(10);
 
     // Updates and DLC
-    add_ons_heading = MakeHeading(content);
+    add_ons_heading = MakeHeading(scroll_content);
     body->addWidget(add_ons_heading);
-    add_ons_box = new QWidget(content);
+    add_ons_box = new QWidget(scroll_content);
     add_ons_layout = new QVBoxLayout(add_ons_box);
     add_ons_layout->setContentsMargins(0, 0, 0, 0);
     add_ons_layout->setSpacing(4);
@@ -544,9 +544,9 @@ GameDetailsPanel::GameDetailsPanel(QWidget* parent) : HomeSidePanel{parent} {
     body->addSpacing(10);
 
     // Shaders
-    shaders_heading = MakeHeading(content);
+    shaders_heading = MakeHeading(scroll_content);
     body->addWidget(shaders_heading);
-    shaders_box = new QWidget(content);
+    shaders_box = new QWidget(scroll_content);
     auto* shaders_grid = new QGridLayout(shaders_box);
     shaders_grid->setContentsMargins(0, 0, 0, 0);
     shaders_grid->setHorizontalSpacing(12);
@@ -569,7 +569,7 @@ GameDetailsPanel::GameDetailsPanel(QWidget* parent) : HomeSidePanel{parent} {
     body->addSpacing(10);
 
     // Technical details, collapsed by default
-    technical_toggle = new QToolButton(content);
+    technical_toggle = new QToolButton(scroll_content);
     technical_toggle->setCheckable(true);
     technical_toggle->setAutoRaise(true);
     technical_toggle->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
@@ -581,7 +581,7 @@ GameDetailsPanel::GameDetailsPanel(QWidget* parent) : HomeSidePanel{parent} {
     technical_toggle->setFont(toggle_font);
     body->addWidget(technical_toggle);
 
-    technical_box = new QWidget(content);
+    technical_box = new QWidget(scroll_content);
     info_grid = new QGridLayout(technical_box);
     info_grid->setContentsMargins(0, 0, 0, 0);
     info_grid->setHorizontalSpacing(12);
@@ -597,11 +597,11 @@ GameDetailsPanel::GameDetailsPanel(QWidget* parent) : HomeSidePanel{parent} {
     body->addStretch(1);
 
     // Action bar, pinned below the scrolled content
-    auto* footer = new QWidget(this);
-    auto* actions = new QHBoxLayout(footer);
+    auto* action_bar = new QWidget(this);
+    auto* actions = new QHBoxLayout(action_bar);
     actions->setContentsMargins(SideMargin, 10, SideMargin, 12);
     actions->setSpacing(8);
-    play_button = new QPushButton(footer);
+    play_button = new QPushButton(action_bar);
     play_button->setMinimumHeight(38);
     play_button->setIconSize(QSize(18, 18));
     play_button->setCursor(Qt::PointingHandCursor);
@@ -612,7 +612,7 @@ GameDetailsPanel::GameDetailsPanel(QWidget* parent) : HomeSidePanel{parent} {
     actions->addWidget(play_button, 1);
 
     const auto make_action = [&] {
-        auto* button = new QToolButton(footer);
+        auto* button = new QToolButton(action_bar);
         button->setFixedSize(38, 38);
         button->setIconSize(QSize(18, 18));
         button->setCursor(Qt::PointingHandCursor);
@@ -627,7 +627,7 @@ GameDetailsPanel::GameDetailsPanel(QWidget* parent) : HomeSidePanel{parent} {
     connect(more_button, &QToolButton::clicked, this, [this] {
         emit MoreRequested(more_button->mapToGlobal(QPoint(0, more_button->height())));
     });
-    SetFooter(footer);
+    SetFooter(action_bar);
 
     // Artwork menus on the header's hover buttons
     banner_menu = new QMenu(this);

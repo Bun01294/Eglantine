@@ -267,17 +267,17 @@ void BackgroundDropZone::dropEvent(QDropEvent* event) {
 
 HomeCustomizePanel::HomeCustomizePanel(HomeBackground* background_, QWidget* parent)
     : HomeSidePanel{parent}, background{background_} {
-    QWidget* content = Content();
-    auto* layout = new QVBoxLayout(content);
+    QWidget* scroll_content = Content();
+    auto* layout = new QVBoxLayout(scroll_content);
     layout->setContentsMargins(16, 12, 16, 16);
     layout->setSpacing(8);
 
     // Header
     auto* header = new QHBoxLayout;
     header->setSpacing(8);
-    title_icon = new QLabel(content);
-    title_label = MakeHeading(content, 1.4);
-    close_button = new QToolButton(content);
+    title_icon = new QLabel(scroll_content);
+    title_label = MakeHeading(scroll_content, 1.4);
+    close_button = new QToolButton(scroll_content);
     close_button->setAutoRaise(true);
     close_button->setIconSize(QSize(16, 16));
     connect(close_button, &QToolButton::clicked, this, &HomeCustomizePanel::CloseRequested);
@@ -287,19 +287,19 @@ HomeCustomizePanel::HomeCustomizePanel(HomeBackground* background_, QWidget* par
     layout->addLayout(header);
 
     // Background
-    background_label = MakeHeading(content, 1.15);
+    background_label = MakeHeading(scroll_content, 1.15);
     layout->addWidget(background_label);
 
-    drop_zone = new BackgroundDropZone(background, content);
+    drop_zone = new BackgroundDropZone(background, scroll_content);
     connect(drop_zone, &BackgroundDropZone::BrowseRequested, this, &HomeCustomizePanel::Browse);
     connect(drop_zone, &BackgroundDropZone::FileDropped, this,
             &HomeCustomizePanel::BackgroundChosen);
     layout->addWidget(drop_zone);
 
-    recent_label = new QLabel(content);
+    recent_label = new QLabel(scroll_content);
     layout->addWidget(recent_label);
 
-    recent_list = new QListWidget(content);
+    recent_list = new QListWidget(scroll_content);
     recent_list->setViewMode(QListView::IconMode);
     recent_list->setFlow(QListView::LeftToRight);
     recent_list->setWrapping(false);
@@ -326,7 +326,7 @@ HomeCustomizePanel::HomeCustomizePanel(HomeBackground* background_, QWidget* par
     layout->addSpacing(12);
 
     // Display mode
-    mode_label = MakeHeading(content, 1.15);
+    mode_label = MakeHeading(scroll_content, 1.15);
     layout->addWidget(mode_label);
 
     auto* mode_row = new QHBoxLayout;
@@ -334,7 +334,7 @@ HomeCustomizePanel::HomeCustomizePanel(HomeBackground* background_, QWidget* par
     mode_group = new QButtonGroup(this);
     mode_group->setExclusive(true);
     for (size_t i = 0; i < Modes.size(); ++i) {
-        auto* button = new QToolButton(content);
+        auto* button = new QToolButton(scroll_content);
         button->setCheckable(true);
         button->setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
         button->setIconSize(QSize(40, 40));
@@ -351,15 +351,15 @@ HomeCustomizePanel::HomeCustomizePanel(HomeBackground* background_, QWidget* par
 
     // Icon size
     auto* size_row = new QHBoxLayout;
-    icon_size_title = new QLabel(content);
-    icon_size_value = new QLabel(content);
+    icon_size_title = new QLabel(scroll_content);
+    icon_size_value = new QLabel(scroll_content);
     icon_size_value->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
     size_row->addWidget(icon_size_title);
     size_row->addWidget(icon_size_value, 1);
     layout->addSpacing(4);
     layout->addLayout(size_row);
 
-    icon_size_slider = new QSlider(Qt::Horizontal, content);
+    icon_size_slider = new QSlider(Qt::Horizontal, scroll_content);
     icon_size_slider->setRange(1, static_cast<int>(IconSizeSteps.size()));
     icon_size_slider->setPageStep(1);
     icon_size_slider->setTickPosition(QSlider::TicksBelow);
