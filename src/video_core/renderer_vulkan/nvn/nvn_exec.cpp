@@ -5333,7 +5333,11 @@ bool Recorder::RecordWindowFilter(Texture& texture, VkFormat source_format, cons
     Storage& source = *texture.storage;
     using Settings::ScalingFilter;
     const auto filter = Settings::values.scaling_filter.GetValue();
-    if (filter == ScalingFilter::NearestNeighbor || filter == ScalingFilter::Bilinear ||
+    // ScaleForce shifts sampling positions even at native size. Use the plain blit when it
+    // preserves the source bits without an intermediate sRGB-to-UNORM copy.
+    const bool native_size = crop.width == picture.width && crop.height == picture.height;
+    if ((filter == ScalingFilter::ScaleForce && native_size && source_format == source.host.format) ||
+        filter == ScalingFilter::NearestNeighbor || filter == ScalingFilter::Bilinear ||
         !frame.framebuffer || source.type != VK_IMAGE_TYPE_2D ||
         !impl.device.IsFormatSupported(source_format,
                                        VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT,

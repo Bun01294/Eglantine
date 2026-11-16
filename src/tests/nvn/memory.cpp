@@ -2353,7 +2353,9 @@ TEST_CASE("MKW window filters process a saved gameplay image at display resoluti
                      << (100.0 * static_cast<double>(changed_over_1) / static_cast<double>(count))
                      << "% pixels differ by >1 from bilinear; mean RGB delta " << mean);
             }
-            if (size.width == width && filter == ScalingFilter::NearestNeighbor) {
+            if (size.width == width &&
+                (filter == ScalingFilter::NearestNeighbor ||
+                 (filter == ScalingFilter::ScaleForce && source_format == 0x25))) {
                 u32 identity_error = 0;
                 for (size_t i = 0; i < pixels.size(); i += 4) {
                     for (size_t c = 0; c < 3; ++c) {
