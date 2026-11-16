@@ -2092,6 +2092,29 @@ private:
 
 } // namespace
 
+TEST_CASE("NVN completed bulk uploads reuse staging without keeping the old bytes",
+          "[nvn][staging-reuse]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    Rig rig(*vulkan, false);
+    constexpr u32 WIDTH = 32;
+    constexpr u32 HEIGHT = 24;
+    const auto source = MakeStorage(NVN_FORMAT_RGBA8, WIDTH, HEIGHT, 1,
+                                    PixelFormat::A8B8G8R8_UNORM, VK_FORMAT_A8B8G8R8_UNORM_PACK32);
+    for (const u32 index : {0u, 1u}) {
+        const u64 offset = index * 64_KiB;
+        const auto expected = Gradient(WIDTH, HEIGHT, static_cast<u8>(63 + index));
+        const auto bytes = SwizzleLevel0(source, expected, 4, WIDTH, HEIGHT);
+        std::memcpy(rig.texture_bytes + offset, bytes.data(), bytes.size());
+        rig.context.CreateTexture(
+            MakeTexture(10 + index, Rig::TEXTURE_POOL, offset, NVN_FORMAT_RGBA8, WIDTH, HEIGHT));
+        REQUIRE(rig.Read(10 + index, WIDTH, HEIGHT) == expected);
+    }
+    CHECK(rig.context.Stats().staging_chunks_reused == 1);
+}
+
 TEST_CASE("NVN window filters change actual presented pixels on every title and colour format",
           "[nvn][present-filter]") {
     auto vulkan = MakeHeadlessVulkan();

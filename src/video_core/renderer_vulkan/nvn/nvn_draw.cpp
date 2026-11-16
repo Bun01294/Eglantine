@@ -139,6 +139,7 @@ void DrawContext::BeginSubmission(DrawHost& host_, const VC::Submission& submiss
     set_pool_used = 0;
     last_kept = nullptr;
     last_compute_kept = nullptr;
+    last_framebuffer.handle = VK_NULL_HANDLE;
     resources.RefreshSamplerSetting();
 }
 
@@ -1229,22 +1230,31 @@ bool DrawContext::BeginPass() {
         views[i] = attachments[i].view;
     }
     try {
-        auto framebuffer = std::make_shared<vk::Framebuffer>(device.GetLogical().CreateFramebuffer({
-            .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .renderPass = render_pass,
-            .attachmentCount = attachment_count,
-            .pAttachments = views.data(),
-            .width = extent.width,
-            .height = extent.height,
-            .layers = layers,
-        }));
+        VkFramebuffer framebuffer = last_framebuffer.handle;
+        if (!framebuffer || last_framebuffer.pass != render_pass ||
+            last_framebuffer.extent.width != extent.width ||
+            last_framebuffer.extent.height != extent.height || last_framebuffer.layers != layers ||
+            last_framebuffer.views != views) {
+            auto created = std::make_shared<vk::Framebuffer>(device.GetLogical().CreateFramebuffer({
+                .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .renderPass = render_pass,
+                .attachmentCount = attachment_count,
+                .pAttachments = views.data(),
+                .width = extent.width,
+                .height = extent.height,
+                .layers = layers,
+            }));
+            framebuffer = **created;
+            host->HostFlight().keepalive.push_back(std::move(created));
+            last_framebuffer = {render_pass, framebuffer, extent, layers, views};
+        }
         const VkRenderPassBeginInfo begin{
             .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
             .pNext = nullptr,
             .renderPass = render_pass,
-            .framebuffer = **framebuffer,
+            .framebuffer = framebuffer,
             .renderArea = {{0, 0}, extent},
             .clearValueCount = 0,
             .pClearValues = nullptr,
@@ -1253,7 +1263,6 @@ bool DrawContext::BeginPass() {
             ProfBeginPass(key, extent, layers, samples);
         }
         host->HostCmd().BeginRenderPass(begin, VK_SUBPASS_CONTENTS_INLINE);
-        host->HostFlight().keepalive.push_back(std::move(framebuffer));
     } catch (const vk::Exception& exception) {
         host->HostFailed("SetRenderTargets", fmt::format("framebuffer: {}", exception.what()));
         return false;

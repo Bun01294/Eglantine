@@ -805,6 +805,14 @@ private:
     std::array<u32, 3> compute_groups{};
 
     // ---- per command buffer / pass state ----
+    // The flight owns this framebuffer and its attachments until execution completes.
+    struct {
+        VkRenderPass pass{};
+        VkFramebuffer handle{};
+        VkExtent2D extent{};
+        u32 layers{};
+        std::array<VkImageView, MAX_COLOR_TARGETS + 1> views{};
+    } last_framebuffer;
     bool pass_open{false};
     void NoteFlipTarget(const std::shared_ptr<Storage>& storage, VkImageLayout sampled_layout);
     /// Storages that flip between attachment and sampled use, with the layout they are sampled in:

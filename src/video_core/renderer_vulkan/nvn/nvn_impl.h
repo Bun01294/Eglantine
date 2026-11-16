@@ -709,6 +709,7 @@ struct Context::Impl {
         std::atomic<u64> mirror_upload_bytes{};          ///< guest bytes copied into mirrors
         std::atomic<u64> mirror_upload_runs{};           ///< ... in this many copies
         std::atomic<u64> mirror_uploads{};               ///< UploadRange calls that copied anything
+        std::atomic<u64> staging_chunks_reused{};
         std::atomic<u64> mirror_pages_hashed{};          ///< guest pages compared with the mirror
         std::atomic<u64> mirror_pages_trusted{}; ///< ... not compared: the tracker saw no write
         std::atomic<u64>
@@ -910,6 +911,12 @@ struct Context::Impl {
     // Recycled command buffers (returned by the completion thread).
     std::mutex free_commands_mutex;
     std::vector<VkCommandBuffer> free_command_buffers;
+
+    // The completion thread returns ordinary upload buffers after their final timeline signal.
+    static constexpr u64 STAGING_CHUNK = u64{8} << 20;
+    std::mutex staging_cache_mutex;
+    std::array<vk::Buffer, 2> staging_cache;
+    [[nodiscard]] vk::Buffer AcquireStaging(u64 size);
 
     /// Usage of pool buffers: POOL_BUFFER_USAGE, plus a device address when the device has
     /// buffer device address (raw global memory).

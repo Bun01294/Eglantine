@@ -54,7 +54,6 @@ namespace {
 constexpr VkPipelineStageFlags ALL_STAGES = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
 constexpr VkAccessFlags ALL_WRITES = VK_ACCESS_MEMORY_WRITE_BIT;
 constexpr VkAccessFlags ALL_ACCESS = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-constexpr u64 STAGING_CHUNK = u64{8} << 20;
 /// Tiled uploads below this many linear bytes untile on the CPU: a few dozen microseconds there,
 /// less than a buffer allocation, a dispatch and a barrier more (switch2-recomp's GPU untile uses
 /// the same 64 KiB floor).
@@ -1153,12 +1152,8 @@ void Recorder::PrepareImagesSpan(std::span<const std::pair<Storage*, VkImageLayo
 StagingRange Recorder::AllocStaging(u64 size, u64 alignment) {
     chunk_used = (chunk_used + alignment - 1) / alignment * alignment;
     if (flight.staging.empty() || chunk_used + size > chunk_size) {
-        const u64 new_size = (std::max)(size, STAGING_CHUNK);
-        // GPU untile and ASTC decode can read the staged GOBs directly.
-        vk::Buffer chunk = impl.CreateHostBuffer(
-            new_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            MemoryUsage::Upload, AllocationKind::Staging);
-        flight.staging.push_back(std::move(chunk));
+        const u64 new_size = (std::max)(size, Context::Impl::STAGING_CHUNK);
+        flight.staging.push_back(impl.AcquireStaging(new_size));
         chunk_size = new_size;
         chunk_pointer = flight.staging.back().Mapped().data();
         chunk_used = 0;
