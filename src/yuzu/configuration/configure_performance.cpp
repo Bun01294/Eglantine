@@ -111,6 +111,17 @@ std::vector<Feature> FeaturesFor(Platform platform) {
          QT_TR_NOOP("Switch 2 games signal thousands of fences a second; releasing the ones the "
                     "host GPU already passed together smooths frame times."),
          true, none});
+    // tested by Octelly on Linux, RX 6600
+    features.push_back(
+        {"EDEN_NX2_FENCE_WAIT", "host", QT_TR_NOOP("Wait for the frame fence on the host"),
+         QT_TR_NOOP("The present waits for its own GPU fence on the host instead of sleeping in "
+                    "the guest kernel on an event. A channel suspended on a semaphore cannot "
+                    "then wedge the guest while the fence is waited for: without it, Splatoon "
+                    "Raiders freezes a few seconds after load and Mario Kart World deadlocked "
+                    "about one boot in three. It is not free: the guest wait is what keeps the "
+                    "game's core free while the GPU catches up, and Ocarina of Time lost about "
+                    "15 ms a frame (~50 to ~34 FPS) with the host wait on Windows."),
+         platform == Platform::Amd, none});
     const bool host_import_recommended = platform == Platform::Nvidia;
     features.push_back(
         {"EDEN_NX2_HOST_IMPORT", "1", QT_TR_NOOP("Read uniform banks straight from guest memory"),
@@ -430,8 +441,9 @@ ConfigurePerformance::ConfigurePerformance(Performance::Platform platform_,
     footer->setWordWrap(true);
     footer->setEnabled(false);
     footer->setToolTip(
-        tr("Written to %1, which the emulator reads when it starts. The recommendations come from "
-           "measurements on NVIDIA hardware on Linux; other platforms have not been measured.")
+        tr("Written to %1, which the emulator reads when it starts. The NVIDIA recommendations "
+           "come from measurements on NVIDIA hardware on Linux; the AMD fence wait was measured "
+           "on one RADV system. Other platforms have not been measured.")
             .arg(QString::fromStdString(State::SwitchFilePath().string())));
     layout->addWidget(footer);
     layout->addStretch(1);
