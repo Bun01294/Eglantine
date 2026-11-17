@@ -16,11 +16,18 @@ GameCard::GameCard(QObject* parent) : QStyledItemDelegate{parent} {
 namespace {
 
 constexpr int MaxTitleLines = 2;
+/// How far the icon's drop shadow extends past the icon on each side.
+constexpr int ShadowSpread = 6;
 
-/// The platform border for a game icon, loaded once per process.
-QPixmap GetPlatformBorder(bool is_switch2) {
-    const QString key = is_switch2 ? QStringLiteral("eglantine-border-switch2")
-                                   : QStringLiteral("eglantine-border-switch1");
+/// The platform border for a game icon, scaled to `size` logical pixels and loaded once per
+/// process. Scaling a 1024x1024 pixmap on every card paint is far too slow to scroll at 60 fps,
+/// so the result is cached per size and device pixel ratio.
+QPixmap GetPlatformBorder(bool is_switch2, int size, qreal dpr) {
+    const QString key = QStringLiteral("eglantine-border-%1-%2-%3")
+                            .arg(is_switch2 ? QStringLiteral("switch2") : QStringLiteral("switch1"))
+                            .arg(size)
+                            .arg(dpr);
+
     QPixmap border;
     if (QPixmapCache::find(key, &border)) {
         return border;
@@ -28,10 +35,54 @@ QPixmap GetPlatformBorder(bool is_switch2) {
 
     border.load(is_switch2 ? QStringLiteral(":/game_borders/switch2.png")
                            : QStringLiteral(":/game_borders/switch1.png"));
-    if (!border.isNull()) {
-        QPixmapCache::insert(key, border);
+    if (border.isNull()) {
+        return border;
     }
+
+    const int pixels = std::max(1, qRound(size * dpr));
+    border = border.scaled(pixels, pixels, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    border.setDevicePixelRatio(dpr);
+    QPixmapCache::insert(key, border);
     return border;
+}
+
+/// The soft drop shadow drawn under a game icon: six stacked translucent rounded rects, rendered
+/// once per icon size and device pixel ratio. Drawing them per card per frame costs about as much
+/// as the whole rest of the card, which is enough to drop scrolling below 60 fps.
+QPixmap GetIconShadow(const QSize& icon_size, qreal dpr) {
+    constexpr int ShadowShift = 3;
+
+    const QString key = QStringLiteral("eglantine-icon-shadow-%1x%2-%3")
+                            .arg(icon_size.width())
+                            .arg(icon_size.height())
+                            .arg(dpr);
+
+    QPixmap shadow;
+    if (QPixmapCache::find(key, &shadow)) {
+        return shadow;
+    }
+
+    const QSize extent(icon_size.width() + 2 * ShadowSpread,
+                       icon_size.height() + 2 * ShadowSpread + ShadowShift);
+    shadow = QPixmap(extent * dpr);
+    shadow.setDevicePixelRatio(dpr);
+    shadow.fill(Qt::transparent);
+
+    QPainter painter(&shadow);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(QColor(0, 0, 0, 14));
+
+    const qreal icon_radius = icon_size.width() * 0.08;
+    for (int spread = 1; spread <= ShadowSpread; ++spread) {
+        const QRectF rect(ShadowSpread - spread, ShadowSpread - spread + ShadowShift,
+                          icon_size.width() + spread * 2, icon_size.height() + spread * 2);
+        painter.drawRoundedRect(rect, icon_radius + spread, icon_radius + spread);
+    }
+    painter.end();
+
+    QPixmapCache::insert(key, shadow);
+    return shadow;
 }
 
 /// Wraps `text` into at most `max_lines` centred lines, eliding the last one if it overflows.
@@ -111,17 +162,13 @@ void GameCard::paint(QPainter* painter, const QStyleOptionViewItem& option,
         // The platform borders round their outer corners at ~8% of their width; matching that
         // keeps icon pixels from showing past the border's corners.
         const qreal icon_radius = iconRect.width() * 0.08;
+        const qreal dpr = painter->device() ? painter->device()->devicePixelRatio() : 1.0;
 
         painter->setRenderHint(QPainter::SmoothPixmapTransform, true);
 
-        // Soft drop shadow: stacked translucent rects, darkest under the icon's centre.
-        painter->setPen(Qt::NoPen);
-        painter->setBrush(QColor(0, 0, 0, 14));
-        for (int spread = 1; spread <= 6; ++spread) {
-            const QRectF shadow = QRectF(iconRect).adjusted(-spread, -spread + 3, spread,
-                                                            spread + 3);
-            painter->drawRoundedRect(shadow, icon_radius + spread, icon_radius + spread);
-        }
+        // Soft drop shadow, pre-rendered: darkest under the icon's centre.
+        const QPixmap shadow = GetIconShadow(iconRect.size(), dpr);
+        painter->drawPixmap(iconRect.topLeft() - QPoint(ShadowSpread, ShadowSpread), shadow);
 
         painter->save();
         QPainterPath clip_path;
@@ -132,8 +179,8 @@ void GameCard::paint(QPainter* painter, const QStyleOptionViewItem& option,
 
         // The platform border sits on top of the icon; its centre is transparent.
         if (m_showPlatformBorders) {
-            const QPixmap border =
-                GetPlatformBorder(index.data(GameListItemPath::Switch2Role).toBool());
+            const QPixmap border = GetPlatformBorder(
+                index.data(GameListItemPath::Switch2Role).toBool(), iconRect.width(), dpr);
             if (!border.isNull()) {
                 painter->drawPixmap(iconRect, border);
             }
