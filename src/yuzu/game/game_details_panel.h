@@ -57,7 +57,8 @@ struct GameDetailsExtras {
 };
 
 /// Banner across the top with the game icon overlapping its lower edge, title and developer
-/// beside the icon. Hovering shows buttons to change the banner and the icon.
+/// beside the icon. While the game's artwork can be changed, buttons to change the banner and
+/// the icon stay visible over the artwork.
 class GameDetailsHeader : public QWidget {
     Q_OBJECT
 
@@ -68,8 +69,6 @@ public:
     void SetIcon(const QPixmap& icon);
     void SetEditable(bool editable);
     void SetBusy(bool busy);
-    /// Shows the edit buttons while hovered, focused or showing their menu.
-    void UpdateEditButtons();
 
     QToolButton* BannerEditButton() const {
         return banner_edit;
@@ -89,10 +88,10 @@ protected:
     void paintEvent(QPaintEvent* event) override;
     void resizeEvent(QResizeEvent* event) override;
     void changeEvent(QEvent* event) override;
-    void enterEvent(QEnterEvent* event) override;
-    void leaveEvent(QEvent* event) override;
 
 private:
+    /// Shows the artwork buttons whenever the game's artwork can be changed.
+    void UpdateEditButtons();
     int HeroHeight(int width) const;
     QRect IconRect() const;
     void LayoutLabels();
@@ -109,6 +108,7 @@ private:
     QToolButton* icon_edit = nullptr;
     bool editable = false;
     bool busy = false;
+    bool glyph_refresh_queued = false;
 };
 
 /// Single line label that elides a path to whatever width it gets and opens it on click.

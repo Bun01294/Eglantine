@@ -38,8 +38,11 @@ constexpr int SideMargin = 16;
 constexpr int HeroMaxWidth = 1280;
 constexpr int StoredIconSize = 256;
 constexpr int OverlayButtonSize = 28;
+/// Height of the action bar buttons. Buttons in the panel body match it so the panel reads as
+/// one set of controls.
+constexpr int ActionButtonHeight = 38;
 
-enum class Glyph { Play, Configure, StarOutline, StarFilled, More, Edit };
+enum class Glyph { Play, Configure, StarOutline, StarFilled, More };
 
 QIcon MakeGlyph(Glyph glyph, const QColor& color, qreal dpr, int size = 20) {
     QPixmap pixmap(QSize(size, size) * dpr);
@@ -88,14 +91,6 @@ QIcon MakeGlyph(Glyph glyph, const QColor& color, qreal dpr, int size = 20) {
             p.drawEllipse(QPointF(4 + i * 6, 10), 1.8, 1.8);
         }
         break;
-    case Glyph::Edit:
-        // Pencil, tip at the bottom left.
-        p.translate(10, 10);
-        p.rotate(45);
-        p.drawRoundedRect(QRectF(-2.2, -8.5, 4.4, 2.6), 1, 1);
-        p.drawRect(QRectF(-2.2, -5.2, 4.4, 9.2));
-        p.drawPolygon(QPolygonF{QPointF(-2.2, 4.8), QPointF(2.2, 4.8), QPointF(0, 8.6)});
-        break;
     }
     return QIcon(pixmap);
 }
@@ -111,6 +106,11 @@ QString Rgba(QColor color) {
 QColor WithAlpha(QColor color, int alpha) {
     color.setAlpha(alpha);
     return color;
+}
+
+/// Steps a surface colour up for hover states, whichever direction the palette goes.
+QColor Emphasized(const QColor& color, int amount) {
+    return color.lightness() < 128 ? color.lighter(amount) : color.darker(amount);
 }
 
 void SetMuted(QWidget* widget, int alpha = 150) {
@@ -268,14 +268,28 @@ private:
 QToolButton* MakeOverlayButton(QWidget* parent) {
     auto* button = new QToolButton(parent);
     button->setFixedSize(OverlayButtonSize, OverlayButtonSize);
-    button->setIconSize(QSize(16, 16));
+    // At 16 px the brush's handle and bristles collapse into one diagonal stroke.
+    button->setIconSize(QSize(20, 20));
     button->setCursor(Qt::PointingHandCursor);
-    // Drawn over artwork, so a fixed dark scrim keeps it readable on any banner.
-    button->setStyleSheet(QStringLiteral(
-        "QToolButton { border: none; border-radius: 14px; background: rgba(0, 0, 0, 110); } "
-        "QToolButton:hover, QToolButton:pressed { background: rgba(0, 0, 0, 170); } "
-        "QToolButton::menu-indicator { image: none; }"));
+    button->setFocusPolicy(Qt::TabFocus);
+    button->setToolButtonStyle(Qt::ToolButtonIconOnly);
     return button;
+}
+
+/// Buttons floating on the banner. They use the panel's own surface instead of a translucent
+/// scrim, so they read as controls of the panel rather than as a tinted square of whatever
+/// artwork is behind them, and stay legible on bright banners too.
+QString OverlayButtonStyle(const QPalette& pal) {
+    const QColor text = pal.color(QPalette::WindowText);
+    const QColor surface = pal.color(QPalette::Window);
+    return QStringLiteral(
+        "QToolButton { border: 1px solid %1; border-radius: 8px; background: %2; } "
+        "QToolButton:hover { background: %3; border-color: %4; } "
+        "QToolButton:pressed { background: %5; } "
+        "QToolButton::menu-indicator { image: none; }")
+        .arg(Rgba(WithAlpha(text, 55)), Rgba(WithAlpha(surface, 235)),
+             Rgba(WithAlpha(Emphasized(surface, 135), 245)), Rgba(WithAlpha(text, 110)),
+             Rgba(WithAlpha(Emphasized(surface, 115), 245)));
 }
 
 } // namespace
@@ -348,21 +362,11 @@ void GameDetailsHeader::SetBusy(bool busy_) {
 }
 
 void GameDetailsHeader::UpdateEditButtons() {
-    const bool active = underMouse() || banner_edit->isDown() || icon_edit->isDown() ||
-                        banner_edit->hasFocus() || icon_edit->hasFocus();
-    const bool show = editable && !busy && active;
+    // Always visible while the artwork can be changed: a control that only exists once the
+    // pointer is already over the artwork is one nobody finds.
+    const bool show = editable && !busy;
     banner_edit->setVisible(show);
     icon_edit->setVisible(show);
-}
-
-void GameDetailsHeader::enterEvent(QEnterEvent* event) {
-    UpdateEditButtons();
-    QWidget::enterEvent(event);
-}
-
-void GameDetailsHeader::leaveEvent(QEvent* event) {
-    UpdateEditButtons();
-    QWidget::leaveEvent(event);
 }
 
 int GameDetailsHeader::HeroHeight(int width) const {
@@ -401,11 +405,15 @@ void GameDetailsHeader::LayoutLabels() {
     title->setGeometry(text_x, hero_height + 8, text_width, title_height);
     developer->setGeometry(text_x, hero_height + 10 + title_height, text_width,
                            developer->heightForWidth(text_width));
-    close_button->move(width() - OverlayButtonSize - 10, 10);
-    banner_edit->move(width() - 2 * OverlayButtonSize - 16, 10);
+
+    close_button->move(width() - OverlayButtonSize - SideMargin, SideMargin / 2);
+    banner_edit->move(close_button->x() - OverlayButtonSize - 8, close_button->y());
+
+    // Sits inside the icon's bottom-right corner. Hung off the corner itself it ended up past
+    // the header's bottom edge, which cut the button in half.
     const QRect icon_rect = IconRect();
-    icon_edit->move(icon_rect.right() - OverlayButtonSize + 6,
-                    icon_rect.bottom() - OverlayButtonSize + 6);
+    icon_edit->move(icon_rect.right() + 1 - OverlayButtonSize - 4,
+                    icon_rect.bottom() + 1 - OverlayButtonSize - 4);
     updateGeometry();
 }
 
@@ -416,14 +424,34 @@ void GameDetailsHeader::resizeEvent(QResizeEvent* event) {
 
 void GameDetailsHeader::RefreshGlyphs() {
     const qreal dpr = devicePixelRatioF();
-    close_button->setIcon(HomeGlyphs::Close(Qt::white, dpr));
-    banner_edit->setIcon(MakeGlyph(Glyph::Edit, Qt::white, dpr));
-    icon_edit->setIcon(MakeGlyph(Glyph::Edit, Qt::white, dpr));
+    const QColor color = palette().color(QPalette::WindowText);
+    const QString style = OverlayButtonStyle(palette());
+
+    for (QToolButton* button : {close_button, banner_edit, icon_edit}) {
+        button->setStyleSheet(style);
+    }
+    close_button->setIcon(HomeGlyphs::Close(color, dpr, 20));
+    // The brush the home screen already uses to mean "change the artwork", so both panels ask
+    // for it with the same symbol.
+    banner_edit->setIcon(HomeGlyphs::Brush(color, dpr, 20));
+    icon_edit->setIcon(HomeGlyphs::Brush(color, dpr, 20));
 }
 
 void GameDetailsHeader::changeEvent(QEvent* event) {
     if (event->type() == QEvent::PaletteChange && developer) {
         RefreshDeveloperPalette();
+        // Setting child style sheets while Qt is still applying the change crashes it, so the
+        // glyphs and button surfaces follow on the next event loop turn.
+        if (!glyph_refresh_queued) {
+            glyph_refresh_queued = true;
+            QMetaObject::invokeMethod(
+                this,
+                [this] {
+                    glyph_refresh_queued = false;
+                    RefreshGlyphs();
+                },
+                Qt::QueuedConnection);
+        }
     }
     QWidget::changeEvent(event);
 }
@@ -602,7 +630,7 @@ GameDetailsPanel::GameDetailsPanel(QWidget* parent) : HomeSidePanel{parent} {
     actions->setContentsMargins(SideMargin, 10, SideMargin, 12);
     actions->setSpacing(8);
     play_button = new QPushButton(action_bar);
-    play_button->setMinimumHeight(38);
+    play_button->setFixedHeight(ActionButtonHeight);
     play_button->setIconSize(QSize(18, 18));
     play_button->setCursor(Qt::PointingHandCursor);
     QFont play_font = play_button->font();
@@ -613,7 +641,7 @@ GameDetailsPanel::GameDetailsPanel(QWidget* parent) : HomeSidePanel{parent} {
 
     const auto make_action = [&] {
         auto* button = new QToolButton(action_bar);
-        button->setFixedSize(38, 38);
+        button->setFixedSize(ActionButtonHeight, ActionButtonHeight);
         button->setIconSize(QSize(18, 18));
         button->setCursor(Qt::PointingHandCursor);
         actions->addWidget(button);
@@ -629,7 +657,7 @@ GameDetailsPanel::GameDetailsPanel(QWidget* parent) : HomeSidePanel{parent} {
     });
     SetFooter(action_bar);
 
-    // Artwork menus on the header's hover buttons
+    // Artwork menus on the header's edit buttons
     banner_menu = new QMenu(this);
     icon_menu = new QMenu(this);
     for (QMenu* menu : {banner_menu, icon_menu}) {
@@ -651,9 +679,6 @@ GameDetailsPanel::GameDetailsPanel(QWidget* parent) : HomeSidePanel{parent} {
             reset->setEnabled(QFileInfo::exists(path));
             connect(reset, &QAction::triggered, this, [this, hero] { ResetArt(hero); });
         });
-        // The pointer may have left the header while the menu was open.
-        connect(menu, &QMenu::aboutToHide, header, &GameDetailsHeader::UpdateEditButtons,
-                Qt::QueuedConnection);
     }
     header->BannerEditButton()->setMenu(banner_menu);
     header->IconEditButton()->setMenu(icon_menu);
@@ -958,16 +983,20 @@ void GameDetailsPanel::RefreshGlyphs() {
     const QColor text = pal.color(QPalette::ButtonText);
     const QColor accent = pal.color(QPalette::Highlight);
 
+    // The style sheet, not the widget, decides the height of a styled button, so the action bar
+    // height has to be stated here as well or Play shrinks to its text.
     play_button->setIcon(MakeGlyph(Glyph::Play, pal.color(QPalette::HighlightedText), dpr));
     play_button->setStyleSheet(
-        QStringLiteral("QPushButton { border: none; border-radius: 6px; padding: 0 14px; "
-                       "background: palette(highlight); color: palette(highlighted-text); } "
-                       "QPushButton:hover { background: %1; } "
-                       "QPushButton:pressed { background: %2; }")
-            .arg(Rgba(accent.lighter(112)), Rgba(accent.darker(112))));
+        QStringLiteral("QPushButton { border: none; border-radius: 8px; padding: 0 14px; "
+                       "min-height: %1px; max-height: %1px; background: palette(highlight); "
+                       "color: palette(highlighted-text); } "
+                       "QPushButton:hover { background: %2; } "
+                       "QPushButton:pressed { background: %3; }")
+            .arg(QString::number(ActionButtonHeight), Rgba(accent.lighter(112)),
+                 Rgba(accent.darker(112))));
 
     const QString tool_style =
-        QStringLiteral("QToolButton { border: 1px solid %1; border-radius: 6px; "
+        QStringLiteral("QToolButton { border: 1px solid %1; border-radius: 8px; "
                        "background: transparent; } QToolButton:hover { background: %2; } "
                        "QToolButton::menu-indicator { image: none; }")
             .arg(Rgba(WithAlpha(text, 60)), Rgba(WithAlpha(text, 25)));
