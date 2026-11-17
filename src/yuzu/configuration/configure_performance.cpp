@@ -112,21 +112,6 @@ std::vector<Feature> FeaturesFor(Platform platform) {
          QT_TR_NOOP("Switch 2 games signal thousands of fences a second; releasing the ones the "
                     "host GPU already passed together smooths frame times."),
          true, none});
-    // tested by Octelly on Linux, RX 6600
-    features.push_back(
-        {"EDEN_NX2_FENCE_WAIT", "host", QT_TR_NOOP("Wait for the frame fence on the host"),
-         QT_TR_NOOP("The present waits for its own GPU fence on the host instead of sleeping in "
-                    "the guest kernel on an event. A channel suspended on a semaphore cannot "
-                    "then wedge the guest while the fence is waited for: without it, Splatoon "
-                    "Raiders freezes on AMD a few seconds after load and Mario Kart World"
-                    "deadlocked about one boot in three."),
-         platform == Platform::Amd, [](const Context& context) {
-             Verdict verdict;
-             verdict.note = QObject::tr(
-                 "This was measured on RADV on Linux; other drivers may "
-                 "behave differently. Please report if it does not work on your AMD GPU.");
-             return verdict;
-         }});
     const bool host_import_recommended = platform == Platform::Nvidia;
     features.push_back(
         {"EDEN_NX2_HOST_IMPORT", "1", QT_TR_NOOP("Read uniform banks straight from guest memory"),
@@ -147,6 +132,24 @@ std::vector<Feature> FeaturesFor(Platform platform) {
              verdict.note = QObject::tr("Lower image quality; leave it off on GPUs that keep up.");
              return verdict;
          }});
+    if (platform == Platform::Amd) {
+        // tested by Octelly on Linux, RX 6600
+        features.push_back(
+            {"EDEN_NX2_FENCE_WAIT", "host", QT_TR_NOOP("Wait for the frame fence on the host"),
+             QT_TR_NOOP(
+                 "The present waits for its own GPU fence on the host instead of sleeping in "
+                 "the guest kernel on an event. A channel suspended on a semaphore cannot "
+                 "then wedge the guest while the fence is waited for: without it, Splatoon "
+                 "Raiders freezes on AMD a few seconds after load and Mario Kart World"
+                 "deadlocked about one boot in three."),
+             platform == Platform::Amd, [](const Context& context) {
+                 Verdict verdict;
+                 verdict.note = QObject::tr(
+                     "This was measured on RADV on Linux; other drivers may "
+                     "behave differently. Please report if it does not work on your AMD GPU.");
+                 return verdict;
+             }});
+    }
     if (platform == Platform::Nvidia) {
         features.push_back(
             {"EDEN_NX2_BANK_REUPLOAD", "0", QT_TR_NOOP("Skip the once-per-frame bank re-upload"),
