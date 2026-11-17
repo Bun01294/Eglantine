@@ -131,6 +131,17 @@ std::vector<Feature> FeaturesFor(Platform platform) {
                     "instead when the driver refuses. On by default with the NVIDIA proprietary "
                     "driver on Linux; add EDEN_NX2_HOST_IMPORT=0 to turn it off there."),
          host_import_recommended, HostImportVerdict});
+    features.push_back(
+        {"EDEN_NX2_OOT_AA", "0", QT_TR_NOOP("Replace Ocarina of Time's anti-aliasing"),
+         QT_TR_NOOP("Without DLSS, Ocarina of Time's own anti-aliasing pass runs after "
+                    "tonemapping (14.8 ms a frame at 1440p on an RX 580). This replaces it with "
+                    "a bilinear copy of its input: faster, with more aliasing. With DLSS active "
+                    "it changes nothing. Meant for GPUs that cannot keep up."),
+         false, [](const Context&) {
+             Verdict verdict;
+             verdict.note = QObject::tr("Lower image quality; leave it off on GPUs that keep up.");
+             return verdict;
+         }});
     if (platform == Platform::Nvidia) {
         features.push_back(
             {"EDEN_NX2_BANK_REUPLOAD", "0", QT_TR_NOOP("Skip the once-per-frame bank re-upload"),
