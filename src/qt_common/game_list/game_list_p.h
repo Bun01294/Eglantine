@@ -179,16 +179,19 @@ public:
     static constexpr int DeveloperRole = SortRole + 6;
     /// Display version of the newest enabled update, or of the base game.
     static constexpr int VersionRole = SortRole + 7;
+    /// True when the game is a Switch 2 title.
+    static constexpr int Switch2Role = SortRole + 8;
 
     GameListItemPath() = default;
     GameListItemPath(const QString& game_path, const std::vector<u8>& picture_data,
                      const QString& game_name, const QString& game_type, u64 program_id,
-                     u64 play_time, const QString& patch_versions) {
+                     u64 play_time, const QString& patch_versions, bool is_switch2 = false) {
         setData(type(), TypeRole);
         setData(game_path, FullPathRole);
         setData(game_name, TitleRole);
         setData(qulonglong(program_id), ProgramIdRole);
         setData(game_type, FileTypeRole);
+        setData(is_switch2, Switch2Role);
 
         const auto readable_play_time =
             play_time > 0 ? QObject::tr("Play Time: %1")

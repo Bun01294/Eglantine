@@ -3,9 +3,11 @@
 
 #include <QPainter>
 #include <QPainterPath>
+#include <QPixmapCache>
 #include <QTextLayout>
 #include "game_card.h"
 #include "qt_common/config/uisettings.h"
+#include "qt_common/game_list/game_list_p.h"
 
 GameCard::GameCard(QObject* parent) : QStyledItemDelegate{parent} {
     setObjectName("GameCard");
@@ -14,6 +16,23 @@ GameCard::GameCard(QObject* parent) : QStyledItemDelegate{parent} {
 namespace {
 
 constexpr int MaxTitleLines = 2;
+
+/// The platform border for a game icon, loaded once per process.
+QPixmap GetPlatformBorder(bool is_switch2) {
+    const QString key = is_switch2 ? QStringLiteral("eglantine-border-switch2")
+                                   : QStringLiteral("eglantine-border-switch1");
+    QPixmap border;
+    if (QPixmapCache::find(key, &border)) {
+        return border;
+    }
+
+    border.load(is_switch2 ? QStringLiteral(":/game_borders/switch2.png")
+                           : QStringLiteral(":/game_borders/switch1.png"));
+    if (!border.isNull()) {
+        QPixmapCache::insert(key, border);
+    }
+    return border;
+}
 
 /// Wraps `text` into at most `max_lines` centred lines, eliding the last one if it overflows.
 void DrawTitle(QPainter* painter, const QRect& rect, const QString& text, const QFont& font,
@@ -62,7 +81,7 @@ void GameCard::paint(QPainter* painter, const QStyleOptionViewItem& option,
     painter->save();
     painter->setRenderHint(QPainter::Antialiasing);
 
-    constexpr int cardCornerRadius = 10;
+    constexpr int cardCornerRadius = 18;
 
     const QRect cardRect = getCardRect(option, index);
     const QPalette& palette = option.palette;
@@ -89,6 +108,10 @@ void GameCard::paint(QPainter* painter, const QStyleOptionViewItem& option,
         iconRect = {cardRect.left() + (cardRect.width() - scaled.width()) / 2,
                     cardRect.top() + cardMargin - 1, scaled.width(), scaled.height()};
 
+        // The platform borders round their outer corners at ~8% of their width; matching that
+        // keeps icon pixels from showing past the border's corners.
+        const qreal icon_radius = iconRect.width() * 0.08;
+
         painter->setRenderHint(QPainter::SmoothPixmapTransform, true);
 
         // Soft drop shadow: stacked translucent rects, darkest under the icon's centre.
@@ -97,21 +120,30 @@ void GameCard::paint(QPainter* painter, const QStyleOptionViewItem& option,
         for (int spread = 1; spread <= 6; ++spread) {
             const QRectF shadow = QRectF(iconRect).adjusted(-spread, -spread + 3, spread,
                                                             spread + 3);
-            painter->drawRoundedRect(shadow, cardCornerRadius + spread, cardCornerRadius + spread);
+            painter->drawRoundedRect(shadow, icon_radius + spread, icon_radius + spread);
         }
 
         painter->save();
         QPainterPath clip_path;
-        clip_path.addRoundedRect(iconRect, cardCornerRadius, cardCornerRadius);
+        clip_path.addRoundedRect(iconRect, icon_radius, icon_radius);
         painter->setClipPath(clip_path);
         painter->drawPixmap(iconRect, icon_pixmap);
         painter->restore();
 
+        // The platform border sits on top of the icon; its centre is transparent.
+        if (m_showPlatformBorders) {
+            const QPixmap border =
+                GetPlatformBorder(index.data(GameListItemPath::Switch2Role).toBool());
+            if (!border.isNull()) {
+                painter->drawPixmap(iconRect, border);
+            }
+        }
+
         if (selected) {
             painter->setPen(QPen(palette.highlight().color(), 2));
             painter->setBrush(Qt::NoBrush);
-            painter->drawRoundedRect(QRectF(iconRect).adjusted(-1, -1, 1, 1), cardCornerRadius,
-                                     cardCornerRadius);
+            painter->drawRoundedRect(QRectF(iconRect).adjusted(-1, -1, 1, 1), icon_radius,
+                                     icon_radius);
         }
     } else {
         iconRect = {cardRect.left() + cardMargin, cardRect.top() + cardMargin,
@@ -196,4 +228,8 @@ void GameCard::setSize(const QSize& newSize, const QSize& contentSize, const int
     m_contentSize = contentSize;
     m_padding = padding;
     m_columns = columns;
+}
+
+void GameCard::setShowPlatformBorders(bool show) {
+    m_showPlatformBorders = show;
 }
