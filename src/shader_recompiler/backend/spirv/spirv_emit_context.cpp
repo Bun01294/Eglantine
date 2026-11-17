@@ -468,13 +468,15 @@ Id DescType(EmitContext& ctx, Id sampled_type, Id pointer_type, u32 count) {
         return pointer_type;
     }
 }
-// EDEN_NX2_LEAN_SSBO=0 turns it off: the global memory helpers are kept as calls and route
-// with one switch. Inlined at each of their calls, a program with ~30 candidate buffers took
-// NVIDIA's compiler 2.4 s (Ocarina's foliage compute programs; 0.6 s this way, same accesses).
+// EDEN_NX2_LEAN_SSBO=1 turns it on: the global memory helpers are kept as calls (DontInline) and
+// route with one switch. Inlined at each of their calls, a program with ~30 candidate buffers
+// took NVIDIA's compiler 2.4 s (Ocarina's foliage compute programs; 0.6 s as calls). Off by
+// default: as calls, the first of two consecutive loads in Ocarina's tree task program returned
+// 0 on NVIDIA, so every tree cell drew its 256-record cap (a wall of trees in Hyrule Field).
 bool LeanGlobalMemory() {
     static const bool enabled = [] {
         const char* value = std::getenv("EDEN_NX2_LEAN_SSBO");
-        return value == nullptr || value[0] != '0';
+        return value != nullptr && value[0] != '0';
     }();
     return enabled;
 }
