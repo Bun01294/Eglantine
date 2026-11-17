@@ -6,6 +6,7 @@
 
 #include <QBuffer>
 #include <QCheckBox>
+#include <QCoreApplication>
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -22,6 +23,7 @@
 #include <QPainterPath>
 #include <QPushButton>
 #include <QStyle>
+#include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
 
@@ -290,6 +292,40 @@ QString OverlayButtonStyle(const QPalette& pal) {
         .arg(Rgba(WithAlpha(text, 55)), Rgba(WithAlpha(surface, 235)),
              Rgba(WithAlpha(Emphasized(surface, 135), 245)), Rgba(WithAlpha(text, 110)),
              Rgba(WithAlpha(Emphasized(surface, 115), 245)));
+}
+
+/// Secondary button in the panel body. Outlined like the action bar's tool buttons and derived
+/// from the palette, so every control on the panel reads as one family and stays legible on
+/// light and dark themes alike. The height is stated in the style sheet as well because QSS,
+/// not the widget, decides the size of a styled button.
+QString BodyButtonStyle(const QPalette& pal) {
+    const QColor text = pal.color(QPalette::ButtonText);
+    const QColor accent = pal.color(QPalette::Highlight);
+    return QStringLiteral(
+        "QPushButton { border: 1px solid %1; border-radius: 8px; padding: 0 12px; "
+        "min-height: %2px; max-height: %2px; background: transparent; "
+        "color: %3; } "
+        "QPushButton:hover { background: %4; border-color: %5; } "
+        "QPushButton:pressed { background: %6; } "
+        "QPushButton:disabled { border-color: %7; color: %8; }")
+        // The 1 px border is part of the box, so the content height is the bar height minus it.
+        .arg(Rgba(WithAlpha(text, 60)), QString::number(ActionButtonHeight - 2),
+             Rgba(text), Rgba(WithAlpha(accent, 45)), Rgba(WithAlpha(accent, 120)),
+             Rgba(WithAlpha(accent, 75)), Rgba(WithAlpha(text, 35)), Rgba(WithAlpha(text, 90)));
+}
+
+/// Collapsible section header. A full-width row with a faint surface of its own: it says
+/// "click me to unfold" instead of looking like the plain headings around it.
+QString SectionToggleStyle(const QPalette& pal) {
+    const QColor text = pal.color(QPalette::ButtonText);
+    return QStringLiteral(
+        "QToolButton { border: 1px solid transparent; border-radius: 8px; padding: 0 8px; "
+        "min-height: %1px; max-height: %1px; background: %2; text-align: left; color: %3; } "
+        "QToolButton:hover { background: %4; border-color: %5; } "
+        "QToolButton:pressed { background: %6; }")
+        .arg(QString::number(ActionButtonHeight - 2), Rgba(WithAlpha(text, 14)), Rgba(text),
+             Rgba(WithAlpha(text, 28)), Rgba(WithAlpha(text, 55)),
+             Rgba(WithAlpha(text, 20)));
 }
 
 } // namespace
@@ -603,6 +639,8 @@ GameDetailsPanel::GameDetailsPanel(QWidget* parent) : HomeSidePanel{parent} {
     technical_toggle->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
     technical_toggle->setArrowType(Qt::RightArrow);
     technical_toggle->setCursor(Qt::PointingHandCursor);
+    // Full width so the header is one row across the panel rather than a label plus a stray arrow.
+    technical_toggle->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     QFont toggle_font = technical_toggle->font();
     toggle_font.setBold(true);
     toggle_font.setPointSizeF(toggle_font.pointSizeF() * 1.15);
@@ -692,6 +730,44 @@ GameDetailsPanel::GameDetailsPanel(QWidget* parent) : HomeSidePanel{parent} {
 
     RetranslateUI();
     RefreshGlyphs();
+
+    // TEMP GRAB
+    if (const QByteArray path = qgetenv("EGLANTINE_GRAB_PANEL"); !path.isEmpty()) {
+        GameDetailsInfo fake;
+        fake.program_id = 0x0100000000010000ULL;
+        fake.title = QStringLiteral("The Legend of Zelda: Tears of the Kingdom");
+        fake.developer = QStringLiteral("Nintendo");
+        fake.version = QStringLiteral("1.2.1");
+        fake.file_type = QStringLiteral("NSP");
+        fake.size = QStringLiteral("16.4 GiB");
+        fake.play_time = QStringLiteral("42h 10m");
+        fake.path = QStringLiteral("/home/alex/games/totk/totk.nsp");
+        fake.icon = QPixmap(256, 256);
+        fake.icon.fill(QColor(210, 190, 120));
+
+        auto* probe = new QWidget;
+        probe->setAutoFillBackground(true);
+        probe->setBackgroundRole(QPalette::Window);
+        auto* probe_panel = new GameDetailsPanel(probe);
+        probe->resize(GameDetailsPanel::PanelWidth, 980);
+        probe_panel->resize(GameDetailsPanel::PanelWidth, 980);
+        probe_panel->SetGame(fake);
+        probe_panel->SetExtras(GameDetailsExtras{.program_id = fake.program_id,
+                                                 .path = fake.path});
+        probe_panel->technical_toggle->setChecked(true);
+        probe->show();
+        QTimer::singleShot(400, this, [this, probe, path] {
+            qWarning("GEOM precompile %dx%d row %d,%d toggle %dx%d at %d,%d",
+                     precompile_button->width(), precompile_button->height(),
+                     precompile_button->x(), precompile_button->y(),
+                     technical_toggle->width(), technical_toggle->height(),
+                     technical_toggle->x(), technical_toggle->y());
+            probe->grab().save(QString::fromUtf8(path));
+            precompile_button->grab().save(QString::fromUtf8(path) + QStringLiteral(".precompile.png"));
+            technical_toggle->grab().save(QString::fromUtf8(path) + QStringLiteral(".toggle.png"));
+            QCoreApplication::quit();
+        });
+    }
 }
 
 GameDetailsPanel::~GameDetailsPanel() = default;
@@ -1012,6 +1088,11 @@ void GameDetailsPanel::RefreshGlyphs() {
     for (QLabel* key : {pipeline_cache_key, precompiled_key}) {
         SetMuted(key);
     }
+
+    // Like the action bar, the styles are palette-derived and re-applied here so a theme switch
+    // repaints them instead of leaving colours from the previous palette behind.
+    precompile_button->setStyleSheet(BodyButtonStyle(pal));
+    technical_toggle->setStyleSheet(SectionToggleStyle(pal));
 }
 
 void GameDetailsPanel::RetranslateUI() {
