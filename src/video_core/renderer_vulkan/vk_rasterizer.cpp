@@ -1838,6 +1838,8 @@ void RasterizerVulkan::Clear(u32 layer_count) {
             cmdbuf.ClearAttachments(attachment, clear_rect);
         });
     }
+    // The depth/stencil attachment was written (BarrierFeedbackLoop).
+    scheduler.NoteDepthStencilWrite();
 }
 
 namespace {
@@ -2498,6 +2500,25 @@ void RasterizerVulkan::WaitForIdle() {
     }
 
     query_cache.NotifyWFI();
+
+    // Inside a render pass whose draws wrote no storage buffers or transform feedback, the
+    // draws after the wait need nothing from the draws before it that rasterization order does
+    // not already give: the barrier waits until the pass ends (Scheduler::DeferWaitForIdle).
+    // Ocarina of Time ended 820-1,200 render passes a second here. EDEN_NX2_WFI_DEFER=0 ends
+    // the pass every time, as before; so does EGLANTINE_SYNC_FIX=0.
+    static const bool defer_wfi = [] {
+        const char* env = std::getenv("EDEN_NX2_WFI_DEFER");
+        return env == nullptr || std::string_view{env} != "0";
+    }();
+    if (defer_wfi && SyncFixEnabled() && scheduler.IsRenderPassActive() &&
+        !scheduler.RenderPassHasStores() &&
+        maxwell3d != nullptr && maxwell3d->regs.transform_feedback_enabled == 0) {
+        scheduler.DeferWaitForIdle(flags);
+        VideoCommon::Nx2Profile::Scope profile_scope{
+            VideoCommon::Nx2Profile::Zone::SignalOrdering};
+        fence_manager.SignalOrdering();
+        return;
+    }
 
     scheduler.RequestOutsideRenderPassOperationContext();
     if (SyncFixEnabled()) {
@@ -3446,6 +3467,8 @@ void RasterizerVulkan::HandleTransformFeedback() {
     query_cache.CounterEnable(VideoCommon::QueryType::StreamingByteCount,
                               regs.transform_feedback_enabled);
     if (regs.transform_feedback_enabled != 0) {
+        // Transform feedback writes buffers from inside the pass (WaitForIdle may not defer).
+        scheduler.NoteRenderPassStores();
         // Log extension usage for transform feedback
         if (GPU::Logging::IsActive()) {
             GPU::Logging::GPULogger::GetInstance().LogExtensionUsage(

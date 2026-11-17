@@ -225,6 +225,8 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
         values[i] = clear_values[i];
     }
     const bool after_compute = std::exchange(compute_writes_pending, false);
+    // A pass that begins with a clear writes its attachments before any draw.
+    render_pass_depth_written = clear_value_count != 0;
     Record([renderpass, framebuffer_handle, render_area, values, clear_value_count,
             after_compute](vk::CommandBuffer cmdbuf) {
         const VkRenderPassBeginInfo renderpass_bi{
@@ -532,6 +534,7 @@ void Scheduler::EndRenderPass()
         ++recording_epoch;
         fragment_barrier.Reset();
         render_pass_has_stores = false;
+        render_pass_depth_written = false;
 
         query_cache->CounterClose(VideoCommon::QueryType::StreamingByteCount);
 
@@ -601,6 +604,19 @@ void Scheduler::EndRenderPass()
             }
         });
 
+        if (const VkPipelineStageFlags stages = std::exchange(deferred_wfi_stages, 0)) {
+            // The guest's wait-for-idle (RasterizerVulkan::WaitForIdle) from inside the pass.
+            Record([stages](vk::CommandBuffer cmdbuf) {
+                static constexpr VkMemoryBarrier WFI_BARRIER{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                };
+                cmdbuf.PipelineBarrier(stages, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, WFI_BARRIER);
+            });
+            storage_writes_unordered = false;
+        }
         state.renderpass = VkRenderPass{};
         num_renderpass_images = 0;
     }
