@@ -182,6 +182,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "compatibility with the on-screen keyboard that some games request for "
               "input.\nExclusive "
               "fullscreen may offer better performance and better Freesync/Gsync support."));
+    INSERT(Settings, fullscreen_on_launch, tr("Automatically launches in fullscreen"),
+           tr("Switches to fullscreen automatically when a game starts."));
     INSERT(Settings, aspect_ratio, tr("Aspect Ratio:"),
            tr("Stretches the renderer to fit the specified aspect ratio.\nMost games only support "
               "16:9, so modifications are required to get other ratios.\nAlso controls the "

@@ -522,6 +522,8 @@ struct Values {
                                                             Specialization::Default,
                                                             true,
                                                             true};
+    SwitchableSetting<bool> fullscreen_on_launch{linkage, false, "fullscreen_on_launch",
+                                                 Category::Renderer};
 
     SwitchableSetting<u8, false> bg_red{
                                         linkage, 0, "bg_red", Category::Renderer, Specialization::Default, true, true};
