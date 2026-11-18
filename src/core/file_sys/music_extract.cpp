@@ -28,6 +28,7 @@
 
 #ifdef EGLANTINE_HAS_FLAC
 extern "C" {
+#include <FLAC/metadata.h>
 #include <FLAC/stream_encoder.h>
 }
 #endif
@@ -48,6 +49,8 @@ struct Entry {
 struct Collected {
     std::vector<Entry> entries;
     std::string game_title;
+    // NUP/package cover art (PNG or JPEG bytes), embedded into every track.
+    std::vector<u8> icon;
 };
 
 std::string Lower(std::string_view value) {
@@ -190,6 +193,7 @@ bool CollectLoose(const std::filesystem::path& dump_root, RealVfsFilesystem& vfs
     collected.game_title = !probed.title_name.empty()
                                ? probed.title_name
                                : Common::FS::PathToUTF8String(dump_root.filename());
+    collected.icon = probed.icon;
     return true;
 }
 
@@ -260,6 +264,17 @@ bool CollectNup(const std::string& game_path, RealVfsFilesystem& vfs, Collected&
     }
     if (collected.game_title.empty()) {
         collected.game_title = std::string{Common::FS::GetFilename(game_path)};
+    }
+    if (const auto base = container.FindBasePackage()) {
+        collected.icon = container.GetPackages()[*base].icon;
+    }
+    if (collected.icon.empty()) {
+        for (const auto& package : container.GetPackages()) {
+            if (!package.icon.empty()) {
+                collected.icon = package.icon;
+                break;
+            }
+        }
     }
     return true;
 }
@@ -681,16 +696,172 @@ bool DecodeBwav(std::span<const u8> data, DecodedTrack& out, std::string& note) 
 }
 
 // ---------------------------------------------------------------------------------------------
+// Clean output names and embedded metadata
+// -------------------------------------------------------------------------------------
+
+bool IsAllDigits(std::string_view value) {
+    return !value.empty() &&
+           std::all_of(value.begin(), value.end(), [](unsigned char c) {
+               return std::isdigit(c) != 0;
+           });
+}
+
+// "BGM_XXX_YYY_0005" becomes folder "XXX" and title "YYY": the category markers
+// (BGM, Dm, ExampleMelody) are dropped, a single trailing numeric token goes away,
+// the remaining tokens join with spaces, and a lone token lands directly in the
+// output folder.
+std::pair<std::string, std::string> CleanNameFor(const std::string& entry_name) {
+    const std::string stem = EndsWithCI(entry_name, ".bwav")
+                                 ? entry_name.substr(0, entry_name.size() - 5)
+                                 : entry_name;
+    std::vector<std::string_view> tokens;
+    std::size_t start = 0;
+    for (std::size_t i = 0; i <= stem.size(); ++i) {
+        if (i == stem.size() || stem[i] == '_') {
+            if (i > start) {
+                tokens.push_back(std::string_view{stem}.substr(start, i - start));
+            }
+            start = i + 1;
+        }
+    }
+    while (!tokens.empty()) {
+        const auto head = Lower(tokens.front());
+        if (head != "bgm" && head != "dm" && head != "examplemelody") {
+            break;
+        }
+        tokens.erase(tokens.begin());
+    }
+    if (tokens.size() >= 2 && IsAllDigits(tokens.back())) {
+        tokens.pop_back();
+    }
+    if (tokens.empty()) {
+        return {"", stem};
+    }
+    if (tokens.size() == 1) {
+        return {"", std::string{tokens[0]}};
+    }
+    std::string title;
+    for (std::size_t i = 1; i < tokens.size(); ++i) {
+        if (!title.empty()) {
+            title += ' ';
+        }
+        title += tokens[i];
+    }
+    return {std::string{tokens[0]}, title};
+}
+
+// What gets embedded into every written track.
+struct TrackTags {
+    std::string title;
+    std::string artist;
+    std::string album;
+    std::span<const u8> cover{};
+    std::string_view cover_mime{};
+};
+
+// PNG and JPEG headers carry the pixel size; the FLAC picture block wants it.
+void ImageInfo(std::span<const u8> data, std::string_view& mime, u32& width, u32& height) {
+    mime = {};
+    width = height = 0;
+    if (data.size() >= 24 && data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' &&
+        data[3] == 'G') {
+        width = (u32{data[16]} << 24) | (u32{data[17]} << 16) | (u32{data[18]} << 8) |
+                u32{data[19]};
+        height = (u32{data[20]} << 24) | (u32{data[21]} << 16) | (u32{data[22]} << 8) |
+                 u32{data[23]};
+        mime = "image/png";
+        return;
+    }
+    if (data.size() >= 4 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF) {
+        std::size_t at = 2;
+        while (at + 4 < data.size()) {
+            if (data[at] != 0xFF) {
+                ++at;
+                continue;
+            }
+            const u8 marker = data[at + 1];
+            const u32 length = (u32{data[at + 2]} << 8) | u32{data[at + 3]};
+            const bool start_of_frame = (marker >= 0xC0 && marker <= 0xCF) &&
+                                        marker != 0xC4 && marker != 0xC8 && marker != 0xCC;
+            if (start_of_frame && at + 9 < data.size()) {
+                height = (u32{data[at + 5]} << 8) | u32{data[at + 6]};
+                width = (u32{data[at + 7]} << 8) | u32{data[at + 8]};
+                mime = "image/jpeg";
+                return;
+            }
+            at += 2 + length;
+        }
+    }
+}
+
+// ID3v2.4 with synch-safe sizes, written into the WAV "id3 " chunk.
+void PutSynchsafe(std::string& out, u32 value) {
+    out.push_back(static_cast<char>((value >> 21) & 0x7F));
+    out.push_back(static_cast<char>((value >> 14) & 0x7F));
+    out.push_back(static_cast<char>((value >> 7) & 0x7F));
+    out.push_back(static_cast<char>(value & 0x7F));
+}
+
+void PutId3TextFrame(std::string& out, std::string_view id, std::string_view text) {
+    std::string payload;
+    payload.push_back('\x03'); // UTF-8
+    payload.append(text);
+    payload.push_back('\0');
+    out.append(id);
+    PutSynchsafe(out, static_cast<u32>(payload.size()));
+    out.push_back('\0');
+    out.push_back('\0');
+    out.append(payload);
+}
+
+std::string MakeId3v2(const TrackTags& tags) {
+    std::string frames;
+    if (!tags.title.empty()) {
+        PutId3TextFrame(frames, "TIT2", tags.title);
+    }
+    if (!tags.artist.empty()) {
+        PutId3TextFrame(frames, "TPE1", tags.artist);
+    }
+    if (!tags.album.empty()) {
+        PutId3TextFrame(frames, "TALB", tags.album);
+    }
+    if (!tags.cover.empty() && !tags.cover_mime.empty()) {
+        std::string payload;
+        payload.push_back('\x03'); // UTF-8
+        payload.append(tags.cover_mime);
+        payload.push_back('\0');
+        payload.push_back('\x03'); // front cover
+        payload.push_back('\0');  // empty description
+        payload.append(reinterpret_cast<const char*>(tags.cover.data()), tags.cover.size());
+        frames.append("APIC");
+        PutSynchsafe(frames, static_cast<u32>(payload.size()));
+        frames.push_back('\0');
+        frames.push_back('\0');
+        frames.append(payload);
+    }
+    std::string out = "ID3";
+    out.push_back('\x04');
+    out.push_back('\x00');
+    out.push_back('\x00');
+    PutSynchsafe(out, static_cast<u32>(frames.size()));
+    out.append(frames);
+    return out;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Output writers
 // -------------------------------------------------------------------------------------
 
-bool WriteWav(const std::filesystem::path& path, const DecodedTrack& track) {
+bool WriteWav(const std::filesystem::path& path, const DecodedTrack& track,
+              const TrackTags& tags) {
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     if (!out) {
         return false;
     }
+    const std::string id3 = MakeId3v2(tags);
+    const u32 id3_chunk = static_cast<u32>(id3.size()) + (id3.size() % 2);
     const u32 data_size = static_cast<u32>(track.pcm.size() * sizeof(s16));
-    const u32 riff_size = 36 + data_size;
+    const u32 riff_size = 4 + 8 + data_size + 8 + id3_chunk;
     const u32 byte_rate = track.sample_rate * track.channels * 2;
     const u16 block_align = track.channels * 2;
     constexpr u16 format = 1;
@@ -711,12 +882,22 @@ bool WriteWav(const std::filesystem::path& path, const DecodedTrack& track) {
     out.write(reinterpret_cast<const char*>(&data_size), 4);
     out.write(reinterpret_cast<const char*>(track.pcm.data()),
               static_cast<std::streamsize>(data_size));
+    if (!id3.empty()) {
+        const u32 id3_size = static_cast<u32>(id3.size());
+        out.write("id3 ", 4);
+        out.write(reinterpret_cast<const char*>(&id3_size), 4);
+        out.write(id3.data(), static_cast<std::streamsize>(id3.size()));
+        if (id3_chunk > id3_size) {
+            out.write("\0", 1);
+        }
+    }
     return out.good();
 }
 
 #ifdef EGLANTINE_HAS_FLAC
 
-bool WriteFlac(const std::filesystem::path& path, const DecodedTrack& track) {
+bool WriteFlac(const std::filesystem::path& path, const DecodedTrack& track,
+               const TrackTags& tags) {
     FLAC__StreamEncoder* encoder = FLAC__stream_encoder_new();
     if (encoder == nullptr) {
         return false;
@@ -725,6 +906,59 @@ bool WriteFlac(const std::filesystem::path& path, const DecodedTrack& track) {
     FLAC__stream_encoder_set_sample_rate(encoder, track.sample_rate);
     FLAC__stream_encoder_set_bits_per_sample(encoder, 16);
     FLAC__stream_encoder_set_compression_level(encoder, 5);
+
+    // Vorbis comments plus the NUP cover as a front-cover picture block. The blocks
+    // stay alive until the encoder finishes; libFLAC does not copy them.
+    std::vector<FLAC__StreamMetadata*> blocks;
+    FLAC__StreamMetadata* vorbis =
+        FLAC__metadata_object_new(FLAC__METADATA_TYPE_VORBIS_COMMENT);
+    if (vorbis != nullptr) {
+        const auto add_comment = [&vorbis](const char* name, const std::string& value) {
+            if (value.empty()) {
+                return;
+            }
+            FLAC__StreamMetadata_VorbisComment_Entry entry;
+            if (FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(
+                    &entry, name, value.c_str()) != 0) {
+                FLAC__metadata_object_vorbiscomment_append_comment(vorbis, entry, true);
+            }
+        };
+        add_comment("TITLE", tags.title);
+        add_comment("ARTIST", tags.artist);
+        add_comment("ALBUM", tags.album);
+        blocks.push_back(vorbis);
+    }
+    FLAC__StreamMetadata* picture = nullptr;
+    if (!tags.cover.empty() && !tags.cover_mime.empty()) {
+        picture = FLAC__metadata_object_new(FLAC__METADATA_TYPE_PICTURE);
+    }
+    if (picture != nullptr) {
+        std::string_view mime;
+        u32 width{};
+        u32 height{};
+        ImageInfo(tags.cover, mime, width, height);
+        if (!mime.empty()) {
+            const std::string mime_text{mime};
+            FLAC__StreamMetadata_Picture& picture_data = picture->data.picture;
+            picture_data.type = FLAC__STREAM_METADATA_PICTURE_TYPE_FRONT_COVER;
+            FLAC__metadata_object_picture_set_mime_type(
+                picture, const_cast<char*>(mime_text.c_str()), true);
+            FLAC__byte empty_description[] = "";
+            FLAC__metadata_object_picture_set_description(picture, empty_description, true);
+            picture_data.width = width;
+            picture_data.height = height;
+            picture_data.depth = 24;
+            picture_data.colors = 0;
+            FLAC__metadata_object_picture_set_data(
+                picture, const_cast<FLAC__byte*>(tags.cover.data()),
+                static_cast<u32>(tags.cover.size()), true);
+            blocks.push_back(picture);
+        }
+    }
+    if (!blocks.empty()) {
+        FLAC__stream_encoder_set_metadata(encoder, blocks.data(),
+                                          static_cast<u32>(blocks.size()));
+    }
 
     bool ok = FLAC__stream_encoder_init_file(encoder, path.c_str(), nullptr, nullptr) ==
               FLAC__STREAM_ENCODER_INIT_STATUS_OK;
@@ -742,6 +976,12 @@ bool WriteFlac(const std::filesystem::path& path, const DecodedTrack& track) {
         }
         ok = ok && FLAC__stream_encoder_finish(encoder);
     }
+    if (picture != nullptr) {
+        FLAC__metadata_object_delete(picture);
+    }
+    if (vorbis != nullptr) {
+        FLAC__metadata_object_delete(vorbis);
+    }
     FLAC__stream_encoder_delete(encoder);
     return ok;
 }
@@ -749,15 +989,15 @@ bool WriteFlac(const std::filesystem::path& path, const DecodedTrack& track) {
 #endif // EGLANTINE_HAS_FLAC
 
 bool WriteEncoded(const std::filesystem::path& path, const DecodedTrack& track,
-                  Encoding encoding) {
+                  Encoding encoding, const TrackTags& tags) {
     if (encoding == Encoding::Flac) {
 #ifdef EGLANTINE_HAS_FLAC
-        return WriteFlac(path, track);
+        return WriteFlac(path, track, tags);
 #else
         return false;
 #endif
     }
-    return WriteWav(path, track);
+    return WriteWav(path, track, tags);
 }
 
 std::string_view ExtensionOf(Encoding encoding) {
@@ -813,6 +1053,7 @@ bool ScanMusic(const std::string& game_path, SourceInfo& info) {
     }
     info.game_title = collected.game_title;
     info.stream_count = collected.entries.size();
+    info.cover = collected.icon;
     for (const auto& entry : collected.entries) {
         info.stream_bytes += entry.file != nullptr ? entry.file->GetSize() : 0;
     }
@@ -856,16 +1097,66 @@ Result ExtractMusic(const std::string& game_path, const Options& options,
         state.bytes_total += entry.file != nullptr ? entry.file->GetSize() : 0;
     }
 
+    // Output naming: clean titles, a folder from the first remaining token, and
+    // 1, 2, 3... when several streams end up with the same name.
+    struct OutputPlan {
+        std::string folder;
+        std::string title;
+        std::string file_name;
+    };
+    const std::string_view extension = ExtensionOf(options.encoding);
+    std::map<std::pair<std::string, std::string>, u32> name_groups;
+    std::vector<std::pair<std::string, std::string>> clean_names;
+    clean_names.reserve(collected.entries.size());
+    for (const auto& entry : collected.entries) {
+        auto clean = CleanNameFor(entry.name);
+        if (options.layout == Layout::Flat) {
+            // Flat mode ignores the folder, so collisions are counted by title alone.
+            clean.first.clear();
+        }
+        clean_names.emplace_back(clean.first, clean.second);
+        ++name_groups[{clean.first, clean.second}];
+    }
+    std::map<std::pair<std::string, std::string>, u32> name_seen;
+    std::vector<OutputPlan> plans;
+    plans.reserve(clean_names.size());
+    for (const auto& [folder, title] : clean_names) {
+        const auto key = std::make_pair(folder, title);
+        OutputPlan plan;
+        plan.folder = folder;
+        plan.title = title;
+        if (name_groups[key] > 1) {
+            plan.file_name = fmt::format("{} {}{}", title, ++name_seen[key], extension);
+        } else {
+            plan.file_name = fmt::format("{}{}", title, extension);
+        }
+        plans.push_back(std::move(plan));
+    }
+
+    // The same tags go into every track; only the title changes. The cover comes
+    // from the chosen file, or from the NUP/package icon when none was chosen.
+    TrackTags base_tags;
+    base_tags.artist = collected.game_title.empty()
+                           ? "Original OST"
+                           : fmt::format("{} - Original OST", collected.game_title);
+    base_tags.album = base_tags.artist;
+    base_tags.cover = options.cover_override.empty() ? collected.icon : options.cover_override;
+    u32 cover_width{};
+    u32 cover_height{};
+    ImageInfo(base_tags.cover, base_tags.cover_mime, cover_width, cover_height);
+
     Summary summary;
     std::ofstream manifest(options.out_dir / "manifest.csv", std::ios::binary | std::ios::trunc);
     const bool have_manifest = manifest.good();
     if (have_manifest) {
-        manifest << "file,kind,channels,sample_rate,duration_seconds,loop_start_seconds,"
+        manifest << "file,output,kind,channels,sample_rate,duration_seconds,loop_start_seconds,"
                     "loop_end_seconds,digest,duplicate_of,note\n";
     }
     std::map<u64, std::string> seen_digests;
 
-    for (const auto& entry : collected.entries) {
+    for (std::size_t index = 0; index < collected.entries.size(); ++index) {
+        const Entry& entry = collected.entries[index];
+        const OutputPlan& plan = plans[index];
         if (cancel != nullptr && cancel->load()) {
             break;
         }
@@ -891,33 +1182,36 @@ Result ExtractMusic(const std::string& game_path, const Options& options,
         }
 
         const std::string kind = KindOf(entry.name);
-        const std::string stem = EndsWithCI(entry.name, ".bwav")
-                                     ? entry.name.substr(0, entry.name.size() - 5)
-                                     : entry.name;
-        const std::string file_name = stem + std::string{ExtensionOf(options.encoding)};
+        const std::string output_rel =
+            plan.folder.empty() ? plan.file_name : plan.folder + "/" + plan.file_name;
 
         std::string duplicate_of;
         if (decoded) {
-            const auto sub = options.layout == Layout::Flat
+            const auto sub = plan.folder.empty()
                                  ? options.out_dir
-                                 : options.out_dir / std::filesystem::path{kind};
-            if (options.layout != Layout::Flat) {
+                                 : options.out_dir / std::filesystem::path{plan.folder};
+            if (!plan.folder.empty()) {
                 std::filesystem::create_directories(sub, ec);
             }
             if (ec) {
                 decoded = false;
                 note = fmt::format("cannot create {}: {}", Common::FS::PathToUTF8String(sub),
                                    ec.message());
-            } else if (!WriteEncoded(sub / file_name, track, options.encoding)) {
-                decoded = false;
-                note = "write failed (is the disk full?)";
             } else {
+                TrackTags tags = base_tags;
+                tags.title = plan.title;
+                if (!WriteEncoded(sub / plan.file_name, track, options.encoding, tags)) {
+                    decoded = false;
+                    note = "write failed (is the disk full?)";
+                }
+            }
+            if (decoded) {
                 const auto seen = seen_digests.find(digest);
                 if (seen != seen_digests.end()) {
                     ++summary.duplicates;
                     duplicate_of = seen->second;
                 } else {
-                    seen_digests.emplace(digest, file_name);
+                    seen_digests.emplace(digest, output_rel);
                 }
             }
         }
@@ -928,7 +1222,8 @@ Result ExtractMusic(const std::string& game_path, const Options& options,
             ++summary.files_failed;
         }
         if (have_manifest) {
-            manifest << CsvEscape(entry.name) << ',' << CsvEscape(kind) << ','
+            manifest << CsvEscape(entry.name) << ',' << CsvEscape(output_rel) << ','
+                     << CsvEscape(kind) << ','
                      << (decoded ? std::to_string(track.channels) : "") << ','
                      << (decoded ? std::to_string(track.sample_rate) : "") << ','
                      << (decoded ? Seconds(track.pcm.size() / track.channels, track.sample_rate)

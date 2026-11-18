@@ -231,6 +231,10 @@ std::string WavOf(const fs::path& out_dir, std::string_view sub, std::string_vie
     return ReadAll(out_dir / sub / fmt::format("{}.wav", name));
 }
 
+std::string WavOf(const fs::path& out_dir, std::string_view name) {
+    return ReadAll(out_dir / fmt::format("{}.wav", name));
+}
+
 } // namespace
 
 TEST_CASE("FileSys::Music round-trips through a loose dump", "[core][music]") {
@@ -259,26 +263,27 @@ TEST_CASE("FileSys::Music round-trips through a loose dump", "[core][music]") {
     REQUIRE(summary.duplicates == 0);
     REQUIRE(error.empty());
 
-    // Kinds: plain BGM in bgm/, the title demo in title/.
-    REQUIRE(fs::exists(out_dir.path / "bgm/BGM_Main.wav"));
-    REQUIRE(fs::exists(out_dir.path / "bgm/BGM_New.wav"));
-    REQUIRE(fs::exists(out_dir.path / "bgm/ExampleMelody_Test.wav"));
-    REQUIRE(fs::exists(out_dir.path / "title/Dm_Title_0005.wav"));
-    REQUIRE(!fs::exists(out_dir.path / "bgm/SE_Ignored.wav"));
-    REQUIRE(!fs::exists(out_dir.path / "bgm/NV_Ignored.wav"));
-    REQUIRE(!fs::exists(out_dir.path / "bgm/IgnoreMe.wav"));
+    // Clean names: category markers and the numeric suffix are gone, a lone token
+    // lands directly in the output folder.
+    REQUIRE(fs::exists(out_dir.path / "Main.wav"));
+    REQUIRE(fs::exists(out_dir.path / "New.wav"));
+    REQUIRE(fs::exists(out_dir.path / "Test.wav"));
+    REQUIRE(fs::exists(out_dir.path / "Title.wav"));
+    REQUIRE(!fs::exists(out_dir.path / "SE_Ignored.wav"));
+    REQUIRE(!fs::exists(out_dir.path / "NV_Ignored.wav"));
+    REQUIRE(!fs::exists(out_dir.path / "IgnoreMe.wav"));
 
     // BGM_Main comes from the update tree (PCM16), not the base (DSP).
-    const auto main_pcm = WavOf(out_dir.path, "bgm", "BGM_Main");
+    const auto main_pcm = WavOf(out_dir.path, "Main");
     const auto expected_main = PcmPayload(Interleave(Ramp(7, 1, 28), Ramp(-7, -1, 28)));
-    REQUIRE(main_pcm.size() == 44 + expected_main.size());
-    REQUIRE(main_pcm.substr(44) == expected_main);
+    REQUIRE(main_pcm.size() > 44 + expected_main.size()); // ID3 chunk trails the data
+    REQUIRE(main_pcm.substr(44, expected_main.size()) == expected_main);
     REQUIRE(std::memcmp(main_pcm.data(), "RIFF", 4) == 0);
     REQUIRE(std::memcmp(main_pcm.data() + 8, "WAVE", 4) == 0);
 
     // The DSP track decodes back to its signed nibbles.
-    const auto new_pcm = WavOf(out_dir.path, "bgm", "BGM_New");
-    REQUIRE(new_pcm.substr(44) ==
+    const auto new_pcm = WavOf(out_dir.path, "New");
+    REQUIRE(new_pcm.substr(44, expected_main.size()) ==
             PcmPayload(Interleave(NibblePattern(8, 28), NibblePattern(0, 28))));
 
     // Sample rate straight from the BWAV channel block.
@@ -286,11 +291,17 @@ TEST_CASE("FileSys::Music round-trips through a loose dump", "[core][music]") {
     std::memcpy(&rate, main_pcm.data() + 24, sizeof(rate));
     REQUIRE(rate == 32000);
 
-    // manifest.csv lists every stream with its kind and loop points.
+    // Embedded metadata: clean title plus "<game> - Original OST".
+    REQUIRE(main_pcm.find("TIT2") != std::string::npos);
+    REQUIRE(main_pcm.find("Main") != std::string::npos);
+    REQUIRE(main_pcm.find(" - Original OST") != std::string::npos);
+
+    // manifest.csv lists every stream with its clean output name, kind and loop points.
     const auto manifest = ReadAll(out_dir.path / "manifest.csv");
-    REQUIRE(manifest.find("BGM_Main.bwav,bgm,2,32000,0.001,,") != std::string::npos);
-    REQUIRE(manifest.find("BGM_New.bwav,bgm,2,48000,0.001,0.000,0.001,") != std::string::npos);
-    REQUIRE(manifest.find("Dm_Title_0005.bwav,title,2,48000,") != std::string::npos);
+    REQUIRE(manifest.find("BGM_Main.bwav,Main.wav,bgm,2,32000,0.001,,") != std::string::npos);
+    REQUIRE(manifest.find("BGM_New.bwav,New.wav,bgm,2,48000,0.001,0.000,0.001,") !=
+            std::string::npos);
+    REQUIRE(manifest.find("Dm_Title_0005.bwav,Title.wav,title,2,48000,") != std::string::npos);
     REQUIRE(manifest.find("SE_Ignored") == std::string::npos);
 }
 
@@ -309,10 +320,10 @@ TEST_CASE("FileSys::Music flat layout keeps every track in the output folder",
     std::string error;
     REQUIRE(FileSys::Music::ExtractMusic(main.string(), options, {}, nullptr, &summary,
                                          &error) == FileSys::Music::Result::Success);
-    REQUIRE(fs::exists(out_dir.path / "BGM_Main.wav"));
-    REQUIRE(fs::exists(out_dir.path / "BGM_New.wav"));
-    REQUIRE(fs::exists(out_dir.path / "Dm_Title_0005.wav"));
-    REQUIRE(fs::exists(out_dir.path / "ExampleMelody_Test.wav"));
+    REQUIRE(fs::exists(out_dir.path / "Main.wav"));
+    REQUIRE(fs::exists(out_dir.path / "New.wav"));
+    REQUIRE(fs::exists(out_dir.path / "Title.wav"));
+    REQUIRE(fs::exists(out_dir.path / "Test.wav"));
 }
 
 TEST_CASE("FileSys::Music reads the same tracks from a packed NUP", "[core][music]") {
@@ -341,9 +352,9 @@ TEST_CASE("FileSys::Music reads the same tracks from a packed NUP", "[core][musi
 
     // Same bytes as the loose run: the update package overlays the base inside the
     // archive, and the zstd member decompresses to the original stream.
-    const auto main_pcm = WavOf(out_dir.path, "bgm", "BGM_Main");
-    REQUIRE(main_pcm.substr(44) == PcmPayload(Interleave(Ramp(7, 1, 28), Ramp(-7, -1, 28))));
-    REQUIRE(fs::exists(out_dir.path / "title/Dm_Title_0005.wav"));
+    const auto main_pcm = WavOf(out_dir.path, "Main");
+    REQUIRE(main_pcm.substr(44, 112) == PcmPayload(Interleave(Ramp(7, 1, 28), Ramp(-7, -1, 28))));
+    REQUIRE(fs::exists(out_dir.path / "Title.wav"));
 }
 
 TEST_CASE("FileSys::Music flags identical tracks and skips unknown sources",
@@ -357,11 +368,15 @@ TEST_CASE("FileSys::Music flags identical tracks and skips unknown sources",
     Put(stream / "BGM_First.bwav", bytes);
     Put(stream / "BGM_Same.bwav", bytes);
     Put(stream / "BGM_Other.bwav", MakeDspBwav(NibblePattern(2, 28), NibblePattern(10, 28)));
+    // Two streams whose clean name is the same: "BGM_Scene_Song_0001" and
+    // "..._0002" both become Scene/Song, so they are numbered apart.
+    Put(stream / "BGM_Scene_Song_0001.bwav", bytes);
+    Put(stream / "BGM_Scene_Song_0002.bwav", bytes);
 
     const fs::path main = dump_dir.path / "base/exefs/main";
     FileSys::Music::SourceInfo info;
     REQUIRE(FileSys::Music::ScanMusic(main.string(), info));
-    REQUIRE(info.stream_count == 3);
+    REQUIRE(info.stream_count == 5);
 
     FileSys::Music::Options options;
     options.out_dir = out_dir.path;
@@ -372,12 +387,20 @@ TEST_CASE("FileSys::Music flags identical tracks and skips unknown sources",
     std::string error;
     REQUIRE(FileSys::Music::ExtractMusic(main.string(), options, {}, nullptr, &summary,
                                          &error) == FileSys::Music::Result::Success);
-    REQUIRE(summary.files_ok == 3);
-    REQUIRE(summary.duplicates == 1);
+    REQUIRE(summary.files_ok == 5);
+    REQUIRE(summary.duplicates == 3);
+    // Collisions get numbered; unique names stay clean.
+    REQUIRE(fs::exists(out_dir.path / "Scene/Song 1.wav"));
+    REQUIRE(fs::exists(out_dir.path / "Scene/Song 2.wav"));
+    REQUIRE(fs::exists(out_dir.path / "First.wav"));
+    REQUIRE(fs::exists(out_dir.path / "Same.wav"));
+    REQUIRE(fs::exists(out_dir.path / "Other.wav"));
     const auto manifest = ReadAll(out_dir.path / "manifest.csv");
     // BGM_Same decodes to the same PCM as BGM_First and points at it.
-    REQUIRE(manifest.find("BGM_Same.bwav,bgm,2,48000,0.001,,") != std::string::npos);
-    REQUIRE(manifest.find("BGM_First.wav") != std::string::npos);
+    REQUIRE(manifest.find("BGM_Same.bwav,Same.wav,bgm,2,48000,0.001,,") != std::string::npos);
+    REQUIRE(manifest.find("First.wav") != std::string::npos);
+    REQUIRE(manifest.find("BGM_Scene_Song_0001.bwav,Scene/Song 1.wav,") != std::string::npos);
+    REQUIRE(manifest.find("BGM_Scene_Song_0002.bwav,Scene/Song 2.wav,") != std::string::npos);
 
     // Neither a plain folder nor a missing NUP is a music source.
     FileSys::Music::SourceInfo bad;
@@ -407,7 +430,7 @@ TEST_CASE("FileSys::Music reports cancellation and per-file failures", "[core][m
     REQUIRE(summary.files_ok == 1);
     REQUIRE(summary.files_failed == 1);
     const auto manifest = ReadAll(out_dir.path / "manifest.csv");
-    REQUIRE(manifest.find("BGM_Bad.bwav,bgm,,,") != std::string::npos);
+    REQUIRE(manifest.find("BGM_Bad.bwav,Bad.wav,bgm,,,") != std::string::npos);
     REQUIRE(manifest.find("missing BWAV magic") != std::string::npos);
 
     // Cancellation stops before the first file.
@@ -436,9 +459,16 @@ TEST_CASE("FileSys::Music extracts a real NUP archive", "[core][music]") {
     FileSys::Music::Options options;
     options.out_dir = out;
     options.layout = FileSys::Music::Layout::ByKind;
-    options.encoding = FileSys::Music::HasFlacSupport()
-                           ? FileSys::Music::Encoding::Flac
-                           : FileSys::Music::Encoding::Wav;
+    options.encoding =
+        std::getenv("EDEN_MUSIC_TEST_WAV") != nullptr || !FileSys::Music::HasFlacSupport()
+            ? FileSys::Music::Encoding::Wav
+            : FileSys::Music::Encoding::Flac;
+    if (const char* cover = std::getenv("EDEN_MUSIC_TEST_COVER");
+        cover != nullptr && *cover != '\0') {
+        std::ifstream in(cover, std::ios::binary);
+        options.cover_override = {std::istreambuf_iterator<char>(in), {}};
+        REQUIRE(!options.cover_override.empty());
+    }
 
     FileSys::Music::Summary summary;
     std::string error;
@@ -597,6 +627,46 @@ TEST_CASE("FileSys::Music decodes NXOpus BWAV streams", "[core][music]") {
     // with the pre-skip dropped.
     const auto expected_left = DecodeOpusFrames(left_packets, kSkip, kSamples);
     const auto expected_right = DecodeOpusFrames(right_packets, kSkip, kSamples);
-    const auto wav = WavOf(out_dir.path, "bgm", "BGM_Opus");
-    REQUIRE(wav.substr(44) == PcmPayload(Interleave(expected_left, expected_right)));
+    const auto wav = WavOf(out_dir.path, "Opus");
+    REQUIRE(wav.substr(44, 2 * kSamples * 2) ==
+            PcmPayload(Interleave(expected_left, expected_right)));
+}
+TEST_CASE("FileSys::Music embeds a chosen cover into every track", "[core][music]") {
+    // A 1x1 transparent PNG, small enough to spell out in full.
+    constexpr std::array<u8, 67> kPng{
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49,
+        0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06,
+        0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44,
+        0x41, 0x54, 0x78, 0x9C, 0x62, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D,
+        0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42,
+        0x60, 0x82,
+    };
+    TempDir dump_dir;
+    TempDir out_dir;
+    const fs::path stream = dump_dir.path / "base/romfs/Sound/Resource/Stream";
+    Put(dump_dir.path / "base/exefs/main", "main");
+    Put(dump_dir.path / "base/exefs/main.npdm", Npdm(TitleId));
+    Put(stream / "BGM_Cover.bwav", MakeDspBwav(NibblePattern(1, 28), NibblePattern(9, 28)));
+
+    FileSys::Music::Options options;
+    options.out_dir = out_dir.path;
+    options.layout = FileSys::Music::Layout::ByKind;
+    options.encoding = FileSys::Music::Encoding::Wav;
+    options.cover_override.assign(kPng.begin(), kPng.end());
+
+    FileSys::Music::Summary summary;
+    std::string error;
+    REQUIRE(FileSys::Music::ExtractMusic((dump_dir.path / "base/exefs/main").string(), options,
+                                         {}, nullptr, &summary, &error) ==
+            FileSys::Music::Result::Success);
+    REQUIRE(summary.files_ok == 1);
+
+    // The WAV carries an ID3 chunk with the cover as an APIC frame.
+    const auto wav = WavOf(out_dir.path, "Cover");
+    REQUIRE(wav.find("APIC") != std::string::npos);
+    REQUIRE(wav.find("image/png") != std::string::npos);
+    const std::string png(reinterpret_cast<const char*>(kPng.data()), kPng.size());
+    REQUIRE(wav.find(png) != std::string::npos);
+    REQUIRE(wav.find("TIT2") != std::string::npos);
+    REQUIRE(wav.find("Cover") != std::string::npos);
 }

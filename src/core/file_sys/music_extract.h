@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <functional>
 #include <string>
+#include <vector>
 
 #include "common/common_types.h"
 
@@ -33,6 +34,8 @@ struct Options {
     std::filesystem::path out_dir;
     Layout layout{Layout::ByKind};
     Encoding encoding{Encoding::Wav};
+    // Cover art override; empty means whatever the NUP carries, if anything.
+    std::vector<u8> cover_override;
 };
 
 struct Progress {
@@ -55,6 +58,8 @@ struct SourceInfo {
     std::string game_title;
     u64 stream_count{};
     u64 stream_bytes{};
+    // The NUP/package icon when one is stored; used as the cover art by default.
+    std::vector<u8> cover;
 };
 
 // Whether this build can encode FLAC (needs libFLAC at build time); WAV is always available.

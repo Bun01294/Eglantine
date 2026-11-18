@@ -6,7 +6,9 @@
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QDir>
+#include <QFile>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -15,6 +17,11 @@
 #include <QRadioButton>
 #include <QStandardPaths>
 #include <QVBoxLayout>
+
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <vector>
 
 #include "common/fs/fs_util.h"
 
@@ -33,11 +40,16 @@ QString Sanitized(std::string_view name) {
     return out;
 }
 
+std::vector<u8> ReadImageBytes(const QString& path) {
+    std::ifstream in(path.toStdString(), std::ios::binary);
+    return {std::istreambuf_iterator<char>(in), {}};
+}
+
 } // namespace
 
 MusicExtractDialog::MusicExtractDialog(const FileSys::Music::SourceInfo& info,
                                        QWidget* parent)
-    : QDialog(parent) {
+    : QDialog(parent), nup_cover(info.cover) {
     setWindowTitle(tr("Extract Music"));
     setModal(true);
     setMinimumWidth(520);
@@ -72,7 +84,7 @@ MusicExtractDialog::MusicExtractDialog(const FileSys::Music::SourceInfo& info,
     }
 
     layout_tree =
-        new QRadioButton(tr("Sort into subfolders (bgm, cutscene, title, segments, stems)"));
+        new QRadioButton(tr("Sort into subfolders (one per area, scene or category)"));
     layout_tree->setChecked(true);
     layout_flat = new QRadioButton(tr("Flat - every track directly in the output folder"));
 
@@ -84,9 +96,26 @@ MusicExtractDialog::MusicExtractDialog(const FileSys::Music::SourceInfo& info,
     auto* structure_holder = new QWidget;
     structure_holder->setLayout(structure_box);
 
+    // Cover art embedded into every track: the NUP icon when it has one, otherwise
+    // an image of the user's choosing.
+    cover_state = new QLabel;
+    auto* cover_choose = new QPushButton(tr("Choose..."));
+    cover_reset = new QPushButton(tr("Reset"));
+    connect(cover_choose, &QPushButton::clicked, this, &MusicExtractDialog::ChooseCover);
+    connect(cover_reset, &QPushButton::clicked, this, &MusicExtractDialog::ResetCover);
+    auto* cover_row = new QHBoxLayout;
+    cover_row->setContentsMargins(0, 0, 0, 0);
+    cover_row->addWidget(cover_state, 1);
+    cover_row->addWidget(cover_choose);
+    cover_row->addWidget(cover_reset);
+    auto* cover_holder = new QWidget;
+    cover_holder->setLayout(cover_row);
+    UpdateCoverLabel();
+
     auto* form = new QFormLayout;
     form->addRow(tr("Encoding:"), encoding_combo);
     form->addRow(tr("Structure:"), structure_holder);
+    form->addRow(tr("Cover art:"), cover_holder);
 
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     ok_button = buttons->button(QDialogButtonBox::Ok);
@@ -117,6 +146,39 @@ void MusicExtractDialog::Browse() {
     }
 }
 
+void MusicExtractDialog::ChooseCover() {
+    const QString path =
+        QFileDialog::getOpenFileName(this, tr("Select Cover Art"), QString{},
+                                      tr("Images (*.png *.jpg *.jpeg);;All Files (*)"));
+    if (path.isEmpty()) {
+        return;
+    }
+    std::vector<u8> bytes = ReadImageBytes(path);
+    if (bytes.empty()) {
+        return;
+    }
+    chosen_cover = std::move(bytes);
+    chosen_name = QFileInfo(path).fileName();
+    UpdateCoverLabel();
+}
+
+void MusicExtractDialog::ResetCover() {
+    chosen_cover.clear();
+    chosen_name.clear();
+    UpdateCoverLabel();
+}
+
+void MusicExtractDialog::UpdateCoverLabel() {
+    if (!chosen_name.isEmpty()) {
+        cover_state->setText(tr("Cover: %1").arg(chosen_name));
+    } else if (!nup_cover.empty()) {
+        cover_state->setText(tr("Cover: the NUP thumbnail"));
+    } else {
+        cover_state->setText(tr("Cover: none (this NUP stores no thumbnail)"));
+    }
+    cover_reset->setEnabled(!chosen_name.isEmpty());
+}
+
 void MusicExtractDialog::UpdateOkEnabled() {
     ok_button->setEnabled(!out_edit->text().trimmed().isEmpty());
 }
@@ -132,4 +194,8 @@ FileSys::Music::Layout MusicExtractDialog::Layout() const {
 
 FileSys::Music::Encoding MusicExtractDialog::Encoding() const {
     return static_cast<FileSys::Music::Encoding>(encoding_combo->currentData().toInt());
+}
+
+const std::vector<u8>& MusicExtractDialog::CoverOverride() const {
+    return chosen_cover;
 }
