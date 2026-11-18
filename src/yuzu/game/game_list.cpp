@@ -248,6 +248,8 @@ GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvid
       play_time_manager{play_time_manager_}, system{system_} {
 
     this->main_window = parent;
+
+
     outer_layout = new QHBoxLayout(this);
     outer_layout->setContentsMargins(0, 0, 0, 0);
     outer_layout->setSpacing(0);
@@ -541,8 +543,15 @@ void GameList::SetupCustomization() {
     connect(customize_panel, &HomeCustomizePanel::GameIconBordersRequested, this,
             [this](bool show) {
                 UISettings::values.game_icon_borders = show;
-                grid_view->viewport()->update();
+                grid_view->UpdateIconSize();
                 carousel_view->viewport()->update();
+            });
+    connect(customize_panel, &HomeCustomizePanel::CartridgeKindRequested, this,
+            [this](u8 kind) {
+                UISettings::values.game_cartridge_kind = kind;
+                grid_view->UpdateIconSize();
+                carousel_view->viewport()->update();
+                emit SaveConfig();
             });
     connect(customize_panel, &HomeCustomizePanel::CarouselCardSizeRequested, this,
             [this](u8 index) {

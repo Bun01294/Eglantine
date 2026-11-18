@@ -227,6 +227,9 @@ struct Values {
     Setting<bool> show_game_name{linkage, true, "show_game_name", Category::UiGameList};
     /// Draws the Switch / Switch 2 frame around game icons in the grid and carousel views.
     Setting<bool> game_icon_borders{linkage, true, "game_icon_borders", Category::UiGameList};
+    /// The frame game cards wear when icon borders are on: 0 the console border, 1 the
+    /// cartridge.
+    Setting<u8> game_cartridge_kind{linkage, 0, "game_cartridge_kind", Category::UiGameList};
     /// The carousel's centered card size: an index into GameCarousel::CardSizeFractions.
     Setting<u8> carousel_card_size{linkage, 0, "carousel_card_size", Category::UiGameList};
     /// The carousel shows the centered game's banner, blurred, behind the cards when it has one.

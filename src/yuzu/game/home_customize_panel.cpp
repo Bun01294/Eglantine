@@ -512,6 +512,32 @@ HomeCustomizePanel::HomeCustomizePanel(HomeBackground* background_, QWidget* par
     });
     layout->addWidget(border_check);
 
+    // The frame the cards wear when icon borders are on.
+    cartridge_row = new QWidget(scroll_content);
+    auto* cartridge_layout = new QVBoxLayout(cartridge_row);
+    cartridge_layout->setContentsMargins(0, 0, 0, 0);
+    cartridge_layout->setSpacing(8);
+    cartridge_label = MakeHeading(cartridge_row);
+    cartridge_layout->addWidget(cartridge_label);
+    auto* cartridge_buttons_row = new QHBoxLayout;
+    cartridge_buttons_row->setSpacing(8);
+    cartridge_group = new QButtonGroup(this);
+    cartridge_group->setExclusive(true);
+    for (size_t i = 0; i < cartridge_buttons.size(); ++i) {
+        auto* button = new QToolButton(cartridge_row);
+        button->setCheckable(true);
+        button->setFixedHeight(28);
+        button->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        cartridge_group->addButton(button, static_cast<int>(i));
+        cartridge_buttons_row->addWidget(button);
+        cartridge_buttons[i] = button;
+    }
+    connect(cartridge_group, &QButtonGroup::idClicked, this, [this](int id) {
+        emit CartridgeKindRequested(static_cast<u8>(id));
+    });
+    cartridge_layout->addLayout(cartridge_buttons_row);
+    layout->addWidget(cartridge_row);
+
     // The centered card's share of the carousel view's height.
     card_size_row = new QWidget(scroll_content);
     auto* card_size_layout = new QVBoxLayout(card_size_row);
@@ -645,6 +671,11 @@ void HomeCustomizePanel::SyncFromSettings() {
     {
         const QSignalBlocker blocker(banner_check);
         banner_check->setChecked(UISettings::values.carousel_banner_background.GetValue());
+    }
+    // The frame choice only matters while icon borders are drawn.
+    const u8 cartridge_kind = std::min<u8>(1, UISettings::values.game_cartridge_kind.GetValue());
+    for (size_t i = 0; i < cartridge_buttons.size(); ++i) {
+        cartridge_buttons[i]->setChecked(i == cartridge_kind);
     }
 
     const auto kind =
@@ -832,6 +863,10 @@ void HomeCustomizePanel::RetranslateUI() {
     border_check->setText(tr("Game icon borders"));
     border_check->setToolTip(tr("Draw the console frame around game icons in the grid and "
                                  "carousel views"));
+    cartridge_label->setText(tr("Cartridge type"));
+    cartridge_label->setToolTip(tr("The frame game cards use when icon borders are on"));
+    cartridge_buttons[0]->setText(tr("Border"));
+    cartridge_buttons[1]->setText(tr("SVG"));
     card_size_label->setText(tr("Card size"));
     card_size_label->setToolTip(tr("Size of the centered game card in the carousel view"));
     card_size_buttons[0]->setText(tr("Full"));

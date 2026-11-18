@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <QImageReader>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPixmapCache>
@@ -46,6 +47,54 @@ QPixmap GameCard::PlatformBorderPixmap(bool is_switch2, int size, qreal dpr) {
     border.setDevicePixelRatio(dpr);
     QPixmapCache::insert(key, border);
     return border;
+}
+
+QPixmap GameCard::CartridgePixmap(int height_px, qreal dpr) {
+    // Quantized to 32-pixel buckets so a live slide hits the cache instead of re-rendering.
+    const int bucket = std::max(32, (std::max(1, height_px) + 31) / 32 * 32);
+    const QString key =
+        QStringLiteral("eglantine-cartridge-%1-%2").arg(bucket).arg(dpr);
+
+    QPixmap cartridge;
+    if (QPixmapCache::find(key, &cartridge)) {
+        return cartridge;
+    }
+
+    QImageReader reader(QStringLiteral(":/game_borders/game_cartridge.svg"));
+    reader.setScaledSize(
+        QSize(qRound(bucket * CartridgeAspect * dpr), qRound(bucket * dpr)));
+    const QImage image = reader.read();
+    if (image.isNull()) {
+        return {};
+    }
+    // Kept at raw device pixels: callers scale it to the exact card rect themselves, which
+    // keeps the bucket quantization out of the draw path at any device pixel ratio.
+    cartridge = QPixmap::fromImage(image);
+    QPixmapCache::insert(key, cartridge);
+    return cartridge;
+}
+
+QRectF GameCard::CartridgeLabelRect(const QRectF& cartridge_rect) {
+    const qreal sx = cartridge_rect.width() / CartridgeBase.width();
+    const qreal sy = cartridge_rect.height() / CartridgeBase.height();
+    return {cartridge_rect.left() + CartridgeLabel.x() * sx,
+            cartridge_rect.top() + CartridgeLabel.y() * sy,
+            CartridgeLabel.width() * sx, CartridgeLabel.height() * sy};
+}
+
+void GameCard::DrawCoverCropped(QPainter& painter, const QPixmap& pixmap,
+                                const QRectF& target) {
+    if (pixmap.isNull() || target.isEmpty()) {
+        return;
+    }
+    // Center-crop to the target's aspect: the source region keeps the target's proportions.
+    const qreal scale =
+        std::max(target.width() / pixmap.width(), target.height() / pixmap.height());
+    const qreal src_w = target.width() / scale;
+    const qreal src_h = target.height() / scale;
+    const QRectF source((pixmap.width() - src_w) / 2, (pixmap.height() - src_h) / 2, src_w,
+                       src_h);
+    painter.drawPixmap(target, pixmap, source);
 }
 
 namespace {
@@ -156,37 +205,67 @@ void GameCard::paint(QPainter* painter, const QStyleOptionViewItem& option,
     QPixmap icon_pixmap = index.data(Qt::DecorationRole).value<QPixmap>();
 
     QRect iconRect;
+    qreal icon_radius = 0.0;
     if (!icon_pixmap.isNull() && icon_size > 0) {
-        QSize scaled = icon_pixmap.size();
-        scaled.scale(icon_size, icon_size, Qt::KeepAspectRatio);
-
-        iconRect = {cardRect.left() + (cardRect.width() - scaled.width()) / 2,
-                    cardRect.top() + cardMargin - 1, scaled.width(), scaled.height()};
-
-        // The platform borders round their outer corners at ~8% of their width; matching that
-        // keeps icon pixels from showing past the border's corners.
-        const qreal icon_radius = iconRect.width() * 0.08;
         const qreal dpr = painter->device() ? painter->device()->devicePixelRatio() : 1.0;
 
-        painter->setRenderHint(QPainter::SmoothPixmapTransform, true);
+        if (UISettings::values.game_icon_borders.GetValue() &&
+            UISettings::values.game_cartridge_kind.GetValue() == 1) {
+            // The cartridge frame is portrait and replaces the square icon block: the game
+            // art sits in its label area, cover-cropped, and the frame goes on top.
+            const int cart_w = qRound(icon_size * CartridgeAspect);
+            iconRect = {cardRect.left() + (cardRect.width() - cart_w) / 2,
+                        cardRect.top() + cardMargin - 1, cart_w, static_cast<int>(icon_size)};
+            icon_radius = cart_w * 0.06;
 
-        // Soft drop shadow, pre-rendered: darkest under the icon's centre.
-        const QPixmap shadow = GetIconShadow(iconRect.size(), dpr);
-        painter->drawPixmap(iconRect.topLeft() - QPoint(ShadowSpread, ShadowSpread), shadow);
+            const QPixmap frame = CartridgePixmap(static_cast<int>(icon_size), dpr);
+            if (!frame.isNull()) {
+                painter->setRenderHint(QPainter::SmoothPixmapTransform, true);
 
-        painter->save();
-        QPainterPath clip_path;
-        clip_path.addRoundedRect(iconRect, icon_radius, icon_radius);
-        painter->setClipPath(clip_path);
-        painter->drawPixmap(iconRect, icon_pixmap);
-        painter->restore();
+                const QPixmap shadow = GetIconShadow(iconRect.size(), dpr);
+                painter->drawPixmap(iconRect.topLeft() - QPoint(ShadowSpread, ShadowSpread),
+                                    shadow);
 
-        // The platform border sits on top of the icon; its centre is transparent.
-        if (UISettings::values.game_icon_borders.GetValue()) {
-            const QPixmap border = GameCard::PlatformBorderPixmap(
-                index.data(GameListItemPath::Switch2Role).toBool(), iconRect.width(), dpr);
-            if (!border.isNull()) {
-                painter->drawPixmap(iconRect, border);
+                // The frame goes down first: its label area carries the label design, and
+                // the game art sits on top of it, cover-cropped.
+                painter->drawPixmap(iconRect, frame);
+
+                const QRectF label = CartridgeLabelRect(QRectF(iconRect));
+                painter->save();
+                QPainterPath label_clip;
+                label_clip.addRoundedRect(label, label.width() * 0.04, label.width() * 0.04);
+                painter->setClipPath(label_clip);
+                DrawCoverCropped(*painter, icon_pixmap, label);
+                painter->restore();
+            }
+        } else {
+            QSize scaled = icon_pixmap.size();
+            scaled.scale(icon_size, icon_size, Qt::KeepAspectRatio);
+
+            iconRect = {cardRect.left() + (cardRect.width() - scaled.width()) / 2,
+                        cardRect.top() + cardMargin - 1, scaled.width(), scaled.height()};
+            icon_radius = iconRect.width() * 0.08;
+
+            painter->setRenderHint(QPainter::SmoothPixmapTransform, true);
+
+            // Soft drop shadow, pre-rendered: darkest under the icon's centre.
+            const QPixmap shadow = GetIconShadow(iconRect.size(), dpr);
+            painter->drawPixmap(iconRect.topLeft() - QPoint(ShadowSpread, ShadowSpread), shadow);
+
+            painter->save();
+            QPainterPath clip_path;
+            clip_path.addRoundedRect(iconRect, icon_radius, icon_radius);
+            painter->setClipPath(clip_path);
+            painter->drawPixmap(iconRect, icon_pixmap);
+            painter->restore();
+
+            // The platform border sits on top of the icon; its centre is transparent.
+            if (UISettings::values.game_icon_borders.GetValue()) {
+                const QPixmap border = GameCard::PlatformBorderPixmap(
+                    index.data(GameListItemPath::Switch2Role).toBool(), iconRect.width(), dpr);
+                if (!border.isNull()) {
+                    painter->drawPixmap(iconRect, border);
+                }
             }
         }
 

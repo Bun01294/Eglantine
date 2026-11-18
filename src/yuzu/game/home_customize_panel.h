@@ -94,6 +94,7 @@ signals:
     void GameListModeRequested(Settings::GameListMode mode);
     void GameIconSizeRequested(u32 size);
     void GameIconBordersRequested(bool show);
+    void CartridgeKindRequested(u8 kind);
     void CarouselCardSizeRequested(u8 index);
     void CarouselSideCountRequested(u8 count);
     void CarouselBannerBackgroundRequested(bool show);
@@ -133,6 +134,10 @@ private:
     QButtonGroup* mode_group = nullptr;
     std::array<QToolButton*, 3> mode_buttons{};
     QCheckBox* border_check = nullptr;
+    QWidget* cartridge_row = nullptr;
+    QLabel* cartridge_label = nullptr;
+    QButtonGroup* cartridge_group = nullptr;
+    std::array<QToolButton*, 2> cartridge_buttons{};
     QWidget* card_size_row = nullptr;
     QLabel* card_size_label = nullptr;
     QButtonGroup* card_size_group = nullptr;

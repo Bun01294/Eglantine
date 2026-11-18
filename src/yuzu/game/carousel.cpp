@@ -240,7 +240,11 @@ CarouselMetrics MetricsFor(const QSize& area) {
     }
     const qreal available = std::max<qreal>(0.0, area.height() - 2 * SideGap - title);
     m.card_h = std::max<qreal>(MinCenterSize, available * fractions[size_index]);
-    m.card_w = m.card_h;
+    // The cartridge frame is portrait, and its slot is too: the stack, the peeks and the title
+    // all space a rectangle instead of a square with a rectangle painted inside it.
+    const bool cartridge = UISettings::values.game_icon_borders.GetValue() &&
+                           UISettings::values.game_cartridge_kind.GetValue() == 1;
+    m.card_w = cartridge ? m.card_h * GameCard::CartridgeAspect : m.card_h;
     // The card floats centered in the available height at every size.
     m.center = QPointF(area.width() / 2.0, SideGap + available / 2.0);
     m.peek = std::clamp(m.card_w * PeekFraction, qreal(28), qreal(64));
@@ -306,21 +310,61 @@ void DrawTitle(QPainter& p, const QModelIndex& index, const CarouselMetrics& m,
                Qt::AlignHCenter | Qt::AlignTop, line);
 }
 
+/// A stacked cartridge card: the label art and the frame under one tilt, drawn full body. The
+/// frame is cached per bucket, so the extra blit area over a strip costs nothing.
+void DrawStackedCartridge(QPainter& p, const QPixmap& icon, const QRectF& slot, qreal depth,
+                          qreal dpr, const QPalette& pal) {
+    const qreal d = std::abs(depth);
+    const QRectF& art = slot;
+    const qreal fade = std::min(d, 1.0);
+    const qreal far_h = art.height() * (1.0 + (TiltHeight - 1.0) * fade);
+    const qreal yc = art.center().y();
+    const qreal aw = art.width();
+    const qreal ah = art.height();
+    QPolygonF one{QPointF(0, 0), QPointF(aw, 0), QPointF(aw, ah), QPointF(0, ah)};
+    QPolygonF target;
+    // The whole cartridge maps across its slot: the edge facing the center keeps its height,
+    // the far edge is shorter and reads as receding.
+    if (depth > 0.0) {
+        target << QPointF(art.left(), art.top()) << QPointF(art.right(), yc - far_h / 2)
+               << QPointF(art.right(), yc + far_h / 2) << QPointF(art.left(), art.bottom());
+    } else {
+        target << QPointF(art.left(), yc - far_h / 2) << QPointF(art.right(), art.top())
+               << QPointF(art.right(), art.bottom()) << QPointF(art.left(), yc + far_h / 2);
+    }
+    QTransform tilt;
+    if (!QTransform::quadToQuad(one, target, tilt)) {
+        return;
+    }
+    const QPixmap frame = GameCard::CartridgePixmap(qRound(ah), dpr);
+    if (frame.isNull()) {
+        return;
+    }
+    p.save();
+    p.setTransform(tilt);
+    QPainterPath clip;
+    clip.addRoundedRect(QRectF(0, 0, aw, ah), aw * 0.10, aw * 0.10);
+    p.setClipPath(clip);
+    p.drawPixmap(QRectF(0, 0, aw, ah), frame,
+                 QRectF(0, 0, frame.width(), frame.height()));
+    const QRectF label = GameCard::CartridgeLabelRect(QRectF(0, 0, aw, ah));
+    p.save();
+    QPainterPath label_clip;
+    label_clip.addRoundedRect(label, label.width() * 0.04, label.width() * 0.04);
+    p.setClipPath(label_clip);
+    GameCard::DrawCoverCropped(p, icon, label);
+    p.restore();
+    const int fog = std::min(FogMax, qRound(d * FogPerStep));
+    p.fillRect(QRectF(0, 0, aw, ah), WithAlpha(pal.color(QPalette::Window), fog));
+    p.restore();
+}
+
 /// One card at `depth`. Every visual parameter is continuous in the depth, so a card sliding out
 /// of the center shrinks, tilts and fogs in instead of snapping between two shapes.
 void DrawCard(QPainter& p, const QModelIndex& index, const QRectF& rect, qreal depth,
               const QPalette& pal, bool focused, bool borders, qreal dpr, qreal peek,
               int center_bucket, int stack_bucket, qreal alpha) {
-    p.save();
-    if (alpha < 1.0) {
-        p.setOpacity(alpha);
-    }
     const qreal d = std::abs(depth);
-    if (d < 1.0) {
-        // Only the card taking the center slot casts the full shadow.
-        DrawCardShadow(p, rect, int((1.0 - d) * 13));
-    }
-
     const bool centered = d < 0.01;
     const QPixmap icon =
         ScaledCardIcon(index, centered ? center_bucket : stack_bucket, dpr,
@@ -328,20 +372,48 @@ void DrawCard(QPainter& p, const QModelIndex& index, const QRectF& rect, qreal d
     if (icon.isNull()) {
         return;
     }
-    const int side = icon.width();
+    if (d < 1.0) {
+        // Only the card taking the center slot casts the full shadow.
+        DrawCardShadow(p, rect, int((1.0 - d) * 13));
+    }
 
     p.save();
+    if (alpha < 1.0) {
+        p.setOpacity(alpha);
+    }
+    const int side = icon.width();
+    const bool cartridge = borders && UISettings::values.game_cartridge_kind.GetValue() == 1;
+
     if (centered) {
-        QPainterPath clip;
-        clip.addRoundedRect(rect, rect.width() * 0.08, rect.width() * 0.08);
-        p.setClipPath(clip);
-        p.drawPixmap(rect.toRect(), icon);
-        if (borders) {
-            p.drawPixmap(rect.toRect(),
-                         GameCard::PlatformBorderPixmap(
-                             index.data(GameListItemPath::Switch2Role).toBool(),
-                             qRound(rect.width()), dpr));
+        if (cartridge) {
+            const QRectF& cart = rect;
+            const QPixmap frame = GameCard::CartridgePixmap(qRound(cart.height()), dpr);
+            if (!frame.isNull()) {
+                // The frame first, the game art on its label: the label design shows through
+                // the art's transparent regions.
+                p.drawPixmap(cart, frame, QRectF(0, 0, frame.width(), frame.height()));
+                const QRectF label = GameCard::CartridgeLabelRect(cart);
+                p.save();
+                QPainterPath label_clip;
+                label_clip.addRoundedRect(label, label.width() * 0.04, label.width() * 0.04);
+                p.setClipPath(label_clip);
+                GameCard::DrawCoverCropped(p, icon, label);
+                p.restore();
+            }
+        } else {
+            QPainterPath clip;
+            clip.addRoundedRect(rect, rect.width() * 0.08, rect.width() * 0.08);
+            p.setClipPath(clip);
+            p.drawPixmap(rect.toRect(), icon);
+            if (borders) {
+                p.drawPixmap(rect.toRect(),
+                             GameCard::PlatformBorderPixmap(
+                                 index.data(GameListItemPath::Switch2Role).toBool(),
+                                 qRound(rect.width()), dpr));
+            }
         }
+    } else if (cartridge) {
+        DrawStackedCartridge(p, icon, rect, depth, dpr, pal);
     } else {
         const qreal fade = std::min(d, 1.0);
         const qreal far_h = rect.height() * (1.0 + (TiltHeight - 1.0) * fade);
@@ -398,7 +470,6 @@ void DrawCard(QPainter& p, const QModelIndex& index, const QRectF& rect, qreal d
         p.drawRoundedRect(rect.adjusted(-1, -1, 1, 1), rect.width() * 0.08 + 1,
                           rect.width() * 0.08 + 1);
     }
-    p.restore();
 }
 
 } // namespace
@@ -425,7 +496,6 @@ GameCarousel::GameCarousel(QWidget* parent) : QListView{parent} {
                 m_position = value.toReal();
                 viewport()->update();
             });
-
 
 }
 
