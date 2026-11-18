@@ -37,9 +37,26 @@ u32 Mip(u32 size, u32 level) {
 } // Anonymous namespace
 
 u64 Context::Impl::PollTick() {
+    // Idle ticks of one ordinary frame (64 ms, ~15 fps): not kept when the next present comes, so
+    // at a steady frame rate the clock moves one tick per present.
+    constexpr u64 IDLE_FRAME_TICKS = 4;
     const auto now = std::chrono::steady_clock::now();
     const u64 presents = stats.presents.load(std::memory_order_relaxed);
-    if (presents != poll_presents_seen || poll_last_change == std::chrono::steady_clock::time_point{}) {
+    if (poll_last_change == std::chrono::steady_clock::time_point{}) {
+        poll_presents_seen = presents;
+        poll_last_change = now;
+        poll_tick = (std::max)(poll_tick, presents);
+        poll_tick_at_change = poll_tick;
+    } else if (presents != poll_presents_seen) {
+        // A stretch without presents (a loading screen, a cold start's compile stalls) moved the
+        // clock ahead of the present count. Counting from the present count again froze it until
+        // the presents caught up, and a check scheduled during the stretch waited that long
+        // (Mario Kart World: glyphs written then stayed blank for ~900 presents). The next
+        // stretch counts from the clock as it stands.
+        const u64 idle_ticks = poll_tick - poll_tick_at_change;
+        const u64 advance = presents > poll_presents_seen ? presents - poll_presents_seen : 0;
+        poll_tick_at_change += advance + (idle_ticks > IDLE_FRAME_TICKS ? idle_ticks : 0);
+        poll_tick = (std::max)(poll_tick, poll_tick_at_change);
         poll_presents_seen = presents;
         poll_last_change = now;
     }
@@ -47,7 +64,7 @@ u64 Context::Impl::PollTick() {
         static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(now - poll_last_change)
                              .count()) /
         16;
-    poll_tick = (std::max)(poll_tick, presents + idle);
+    poll_tick = (std::max)(poll_tick, poll_tick_at_change + idle);
     return poll_tick;
 }
 

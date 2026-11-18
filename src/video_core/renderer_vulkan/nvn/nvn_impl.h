@@ -1144,9 +1144,12 @@ struct Context::Impl {
     u32 virtual_storages_logged{0};
     u64 write_clock{0};
     /// Clock the CPU-change checks are scheduled by: the present count, plus 1 per 16 ms while no
-    /// present happens (a loading screen), so checks never stall. Replay thread only.
+    /// present happens (a loading screen), so checks never stall. Every new present moves it on,
+    /// also after such a stretch moved it ahead of the present count. Replay thread only.
     u64 poll_tick{0};
     u64 poll_presents_seen{0};
+    /// `poll_tick` at the last new present: the idle ticks of the current stretch count from here.
+    u64 poll_tick_at_change{0};
     std::chrono::steady_clock::time_point poll_last_change{};
     u64 full_hash_tick{~u64{0}};
     u64 full_hash_bytes{0};
