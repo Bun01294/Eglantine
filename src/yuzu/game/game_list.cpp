@@ -514,6 +514,13 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
     QMenu* dump_romfs_menu = context_menu.addMenu(tr("Dump RomFS"));
     QAction* dump_romfs = dump_romfs_menu->addAction(tr("Dump RomFS"));
     QAction* dump_romfs_sdmc = dump_romfs_menu->addAction(tr("Dump RomFS to SDMC"));
+    // Music extraction reads the Alto-family Sound tree straight out of a NUP archive or a
+    // loose dump; other content types (installed NSPs, XCI) are not supported.
+    QAction* extract_music = nullptr;
+    if (is_nup_archive || FileSys::Nup::DumpRootFromMain(path)) {
+        extract_music = context_menu.addAction(tr("Extract Music..."));
+        extract_music->setEnabled(!nup_conversion_running);
+    }
     QAction* verify_integrity = context_menu.addAction(tr("Verify Integrity"));
     QAction* copy_tid = context_menu.addAction(tr("Copy Title ID to Clipboard"));
     QAction* convert_nup = nullptr;
@@ -629,6 +636,10 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
     if (extract_nup) {
         connect(extract_nup, &QAction::triggered, this,
                 [this, path]() { emit ExtractNupRequested(path); });
+    }
+    if (extract_music) {
+        connect(extract_music, &QAction::triggered, this,
+                [this, path]() { emit ExtractMusicRequested(path); });
     }
     if (edit_nup) {
         connect(edit_nup, &QAction::triggered, this,

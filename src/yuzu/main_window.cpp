@@ -49,6 +49,7 @@
 #include "util/util.h"
 #include "yuzu/game/game_list.h"
 #include "yuzu/nup_dialogs.h"
+#include "yuzu/music_extract_dialog.h"
 #include "yuzu/shader_warm_dialog.h"
 #ifdef YUZU_ENABLE_MCP
 #include <atomic>
@@ -1904,6 +1905,7 @@ void MainWindow::ConnectWidgetEvents() {
     connect(game_list, &GameList::DeleteShaderWarmRequested, this,
             &MainWindow::OnGameListDeleteShaderWarm);
     connect(game_list, &GameList::ExtractNupRequested, this, &MainWindow::OnGameListExtractNup);
+    connect(game_list, &GameList::ExtractMusicRequested, this, &MainWindow::OnGameListExtractMusic);
     connect(game_list, &GameList::EditNupMetadataRequested, this,
             &MainWindow::OnGameListEditNupMetadata);
     connect(game_list, &GameList::CopyTIDRequested, this, &MainWindow::OnGameListCopyTID);
@@ -4925,6 +4927,120 @@ void MainWindow::OnGameListExtractNup(const std::string& game_path) {
                     break;
                 case FileSys::Nup::ExtractResult::InvalidSource:
                 case FileSys::Nup::ExtractResult::IoError:
+                    QMessageBox::critical(this, tr("Extraction Failed"),
+                                          QString::fromStdString(error));
+                    break;
+                }
+            },
+            Qt::QueuedConnection);
+        return FileSys::Nup::PackResult::Success;
+    }));
+}
+
+void MainWindow::OnGameListExtractMusic(const std::string& game_path) {
+    if (nup_running) {
+        return;
+    }
+    FileSys::Music::SourceInfo info;
+    if (!FileSys::Music::ScanMusic(game_path, info)) {
+        QMessageBox::warning(this, tr("Extract Music"),
+                             tr("No music could be found in this game. Only NUP archives and "
+                                "loose folder dumps are supported."));
+        return;
+    }
+    if (info.stream_count == 0) {
+        QMessageBox::information(this, tr("Extract Music"),
+                                 tr("No music streams were found in this game."));
+        return;
+    }
+
+    MusicExtractDialog dialog(info, this);
+    if (dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+    FileSys::Music::Options options;
+    options.out_dir = dialog.OutDir();
+    options.layout = dialog.Layout();
+    options.encoding = dialog.Encoding();
+    if (options.out_dir.empty()) {
+        return;
+    }
+
+    const QString progress_title = QString::fromStdString(info.game_title).trimmed().isEmpty()
+                                       ? tr("Extracting Music")
+                                       : QString::fromStdString(info.game_title);
+    nup_running = true;
+    nup_source_path = game_path;
+    game_list->SetNupConversionRunning(true);
+    nup_cancel = std::make_shared<std::atomic_bool>(false);
+    nup_progress = new NupProgressDialog(tr("Extracting Music"), progress_title, {}, this);
+    connect(nup_progress, &NupProgressDialog::CancelRequested, this, [this, cancel = nup_cancel] {
+        cancel->store(true);
+        if (nup_progress) {
+            nup_progress->SetCancelling();
+        }
+    });
+    nup_progress->show();
+
+    const auto cancel = nup_cancel;
+    auto last_update = std::make_shared<std::chrono::steady_clock::time_point>();
+    nup_watcher.setFuture(QtConcurrent::run([this, game_path, options, cancel, last_update] {
+        std::string error;
+        FileSys::Music::Summary summary;
+        const auto on_progress = [this, last_update](const FileSys::Music::Progress& progress) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - *last_update < std::chrono::milliseconds(200)) {
+                return;
+            }
+            *last_update = now;
+            QMetaObject::invokeMethod(
+                this,
+                [this, progress] {
+                    if (!nup_progress) {
+                        return;
+                    }
+                    nup_progress->SetProgress(FileSys::Nup::PackProgress{
+                        progress.bytes_done, progress.bytes_total, progress.files_done,
+                        progress.files_total});
+                },
+                Qt::QueuedConnection);
+        };
+        const auto result = FileSys::Music::ExtractMusic(game_path, options, on_progress,
+                                                         cancel.get(), &summary, &error);
+        QMetaObject::invokeMethod(
+            this,
+            [this, result, summary, error, out_dir = options.out_dir] {
+                nup_running = false;
+                nup_source_path.clear();
+                game_list->SetNupConversionRunning(false);
+                if (nup_progress) {
+                    nup_progress->Finish();
+                    nup_progress->deleteLater();
+                    nup_progress = nullptr;
+                }
+                nup_cancel.reset();
+                switch (result) {
+                case FileSys::Music::Result::Success: {
+                    QString text = tr("%1 track(s) extracted to:\n%2")
+                                       .arg(summary.files_ok)
+                                       .arg(QString::fromStdString(
+                                           Common::FS::PathToUTF8String(out_dir)));
+                    if (summary.duplicates > 0) {
+                        text += tr("\n%1 duplicate track(s) were flagged in manifest.csv.")
+                                    .arg(summary.duplicates);
+                    }
+                    if (summary.files_failed > 0) {
+                        text += tr("\n%1 stream(s) could not be decoded - see manifest.csv.")
+                                    .arg(summary.files_failed);
+                    }
+                    QMessageBox::information(this, tr("Extraction Complete"), text);
+                    break;
+                }
+                case FileSys::Music::Result::Cancelled:
+                    break;
+                case FileSys::Music::Result::InvalidSource:
+                case FileSys::Music::Result::NoMusic:
+                case FileSys::Music::Result::IoError:
                     QMessageBox::critical(this, tr("Extraction Failed"),
                                           QString::fromStdString(error));
                     break;
