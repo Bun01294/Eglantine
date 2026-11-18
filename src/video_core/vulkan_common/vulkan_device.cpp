@@ -1624,38 +1624,24 @@ void Device::RemoveUnsuitableExtensions() {
     features.mesh_shader.primitiveFragmentShadingRateMeshShader = VK_FALSE;
     features.mesh_shader.meshShaderQueries = VK_FALSE;
     extensions.mesh_shader = features.mesh_shader.taskShader && features.mesh_shader.meshShader;
-    // The use_mesh_shaders setting or EDEN_NX2_FORCE_MESH_FALLBACK=1: leave VK_EXT_mesh_shader
-    // disabled, so task/mesh draws take the compute fallback a device without it uses.
-    if (extensions.mesh_shader && !Settings::values.use_mesh_shaders.GetValue()) {
-        LOG_INFO(Render_Vulkan, "Mesh shaders turned off in the settings: VK_EXT_mesh_shader "
-                                "disabled");
-        extensions.mesh_shader = false;
-    }
-    if (extensions.mesh_shader && std::getenv("EDEN_NX2_FORCE_MESH_FALLBACK") != nullptr) {
-        LOG_WARNING(Render_Vulkan, "EDEN_NX2_FORCE_MESH_FALLBACK: VK_EXT_mesh_shader disabled");
-        extensions.mesh_shader = false;
-    }
-    // AMD runs task shaders on a compute queue ganged with the graphics queue. With the guest's
-    // task programs that hangs the GPU (RDNA2 on RADV 26.2: gfx ring timeout, device lost),
-    // while the compute fallback runs the same draws fine. NVIDIA and Intel have task and mesh
-    // stages in the graphics pipe. EDEN_NX2_NATIVE_MESH is the Performance tab's flag: "0" asks
-    // for the fallback, "1" for the driver's own stages even on AMD, unset leaves the default.
+    // The mesh_shader_mode setting: leave VK_EXT_mesh_shader disabled for the compute fallback a
+    // device without it uses. AMD runs task shaders on a compute queue ganged with the graphics
+    // queue. With the guest's task programs that hangs the GPU (RDNA2 on RADV 26.2: gfx ring
+    // timeout, device lost), while the compute fallback runs the same draws fine, so Auto takes
+    // the fallback there. NVIDIA and Intel have task and mesh stages in the graphics pipe.
     const VkDriverId mesh_driver{properties.driver.driverID};
     const bool amd_task_on_compute_queue{mesh_driver == VK_DRIVER_ID_MESA_RADV ||
                                          mesh_driver == VK_DRIVER_ID_AMD_PROPRIETARY ||
                                          mesh_driver == VK_DRIVER_ID_AMD_OPEN_SOURCE};
-    const char* native_mesh = std::getenv("EDEN_NX2_NATIVE_MESH");
-    const bool native_mesh_off = native_mesh != nullptr && native_mesh[0] == '0';
-    const bool native_mesh_on = native_mesh != nullptr && native_mesh[0] != '0';
-    if (extensions.mesh_shader && native_mesh_on) {
-        LOG_INFO(Render_Vulkan, "EDEN_NX2_NATIVE_MESH={}: task/mesh draws use the driver's own "
-                                "task and mesh stages",
-                 native_mesh);
-    } else if (extensions.mesh_shader && (native_mesh_off || amd_task_on_compute_queue)) {
-        LOG_INFO(Render_Vulkan, "Task/mesh draws use the compute fallback{}",
-                 amd_task_on_compute_queue ? " (AMD driver default, EDEN_NX2_NATIVE_MESH=1 keeps "
-                                             "the driver's own stages)"
-                                           : " (EDEN_NX2_NATIVE_MESH=0)");
+    const Settings::MeshShaderMode mesh_mode{Settings::values.mesh_shader_mode.GetValue()};
+    if (extensions.mesh_shader && mesh_mode == Settings::MeshShaderMode::ComputeFallback) {
+        LOG_INFO(Render_Vulkan, "Task/mesh shaders set to the compute fallback: "
+                                "VK_EXT_mesh_shader disabled");
+        extensions.mesh_shader = false;
+    } else if (extensions.mesh_shader && mesh_mode == Settings::MeshShaderMode::Auto &&
+               amd_task_on_compute_queue) {
+        LOG_INFO(Render_Vulkan, "AMD driver: VK_EXT_mesh_shader disabled, task/mesh draws use the "
+                                "compute fallback (set task/mesh shaders to keep it)");
         extensions.mesh_shader = false;
     }
     RemoveExtensionFeatureIfUnsuitable(extensions.mesh_shader, features.mesh_shader,

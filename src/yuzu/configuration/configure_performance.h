@@ -27,11 +27,16 @@ class System;
 
 namespace ConfigurationShared {
 class Builder;
+class Widget;
 }
 
 namespace Performance {
 
 enum class Platform { Nvidia, Amd, Intel, MacOs };
+
+/// The primary graphics device (the vulkan_device setting), null if unknown.
+[[nodiscard]] const VkDeviceInfo::Record* PrimaryDevice(
+    const std::vector<VkDeviceInfo::Record>& records);
 
 /// Which launch arguments (EDEN_NX2_NAME=VALUE) are switched on. The four platform tabs share it,
 /// since the same argument can be recommended on more than one. They are kept in a block of the
@@ -71,21 +76,17 @@ public:
 
 private:
     struct Row {
-        std::string line;      ///< NAME=VALUE written when the flag is ticked
-        std::string alternate; ///< NAME=VALUE written instead when unticked, if it has an off form
-        bool on_by_default{};  ///< Ticked while neither line nor off form is in the file
+        std::string line; ///< NAME=VALUE
         QCheckBox* box{};
     };
 
     void AddDefaults();
     void Refresh();
-    /// Tick or untick one flag, writing its off form in place of the line when it has one.
-    void SetFlag(const Row& row, bool on);
 
     Performance::Platform platform;
     Performance::State& state;
     std::vector<Row> rows;
-    std::vector<std::pair<std::string, std::string>> recommended_lines; ///< Recommended and supported
+    std::vector<std::string> recommended_lines; ///< Recommended and supported
 };
 
 /// The GPU tab: one page of launch arguments per GPU vendor, picked from a dropdown that starts on
@@ -111,6 +112,7 @@ class ConfigureShaders : public ConfigurationShared::Tab {
 public:
     explicit ConfigureShaders(const Core::System& system_,
                               const ConfigurationShared::Builder& builder,
+                              const std::vector<VkDeviceInfo::Record>& records,
                               QWidget* parent = nullptr);
     ~ConfigureShaders() override;
 
@@ -119,6 +121,12 @@ public:
 
     /// Settings the global configuration shows here rather than on the graphics tabs.
     static bool IsShaderSetting(u32 id);
+
+    /// The mesh_shader_mode dropdown: notes Auto's choice on an AMD driver, and on a device
+    /// without VK_EXT_mesh_shader shows the compute fallback, disabled, keeping the stored value.
+    static void SetUpMeshShaderMode(ConfigurationShared::Widget* widget,
+                                    const std::vector<VkDeviceInfo::Record>& records,
+                                    std::vector<std::function<void(bool)>>& apply_funcs);
 
 private:
     const Core::System& system;
