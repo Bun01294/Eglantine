@@ -39,6 +39,9 @@ constexpr std::array<Settings::GameListMode, 3> Modes{
     Settings::GameListMode::CarouselView,
 };
 
+/// How many stacked cards each side of the centered one can show.
+constexpr std::array<int, 5> SideCounts{3, 4, 5, 6, 8};
+
 constexpr std::array<HomeBackground::Kind, 3> Kinds{
     HomeBackground::Kind::Picture,
     HomeBackground::Kind::Solid,
@@ -535,6 +538,33 @@ HomeCustomizePanel::HomeCustomizePanel(HomeBackground* background_, QWidget* par
     card_size_layout->addLayout(card_size_buttons_row);
     layout->addWidget(card_size_row);
 
+    // How many cards the carousel stacks up on each side of the centered one.
+    side_count_row = new QWidget(scroll_content);
+    auto* side_count_layout = new QVBoxLayout(side_count_row);
+    side_count_layout->setContentsMargins(0, 0, 0, 0);
+    side_count_layout->setSpacing(8);
+    side_count_label = MakeHeading(side_count_row);
+    side_count_layout->addWidget(side_count_label);
+    auto* side_count_buttons_row = new QHBoxLayout;
+    side_count_buttons_row->setSpacing(8);
+    side_count_group = new QButtonGroup(this);
+    side_count_group->setExclusive(true);
+    for (size_t i = 0; i < side_count_buttons.size(); ++i) {
+        auto* button = new QToolButton(side_count_row);
+        button->setCheckable(true);
+        button->setFixedHeight(28);
+        button->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        // The button ids are the counts themselves, so the signal can carry one straight out.
+        side_count_group->addButton(button, SideCounts[i]);
+        side_count_buttons_row->addWidget(button);
+        side_count_buttons[i] = button;
+    }
+    connect(side_count_group, &QButtonGroup::idClicked, this, [this](int id) {
+        emit CarouselSideCountRequested(static_cast<u8>(id));
+    });
+    side_count_layout->addLayout(side_count_buttons_row);
+    layout->addWidget(side_count_row);
+
     // The centered game's banner can stand in for the background.
     banner_check = new QCheckBox(scroll_content);
     banner_check->setCursor(Qt::PointingHandCursor);
@@ -596,6 +626,20 @@ void HomeCustomizePanel::SyncFromSettings() {
     }
     for (size_t i = 0; i < card_size_buttons.size(); ++i) {
         card_size_buttons[i]->setChecked(i == size_index);
+    }
+
+    // The stack depth choice only exists in the carousel; a hand-edited config value checks
+    // the nearest offered count.
+    side_count_row->setVisible(mode == Settings::GameListMode::CarouselView);
+    const int side_count = UISettings::values.carousel_side_count.GetValue();
+    size_t nearest = 0;
+    for (size_t i = 1; i < SideCounts.size(); ++i) {
+        if (std::abs(SideCounts[i] - side_count) < std::abs(SideCounts[nearest] - side_count)) {
+            nearest = i;
+        }
+    }
+    for (size_t i = 0; i < side_count_buttons.size(); ++i) {
+        side_count_buttons[i]->setChecked(i == nearest);
     }
     banner_check->setVisible(mode == Settings::GameListMode::CarouselView);
     {
@@ -795,6 +839,12 @@ void HomeCustomizePanel::RetranslateUI() {
     card_size_buttons[2]->setText(tr("2/3"));
     card_size_buttons[3]->setText(tr("1/2"));
     card_size_buttons[4]->setText(tr("1/3"));
+    side_count_label->setText(tr("Cards per side"));
+    side_count_label->setToolTip(tr("How many game cards the carousel stacks up on each side "
+                                    "of the centered one"));
+    for (size_t i = 0; i < side_count_buttons.size(); ++i) {
+        side_count_buttons[i]->setText(QString::number(SideCounts[i]));
+    }
     banner_check->setText(tr("Show game banner as background"));
     banner_check->setToolTip(tr("Behind the carousel, show the centered game's banner, softly "
                                 "blurred, when the game has one"));

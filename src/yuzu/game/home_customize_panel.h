@@ -95,6 +95,7 @@ signals:
     void GameIconSizeRequested(u32 size);
     void GameIconBordersRequested(bool show);
     void CarouselCardSizeRequested(u8 index);
+    void CarouselSideCountRequested(u8 count);
     void CarouselBannerBackgroundRequested(bool show);
 
 protected:
@@ -136,6 +137,10 @@ private:
     QLabel* card_size_label = nullptr;
     QButtonGroup* card_size_group = nullptr;
     std::array<QToolButton*, 5> card_size_buttons{};
+    QWidget* side_count_row = nullptr;
+    QLabel* side_count_label = nullptr;
+    QButtonGroup* side_count_group = nullptr;
+    std::array<QToolButton*, 5> side_count_buttons{};
     QCheckBox* banner_check = nullptr;
     QLabel* icon_size_title = nullptr;
     QLabel* icon_size_value = nullptr;

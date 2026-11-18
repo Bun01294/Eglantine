@@ -43,6 +43,21 @@ constexpr qreal TiltHeight = 0.95;
 /// details panel uses to fade banners into the surface.
 constexpr int FogPerStep = 55;
 constexpr int FogMax = 170;
+/// The deepest stack the setting may ask for, whatever ends up in the config file.
+constexpr int MaxSideCount = 12;
+
+/// How opaque a stacked card is at `depth` with `count` cards a side shown: solid up close,
+/// dissolving to nothing at the stack's edge. Cards fade out of existence as they recede and
+/// fade back in at the back of the stack as they return.
+qreal StackAlpha(qreal depth, int count) {
+    const qreal d = std::abs(depth);
+    const qreal solid = std::max<qreal>(1.0, count - 2.0);
+    if (d <= solid) {
+        return 1.0;
+    }
+    const qreal t = std::min<qreal>(1.0, (d - solid) / std::max<qreal>(1.0, count - solid));
+    return 1.0 - t * t * (3.0 - 2.0 * t);
+}
 constexpr int FocusRingWidth = 2;
 constexpr int AnimationMs = 220;
 /// Icon sizes are quantized to this many pixels so a live window resize hits the scaling cache
@@ -295,7 +310,11 @@ void DrawTitle(QPainter& p, const QModelIndex& index, const CarouselMetrics& m,
 /// of the center shrinks, tilts and fogs in instead of snapping between two shapes.
 void DrawCard(QPainter& p, const QModelIndex& index, const QRectF& rect, qreal depth,
               const QPalette& pal, bool focused, bool borders, qreal dpr, qreal peek,
-              int center_bucket, int stack_bucket) {
+              int center_bucket, int stack_bucket, qreal alpha) {
+    p.save();
+    if (alpha < 1.0) {
+        p.setOpacity(alpha);
+    }
     const qreal d = std::abs(depth);
     if (d < 1.0) {
         // Only the card taking the center slot casts the full shadow.
@@ -379,6 +398,7 @@ void DrawCard(QPainter& p, const QModelIndex& index, const QRectF& rect, qreal d
         p.drawRoundedRect(rect.adjusted(-1, -1, 1, 1), rect.width() * 0.08 + 1,
                           rect.width() * 0.08 + 1);
     }
+    p.restore();
 }
 
 } // namespace
@@ -405,6 +425,7 @@ GameCarousel::GameCarousel(QWidget* parent) : QListView{parent} {
                 m_position = value.toReal();
                 viewport()->update();
             });
+
 
 }
 
@@ -522,7 +543,8 @@ void GameCarousel::paintEvent(QPaintEvent*) {
         qreal depth;
     };
     std::vector<Card> cards;
-    const int max_depth = int((viewport()->width() / 2 + m.card_w) / m.peek) + 1;
+    const int max_depth =
+        std::clamp(int(UISettings::values.carousel_side_count.GetValue()), 1, MaxSideCount);
     const int base = int(std::floor(m_position));
     for (int position = std::max(0, base - max_depth - 1);
          position <= std::min<int>(int(m_visible.size()) - 1, base + max_depth + 1); ++position) {
@@ -541,9 +563,13 @@ void GameCarousel::paintEvent(QPaintEvent*) {
         if (rect.right() < 0.0 || rect.left() >= viewport()->width()) {
             continue;
         }
+        const qreal alpha = StackAlpha(card.depth, max_depth);
+        if (alpha <= 0.0) {
+            continue;
+        }
         const QModelIndex index = model()->index(m_visible[card.position], 0);
         DrawCard(p, index, rect, card.depth, palette(), focused, borders, dpr, m.peek,
-                 center_bucket, stack_bucket);
+                 center_bucket, stack_bucket, alpha);
     }
 
     if (m.names) {
@@ -565,7 +591,8 @@ QModelIndex GameCarousel::indexAt(const QPoint& point) const {
         return {};
     }
     const CarouselMetrics m = MetricsFor(viewport()->size());
-    const int max_depth = int((viewport()->width() / 2 + m.card_w) / m.peek) + 2;
+    const int max_depth =
+        std::clamp(int(UISettings::values.carousel_side_count.GetValue()), 1, MaxSideCount) + 1;
     int best = -1;
     qreal best_depth = 0.0;
     for (int position = 0; position < int(m_visible.size()); ++position) {

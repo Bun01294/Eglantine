@@ -550,6 +550,12 @@ void GameList::SetupCustomization() {
                 carousel_view->viewport()->update();
                 emit SaveConfig();
             });
+    connect(customize_panel, &HomeCustomizePanel::CarouselSideCountRequested, this,
+            [this](u8 count) {
+                UISettings::values.carousel_side_count = count;
+                carousel_view->viewport()->update();
+                emit SaveConfig();
+            });
     connect(customize_panel, &HomeCustomizePanel::CarouselBannerBackgroundRequested, this,
             [this](bool show) {
                 UISettings::values.carousel_banner_background = show;

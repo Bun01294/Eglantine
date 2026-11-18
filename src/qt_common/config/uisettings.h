@@ -232,6 +232,8 @@ struct Values {
     /// The carousel shows the centered game's banner, blurred, behind the cards when it has one.
     Setting<bool> carousel_banner_background{linkage, false, "carousel_banner_background",
                                               Category::UiGameList};
+    /// How many stacked cards the carousel shows on each side of the centered one.
+    Setting<u8> carousel_side_count{linkage, 6, "carousel_side_count", Category::UiGameList};
     Setting<std::string> home_background{linkage, {}, "home_background", Category::UiGameList};
     QStringList recent_home_backgrounds;
     /// The home screen background's fill: 0 picture, 1 solid color, 2 two-color gradient.
