@@ -4,10 +4,13 @@
 #pragma once
 
 #include <QListView>
+#include <QPixmap>
 #include <QString>
 
 #include <array>
 #include <vector>
+
+#include "common/common_types.h"
 
 class GameListModel;
 class QVariantAnimation;
@@ -32,6 +35,10 @@ public:
     void ApplyFilter(const QString& edit_filter_text, GameListModel* model);
     /// Kept for the surrounding wiring: the card sizes follow the viewport, not this setting.
     void UpdateIconSize();
+
+    /// The program whose game the backdrop should feature: the slide's destination once one is
+    /// running, the settled center otherwise.
+    u64 CenteredProgramId() const;
 
     QModelIndex indexAt(const QPoint& point) const override;
     QRect visualRect(const QModelIndex& index) const override;
@@ -58,5 +65,12 @@ private:
     /// The animated position within m_visible of the centered card.
     qreal m_position = 0.0;
     QVariantAnimation* m_position_anim = nullptr;
+    /// The slide's destination position, or -1 when no slide is running.
+    int m_pending_center = -1;
     bool m_relayout_queued = false;
+
+signals:
+    /// The game the backdrop should feature: the slide's destination once one is running, the
+    /// settled center otherwise. Emitted on selection changes and relayouts.
+    void CenteredGameChanged(u64 program_id);
 };

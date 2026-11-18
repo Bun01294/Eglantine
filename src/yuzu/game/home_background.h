@@ -6,7 +6,10 @@
 #include <QColor>
 #include <QImage>
 #include <QObject>
+#include <QPixmap>
 #include <QString>
+
+#include "common/common_types.h"
 
 class QMovie;
 class QPainter;
@@ -69,6 +72,9 @@ public:
     static QImage LoadThumbnail(const QString& path, const QSize& size);
     /// Scales `image` to cover `target`, cropping the overflow evenly on both sides.
     static void PaintCover(QPainter& painter, const QRect& target, const QImage& image);
+    /// A game's banner, cover-cropped to `target` and softly blurred, as a backdrop. Cached
+    /// per size; a null pixmap when the game has no banner.
+    static QPixmap ScaledHero(u64 program_id, const QSize& target, qreal dpr);
     /// The stored kind value; anything outside Picture..Gradient reads as a picture.
     static Kind KindFromInt(int value) {
         return value == 1 ? Kind::Solid : value == 2 ? Kind::Gradient : Kind::Picture;

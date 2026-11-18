@@ -5,6 +5,7 @@
 #include <QImageReader>
 #include <QMovie>
 #include <QPainter>
+#include <QPixmapCache>
 #include <QStringList>
 
 #if YUZU_USE_QT_MULTIMEDIA
@@ -14,6 +15,10 @@
 #include <QVideoSink>
 #endif
 
+#include <algorithm>
+#include <cmath>
+
+#include "qt_common/util/game_art.h"
 #include "yuzu/game/home_background.h"
 
 namespace {
@@ -41,6 +46,71 @@ QImage ReadStill(const QString& path, const QSize& bound) {
         reader.setScaledSize(size.scaled(bound, Qt::KeepAspectRatio));
     }
     return reader.read();
+}
+
+/// The soft backdrop blur for banners: three box passes each way approximate a Gaussian closely
+/// enough for a background wash, and run only once, when a banner enters the cache.
+void BlurImage(QImage& image, int radius) {
+    if (image.isNull() || radius < 1 || image.width() < 3 || image.height() < 3) {
+        return;
+    }
+    image = image.convertToFormat(QImage::Format_ARGB32);
+    QImage temp(image.size(), QImage::Format_ARGB32);
+    for (int pass = 0; pass < 3; ++pass) {
+        for (int y = 0; y < image.height(); ++y) {
+            const auto* in = reinterpret_cast<const QRgb*>(image.scanLine(y));
+            auto* out = reinterpret_cast<QRgb*>(temp.scanLine(y));
+            int r = 0, g = 0, b = 0, a = 0;
+            auto add = [&](int x) {
+                const QRgb c = in[std::clamp(x, 0, image.width() - 1)];
+                r += qRed(c);
+                g += qGreen(c);
+                b += qBlue(c);
+                a += qAlpha(c);
+            };
+            for (int x = -radius; x <= radius; ++x) {
+                add(x);
+            }
+            const int window = 2 * radius + 1;
+            for (int x = 0; x < image.width(); ++x) {
+                out[x] = qRgba(r / window, g / window, b / window, a / window);
+                add(x + radius + 1);
+                const QRgb gone = in[std::clamp(x - radius, 0, image.width() - 1)];
+                r -= qRed(gone);
+                g -= qGreen(gone);
+                b -= qBlue(gone);
+                a -= qAlpha(gone);
+            }
+        }
+        image.swap(temp);
+        for (int x = 0; x < image.width(); ++x) {
+            int r = 0, g = 0, b = 0, a = 0;
+            auto add = [&](int y) {
+                const QRgb c = reinterpret_cast<const QRgb*>(
+                    image.scanLine(std::clamp(y, 0, image.height() - 1)))[x];
+                r += qRed(c);
+                g += qGreen(c);
+                b += qBlue(c);
+                a += qAlpha(c);
+            };
+            for (int y = -radius; y <= radius; ++y) {
+                add(y);
+            }
+            const int window = 2 * radius + 1;
+            for (int y = 0; y < image.height(); ++y) {
+                reinterpret_cast<QRgb*>(temp.scanLine(y))[x] =
+                    qRgba(r / window, g / window, b / window, a / window);
+                add(y + radius + 1);
+                const QRgb gone = reinterpret_cast<const QRgb*>(
+                    image.scanLine(std::clamp(y - radius, 0, image.height() - 1)))[x];
+                r -= qRed(gone);
+                g -= qGreen(gone);
+                b -= qBlue(gone);
+                a -= qAlpha(gone);
+            }
+        }
+        image.swap(temp);
+    }
 }
 
 } // namespace
@@ -106,6 +176,55 @@ void HomeBackground::PaintCover(QPainter& painter, const QRect& target, const QI
                         (image.height() - visible.height()) / 2.0, visible.width(),
                         visible.height());
     painter.drawImage(QRectF(target), image, source);
+}
+
+QPixmap HomeBackground::ScaledHero(u64 program_id, const QSize& target, qreal dpr) {
+    const QString key = QStringLiteral("eglantine-hero-backdrop-%1-%2x%3-%4")
+                            .arg(program_id)
+                            .arg(target.width())
+                            .arg(target.height())
+                            .arg(dpr);
+    QPixmap cached;
+    if (QPixmapCache::find(key, &cached)) {
+        return cached;
+    }
+    if (program_id == 0) {
+        return {};
+    }
+    const QString path = QtCommon::GameArt::HeroPath(program_id);
+    if (!QFileInfo::exists(path)) {
+        return {};
+    }
+    QImageReader reader(path);
+    const QSize full = reader.size();
+    if (!full.isValid() || full.isEmpty()) {
+        return {};
+    }
+    // Decode and blur at half resolution: the blur hides it, and the cache stays small.
+    const QSize physical(qRound(target.width() * dpr / 2.0), qRound(target.height() * dpr / 2.0));
+    if (physical.isEmpty()) {
+        return {};
+    }
+    QSize scaled = full;
+    scaled.scale(physical, Qt::KeepAspectRatioByExpanding);
+    reader.setScaledSize(scaled);
+    QImage image = reader.read();
+    if (image.isNull()) {
+        return {};
+    }
+    const int left = std::max(0, (image.width() - physical.width()) / 2);
+    const int top = std::max(0, (image.height() - physical.height()) / 2);
+    image = image.copy(left, top, physical.width(), physical.height());
+    BlurImage(image, std::max(2, qRound(6 * dpr)));
+    // Stretch back to the full physical size once, so every frame is an exact 1:1 blit. The
+    // stretch is done here rather than with a sub-1 device pixel ratio, which paint paths are
+    // free to ignore.
+    const QSize full_physical(qRound(target.width() * dpr), qRound(target.height() * dpr));
+    image = image.scaled(full_physical, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    QPixmap out = QPixmap::fromImage(image);
+    out.setDevicePixelRatio(dpr);
+    QPixmapCache::insert(key, out);
+    return out;
 }
 
 QColor HomeBackground::ColorFromString(const QString& name) {

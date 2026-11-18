@@ -535,6 +535,16 @@ HomeCustomizePanel::HomeCustomizePanel(HomeBackground* background_, QWidget* par
     card_size_layout->addLayout(card_size_buttons_row);
     layout->addWidget(card_size_row);
 
+    // The centered game's banner can stand in for the background.
+    banner_check = new QCheckBox(scroll_content);
+    banner_check->setCursor(Qt::PointingHandCursor);
+    connect(banner_check, &QCheckBox::toggled, this, [this](bool show) {
+        if (!syncing) {
+            emit CarouselBannerBackgroundRequested(show);
+        }
+    });
+    layout->addWidget(banner_check);
+
     // Icon size
     auto* size_row = new QHBoxLayout;
     icon_size_title = new QLabel(scroll_content);
@@ -586,6 +596,11 @@ void HomeCustomizePanel::SyncFromSettings() {
     }
     for (size_t i = 0; i < card_size_buttons.size(); ++i) {
         card_size_buttons[i]->setChecked(i == size_index);
+    }
+    banner_check->setVisible(mode == Settings::GameListMode::CarouselView);
+    {
+        const QSignalBlocker blocker(banner_check);
+        banner_check->setChecked(UISettings::values.carousel_banner_background.GetValue());
     }
 
     const auto kind =
@@ -780,6 +795,9 @@ void HomeCustomizePanel::RetranslateUI() {
     card_size_buttons[2]->setText(tr("2/3"));
     card_size_buttons[3]->setText(tr("1/2"));
     card_size_buttons[4]->setText(tr("1/3"));
+    banner_check->setText(tr("Show game banner as background"));
+    banner_check->setToolTip(tr("Behind the carousel, show the centered game's banner, softly "
+                                "blurred, when the game has one"));
     icon_size_title->setText(tr("Icon size"));
     UpdateIconSizeLabel();
 }

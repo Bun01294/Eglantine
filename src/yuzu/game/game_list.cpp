@@ -63,6 +63,11 @@
 #include "yuzu/shader_warm_dialog.h"
 #include "yuzu/util/controller_navigation.h"
 
+/// The banner backdrop crossfades just behind the slide, so the change reads as one motion.
+constexpr int BannerFadeMs = 260;
+/// How far up from the bottom the filter bar's fade into the panel surface reaches.
+constexpr int BarFadeHeight = 80;
+
 /// Holds the game views and paints the home screen background behind them.
 class HomeSurface : public QWidget {
 public:
@@ -72,14 +77,113 @@ public:
             cached = {};
             update();
         });
+
+        m_banner_anim = new QVariantAnimation(this);
+        m_banner_anim->setDuration(BannerFadeMs);
+        m_banner_anim->setEasingCurve(QEasingCurve::OutCubic);
+        connect(m_banner_anim, &QVariantAnimation::valueChanged, this,
+                [this](const QVariant& value) {
+                    m_banner_alpha = value.toReal();
+                    if (m_banner_alpha >= 1.0) {
+                        m_banner_from = {};
+                    }
+                    update();
+                });
+
+    }
+
+    /// Whether the filter bar sits at the bottom and blends into the backdrop.
+    void SetFilterZoneVisible(bool visible) {
+        if (m_filter_zone_visible == visible) {
+            return;
+        }
+        m_filter_zone_visible = visible;
+        update();
+    }
+
+    /// The game whose banner backs the home screen while the carousel is showing. A game
+    /// without one, or an empty id, falls back to the normal background.
+    void SetBannerGame(u64 program_id) {
+        if (m_banner_id == program_id) {
+            return;
+        }
+        m_banner_id = program_id;
+        // Load on the next loop turn, so a slide's first frames are not blocked by the decode.
+        if (m_banner_load_queued) {
+            return;
+        }
+        m_banner_load_queued = true;
+        QMetaObject::invokeMethod(
+            this,
+            [this] {
+                m_banner_load_queued = false;
+                m_banner_from = m_banner_to;
+                m_banner_to =
+                    HomeBackground::ScaledHero(m_banner_id, size(), devicePixelRatioF());
+                m_banner_alpha = m_banner_from.isNull() && m_banner_to.isNull() ? 1.0 : 0.0;
+                if (m_banner_alpha < 1.0) {
+                    m_banner_anim->stop();
+                    m_banner_anim->setStartValue(0.0);
+                    m_banner_anim->setEndValue(1.0);
+                    m_banner_anim->start();
+                }
+                update();
+            },
+            Qt::QueuedConnection);
     }
 
 protected:
     void paintEvent(QPaintEvent*) override {
+        QPainter p(this);
+        PaintBackdrop(p);
+        // A short fade into the panel surface so the filter bar blends into whatever backs it,
+        // the same wash the loading screen fades its artwork into.
+        if (m_filter_zone_visible) {
+            const QColor window = palette().color(QPalette::Window);
+            QColor clear = window;
+            clear.setAlpha(0);
+            QLinearGradient fade(0, height() - BarFadeHeight, 0, height());
+            fade.setColorAt(0.0, clear);
+            fade.setColorAt(1.0, window);
+            p.fillRect(QRect(0, height() - BarFadeHeight, width(), BarFadeHeight), fade);
+        }
+    }
+
+private:
+    /// The backdrop behind everything: the carousel's banner, or the normal background.
+    void PaintBackdrop(QPainter& p) {
+        // The banner backdrop, when one is set for the centered game: the whole surface, filter
+        // bar included, so the backdrop reads as one continuous thing.
+        if (UISettings::values.carousel_banner_background.GetValue() &&
+            UISettings::values.game_list_mode.GetValue() ==
+                Settings::GameListMode::CarouselView) {
+            const bool has_from = !m_banner_from.isNull() && m_banner_alpha < 1.0;
+            const bool has_to = !m_banner_to.isNull();
+            if (has_from || has_to) {
+                if (has_from) {
+                    if (!has_to) {
+                        // The last banner ebbs away over the normal background.
+                        p.setOpacity(1.0 - m_banner_alpha);
+                    }
+                    p.drawPixmap(0, 0, m_banner_from);
+                    p.setOpacity(1.0);
+                }
+                if (has_to && m_banner_alpha > 0.0) {
+                    p.setOpacity(m_banner_alpha);
+                    p.drawPixmap(0, 0, m_banner_to);
+                    p.setOpacity(1.0);
+                }
+                // The same readability scrim the picture path applies.
+                QColor scrim = palette().color(QPalette::Window);
+                scrim.setAlpha(90);
+                p.fillRect(rect(), scrim);
+                return;
+            }
+        }
+
         // A solid or gradient fill paints directly; only a picture needs the scaled cover.
         const auto kind = background->GetKind();
         if (kind != HomeBackground::Kind::Picture) {
-            QPainter p(this);
             if (kind == HomeBackground::Kind::Gradient) {
                 QLinearGradient gradient(rect().topLeft(), rect().bottomRight());
                 gradient.setColorAt(0.0, background->Color());
@@ -109,7 +213,6 @@ protected:
             cached_key = frame.cacheKey();
             cached_size = size();
         }
-        QPainter p(this);
         p.drawPixmap(0, 0, cached);
     }
 
@@ -128,6 +231,14 @@ private:
     QPixmap cached;
     qint64 cached_key = 0;
     QSize cached_size;
+    /// The banner backdrop crossfade, and how far it has run.
+    QVariantAnimation* m_banner_anim = nullptr;
+    QPixmap m_banner_from;
+    QPixmap m_banner_to;
+    qreal m_banner_alpha = 1.0;
+    u64 m_banner_id = 0;
+    bool m_banner_load_queued = false;
+    bool m_filter_zone_visible = true;
 };
 
 GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvider* provider_,
@@ -242,6 +353,7 @@ void GameList::SetFilterFocus() {
 
 void GameList::SetFilterVisible(bool visibility) {
     search_field->setVisible(visibility);
+    surface->SetFilterZoneVisible(visibility);
 }
 
 bool GameList::IsEmpty() const {
@@ -340,6 +452,9 @@ void GameList::ResetViewMode() {
 
     QScroller::grabGesture(view, QScroller::LeftMouseButtonGesture);
 
+    // The banner backdrop belongs to the carousel; leaving the mode must repaint it away.
+    surface->update();
+
     auto scroller = QScroller::scroller(view);
     QScrollerProperties props;
     props.setScrollMetric(QScrollerProperties::HorizontalOvershootPolicy,
@@ -435,6 +550,16 @@ void GameList::SetupCustomization() {
                 carousel_view->viewport()->update();
                 emit SaveConfig();
             });
+    connect(customize_panel, &HomeCustomizePanel::CarouselBannerBackgroundRequested, this,
+            [this](bool show) {
+                UISettings::values.carousel_banner_background = show;
+                surface->SetBannerGame(carousel_view->CenteredProgramId());
+                carousel_view->viewport()->update();
+                emit SaveConfig();
+            });
+    // The backdrop follows the carousel's centered game, including a slide's destination.
+    connect(carousel_view, &GameCarousel::CenteredGameChanged, surface,
+            &HomeSurface::SetBannerGame);
 
     customize_button = new FloatingActionButton(surface);
     customize_button->setToolTip(tr("Customize Home Screen"));

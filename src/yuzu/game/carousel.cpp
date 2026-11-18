@@ -430,6 +430,20 @@ void GameCarousel::ApplyFilter(const QString& edit_filter_text, GameListModel* m
         m_position = std::max<qreal>(0.0, qreal(m_visible.size()) - 1.0);
     }
     viewport()->update();
+    emit CenteredGameChanged(CenteredProgramId());
+}
+
+u64 GameCarousel::CenteredProgramId() const {
+    if (m_visible.empty() || !model()) {
+        return 0;
+    }
+    const int index = m_pending_center >= 0 && m_pending_center < int(m_visible.size())
+                          ? m_pending_center
+                          : std::clamp(int(std::lround(m_position)), 0,
+                                       int(m_visible.size()) - 1);
+    return model()->index(m_visible[index], 0)
+        .data(GameListItemPath::ProgramIdRole)
+        .toULongLong();
 }
 
 void GameCarousel::UpdateIconSize() {
@@ -457,6 +471,9 @@ void GameCarousel::MoveTo(int position) {
     m_position_anim->stop();
     m_position_anim->setStartValue(m_position);
     m_position_anim->setEndValue(qreal(position));
+    // The backdrop follows the slide's destination, not the games it passes.
+    m_pending_center = position;
+    emit CenteredGameChanged(CenteredProgramId());
     // The card settling into the center slot swaps to the center-sized icon; warm it now so
     // the last frame of the slide does not hitch on its first resample.
     if (model() && position >= 0 && position < int(m_visible.size())) {
@@ -476,6 +493,7 @@ void GameCarousel::ScheduleRelayout() {
         this,
         [this] {
             m_relayout_queued = false;
+            m_pending_center = -1;
             if (auto* model = qobject_cast<GameListModel*>(this->model())) {
                 ApplyFilter(m_filter_text, model);
             }

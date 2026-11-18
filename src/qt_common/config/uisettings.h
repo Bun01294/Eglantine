@@ -229,6 +229,9 @@ struct Values {
     Setting<bool> game_icon_borders{linkage, true, "game_icon_borders", Category::UiGameList};
     /// The carousel's centered card size: an index into GameCarousel::CardSizeFractions.
     Setting<u8> carousel_card_size{linkage, 0, "carousel_card_size", Category::UiGameList};
+    /// The carousel shows the centered game's banner, blurred, behind the cards when it has one.
+    Setting<bool> carousel_banner_background{linkage, false, "carousel_banner_background",
+                                              Category::UiGameList};
     Setting<std::string> home_background{linkage, {}, "home_background", Category::UiGameList};
     QStringList recent_home_backgrounds;
     /// The home screen background's fill: 0 picture, 1 solid color, 2 two-color gradient.
