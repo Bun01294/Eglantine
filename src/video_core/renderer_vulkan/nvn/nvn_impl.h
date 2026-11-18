@@ -927,6 +927,14 @@ struct Context::Impl {
 
     // --- replay thread only ---
     bool mario_kart_world{};
+    /// Sparse tiles mapped to the same guest bytes share one host page (SparseBacking). On by
+    /// default for MKW where the device can alias sparse memory; EDEN_NX2_NVN_SPARSE_SHARE=0 turns
+    /// it off, =1 on for every title.
+    std::optional<bool> sparse_share_enabled;
+    bool SparseShareEnabled();
+    /// Counts SparseBacking::Prepare calls: a shared page allocated by an earlier call has its
+    /// texels earlier in the command stream.
+    u64 sparse_prepare_epoch{0};
     std::optional<bool> mkw_bc3_atlas_supported;
     bool MkwBc3AtlasSupported();
     bool mkw_coalesce_early_submit{};

@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
 #include <unordered_set>
@@ -367,7 +368,8 @@ bool Context::Impl::EnsureImage(Storage& s) {
             // Tile-backed: a sparse residency image with no memory; the tiles the pool maps get
             // theirs (SparseBacking::Prepare).
             const char* reason = "the device cannot create a sparse residency image";
-            s.image = allocator->CreateUnbackedImage(image_info);
+            // Shared tile pages (SparseShareEnabled) need SPARSE_ALIASED images.
+            s.image = allocator->CreateUnbackedImage(image_info, SparseShareEnabled());
             if (s.image && s.sparse->Attach(*this, s, reason)) {
                 s.current_layout = VK_IMAGE_LAYOUT_UNDEFINED;
                 stats.storages_created.fetch_add(1, std::memory_order_relaxed);
@@ -762,6 +764,21 @@ void Context::Impl::FlushedRuns(Pool& pool, u64 begin, u64 size,
     }
     stats.vram_flush_pages_kept.fetch_add(kept, std::memory_order_relaxed);
     stats.vram_flush_pages_taken.fetch_add(taken, std::memory_order_relaxed);
+}
+
+bool Context::Impl::SparseShareEnabled() {
+    if (!sparse_share_enabled) {
+        const char* value = std::getenv("EDEN_NX2_NVN_SPARSE_SHARE");
+        const char forced = value == nullptr ? '\0' : value[0];
+        const bool wanted = forced == '1' || (forced != '0' && mario_kart_world);
+        const bool supported = device.IsSparseResidencyAliasedSupported();
+        sparse_share_enabled = wanted && supported;
+        LOG_INFO(Render_Vulkan, "[nvn] sparse tiles of the same guest bytes share pages: {}",
+                 *sparse_share_enabled ? "on"
+                 : !wanted             ? "off"
+                                       : "off (the device cannot alias sparse memory)");
+    }
+    return *sparse_share_enabled;
 }
 
 std::span<const u64> Context::Impl::MkwSparseVirtualUsers(u64 physical_serial) {

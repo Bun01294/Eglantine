@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #include "video_core/renderer_vulkan/nvn/nvn_impl.h"
@@ -30,6 +31,20 @@ namespace Vulkan::Nvn {
 /// Combine adjacent blocks of a single host row without changing their physical mappings.
 void CompactSparseImageBinds(std::vector<VkSparseImageMemoryBind>& binds, u32 granule_x,
                              u32 granule_y);
+
+/// What a shared sparse page holds: the guest bytes at `source` (a guest address, 64 KiB aligned
+/// for a tile), decoded for images of shape `shape` (formats, tile and host block shape, memory
+/// types, host block slot). Tiles with equal keys hold equal texels, so they can share a page.
+struct SparseAliasKey {
+    u64 source{};
+    u64 shape{};
+    bool operator==(const SparseAliasKey&) const = default;
+};
+struct SparseAliasKeyHash {
+    size_t operator()(const SparseAliasKey& key) const noexcept {
+        return static_cast<size_t>(key.source * 0x9E3779B97F4A7C15ULL ^ key.shape);
+    }
+};
 
 /// 64 KiB pages of device memory for sparse images, taken from the allocator in blocks.
 class SparsePagePool {
@@ -47,7 +62,20 @@ public:
     /// A page usable by an image whose memory requirements allow `memory_type_bits`; NoPage when
     /// the budget or the device memory is used up.
     [[nodiscard]] u32 Allocate(u32 memory_type_bits);
+    /// The page holding `key`'s texels, shared with every other tile of that key (one more
+    /// reference). `reused`: the page existed before replay step `epoch`, so its texels were
+    /// uploaded or written earlier in the command stream. NoPage when out of memory.
+    [[nodiscard]] u32 AcquireShared(const SparseAliasKey& key, u32 memory_type_bits, u64 epoch,
+                                    bool& reused);
+    /// Whether `page` is the shared page of `key`.
+    [[nodiscard]] bool HoldsKey(u32 page, const SparseAliasKey& key) const;
+    /// Drops one reference; the page is free when the last one goes.
     void Free(u32 page);
+    /// Bytes saved by sharing: references beyond the first of each shared page.
+    [[nodiscard]] u64 SharedSavedBytes() const {
+        std::scoped_lock lock{mutex_};
+        return shared_extra_refs_ * PageBytes;
+    }
     /// Release wholly unused allocations after their pages are no longer in GPU use.
     void TrimUnusedBlocks();
     /// Counts the pages given back: a starved tile is worth another try only after it changed.
@@ -77,11 +105,18 @@ private:
         u32 used_pages{};
     };
 
+    u32 AllocateLocked(u32 memory_type_bits);
+
     const MemoryAllocator& allocator_;
     const u64 budget_;
     mutable std::mutex mutex_;
     std::vector<Block> blocks_;
     std::vector<u32> free_;
+    std::vector<u32> refs_;  ///< per page: references (0 free)
+    std::vector<u64> epoch_; ///< per shared page: the replay step that allocated it
+    std::unordered_map<SparseAliasKey, u32, SparseAliasKeyHash> by_key_;
+    std::unordered_map<u32, SparseAliasKey> key_of_;
+    u64 shared_extra_refs_{0};
     u64 used_{0};
     u64 free_generation_{0};
     u32 empty_blocks_{0};
@@ -200,7 +235,15 @@ private:
     std::vector<u32>& TilePages(u32 id);
     bool BindUnit(Context::Impl& impl, const Storage& s, bool tail, u32 id, bool bind,
                   std::vector<VkSparseImageMemoryBind>& image_binds,
-                  std::vector<VkSparseMemoryBind>& opaque_binds);
+                  std::vector<VkSparseMemoryBind>& opaque_binds, bool* reused = nullptr);
+    /// The guest address of tile `id`'s 64 KiB, when one physical run maps all of it.
+    bool TileSource(Context::Impl& impl, const Storage& s, u32 id, u64& source) const;
+    /// The alias key of host block `slot` of a tile whose bytes are at `source`.
+    [[nodiscard]] SparseAliasKey KeyOf(u64 source, u32 slot) const {
+        return {source, shape_ ^ (static_cast<u64>(slot + 1) * 0xC2B2AE3D27D4EB4FULL)};
+    }
+    /// Whether the bound pages of tile `id` still hold the bytes its guest mapping points at.
+    bool TilePagesCurrent(Context::Impl& impl, const Storage& s, u32 id);
 
     SparseLayout layout_;
     UploadPlan tail_plan_;
@@ -232,6 +275,8 @@ private:
     u32 verify_cursor_{0};
     std::vector<u32> deferred_free_; ///< pages of unbound units, freed once the binds ran
     bool starved_logged_{false};
+    bool share_{false}; ///< tiles share pages by guest source (the image is SPARSE_ALIASED)
+    u64 shape_{0};      ///< SparseAliasKey::shape before the slot
     bool persistent_tails_{false}; ///< MKW writes coarse levels without mapping guest tail pages
     /// Everything pending found no page at generation `starved_generation_`.
     bool starved_only_{false};
