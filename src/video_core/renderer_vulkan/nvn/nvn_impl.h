@@ -313,6 +313,9 @@ struct Storage : std::enable_shared_from_this<Storage> {
     /// GPU origin: `sample_hash` is the guest signature taken at the first check after the last
     /// GPU write (the baseline a CPU rewrite is compared with).
     bool watch_valid{false};
+    /// GPU origin on a linear storage in a CPU-readable pool: `seq` of the last submission that
+    /// queued a write-back of the GPU's linear texels to guest memory (0: none, or settled).
+    u64 linear_writeback_seq{0};
     /// The CPU changed the bytes behind this storage at least once (checked in full from then on).
     bool dynamic{false};
     /// The guest wrote the storage itself (WriteTexels): upload again whatever the origin.
@@ -1551,6 +1554,9 @@ struct Context::Impl {
     /// the GPU wrote. Replay thread.
     void NotifyHostWriteNow(u64 address, u64 size);
     void NotifyTextureWrittenNow(u64 texture_serial);
+    /// Settles a pending GPU write-back on a linear storage once its submission has completed,
+    /// refreshing `gpu_guest_sig` and re-arming `takeover_track` against the written-back bytes.
+    bool SettleLinearWriteback(Storage& s);
     /// Looks at a CPU-sourced storage's guest bytes when its check is due (a cheap signature, no
     /// commands recorded) and sets `force_upload` when they changed. At most once per `seq`.
     void DetectGuestChange(Storage& s, u64 seq);

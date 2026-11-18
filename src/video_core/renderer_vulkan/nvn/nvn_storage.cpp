@@ -50,10 +50,56 @@ u64 Context::Impl::PollTick() {
     return poll_tick;
 }
 
+bool Context::Impl::SettleLinearWriteback(Storage& s) {
+    if (s.linear_writeback_seq == 0) {
+        return true;
+    }
+    if (completed_seq.load(std::memory_order_acquire) < s.linear_writeback_seq) {
+        return false;
+    }
+    s.linear_writeback_seq = 0;
+    s.watch_valid = false;
+    if (s.origin == StorageOrigin::Gpu) {
+        s.gpu_guest_sig = 0;
+        s.gpu_guest_sig_valid = false;
+        s.gpu_takeover_armed = false;
+        const auto pool_it = pools.find(s.pool_serial);
+        if (pool_it != pools.end() && pool_it->second) {
+            Pool& pool = *pool_it->second;
+            if ((pool.flags & PoolFlag::CpuNoAccess) == 0 && !pool.IsVirtual() &&
+                s.pool_offset < pool.size) {
+                const u64 size = (std::min)(s.layout.size, pool.size - s.pool_offset);
+                if (size != 0) {
+                    std::vector<u8> scratch;
+                    if (const u8* const data = GuestBytes(pool, s.pool_offset, size, scratch)) {
+                        s.gpu_guest_sig = SampleGuestBytes(data, size, mario_kart_world);
+                        s.gpu_guest_sig_valid = true;
+                    }
+                    VC::GuestMemory* const memory = guest.load(std::memory_order_acquire);
+                    if (pool.takeover_track == 0 && !pool.takeover_track_tried) {
+                        pool.takeover_track_tried = true;
+                        if (memory != nullptr) {
+                            pool.takeover_track = memory->Track(pool.address, pool.size);
+                        }
+                    }
+                    if (pool.takeover_track != 0 && memory != nullptr) {
+                        memory->Arm(pool.takeover_track, pool.address + s.pool_offset, size);
+                        s.gpu_takeover_armed = true;
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
 void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
     // A storage the GPU wrote is watched too (a decoder writing a video plane the game cleared
     // first): its baseline is the guest signature at the first check after the GPU write, so a
     // GPU-only change never looks like a CPU one.
+    if (s.linear_writeback_seq != 0 && !SettleLinearWriteback(s)) {
+        return;
+    }
     if (s.sparse || s.force_upload || s.samples != VK_SAMPLE_COUNT_1_BIT ||
         s.origin == StorageOrigin::None || s.checked_seq == seq) {
         return;
@@ -620,6 +666,7 @@ void Context::Impl::MapVirtualNow(u64 pool_serial, const std::vector<VC::Virtual
             storage.contents_valid = false;
             storage.origin = StorageOrigin::None;
             storage.gpu_write_gen = 0; // no longer a source for overlapping textures
+            storage.linear_writeback_seq = 0;
             storage.force_upload = false;
         }
     }
@@ -868,6 +915,18 @@ void Context::Impl::NotifyCpuWriteNow(u64 address, u64 size, bool host_write) {
         if (storage.origin == StorageOrigin::Cpu) {
             // The bytes may have changed: look at them at the next use, whatever the back-off says.
             storage.force_check = true;
+        } else if (storage.origin == StorageOrigin::Gpu) {
+            // A guest flush after a linear GPU write-back may have overwritten the written-back
+            // bytes before DetectGuestChange ever sampled them; force an upload if the write-back
+            // had already completed, otherwise drop the backoff so the next use checks at once.
+            if (storage.linear_writeback_seq != 0 &&
+                storage.linear_writeback_seq <= completed_seq.load(std::memory_order_acquire)) {
+                storage.linear_writeback_seq = 0;
+                storage.watch_valid = false;
+                storage.force_upload = true;
+            } else {
+                storage.force_check = true;
+            }
         }
     }
 }
@@ -1701,6 +1760,7 @@ void Context::Impl::FlushTextureNow(CmdFlushTexture& command) {
     }
     // The guest bytes are the texture's contents now: from here on it is a CPU-sourced storage.
     s.origin = StorageOrigin::Cpu;
+    s.linear_writeback_seq = 0;
     s.guest_hash = HashGuestBytes(storage_bytes, storage_size);
     s.sample_hash = SampleGuestBytes(storage_bytes, storage_size, mario_kart_world);
     s.unchanged_checks = 0;

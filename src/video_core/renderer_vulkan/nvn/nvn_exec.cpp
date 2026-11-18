@@ -641,6 +641,10 @@ private:
     /// guest bytes agree).
     void NotePoolWrite(Pool& pool, u64 offset, u64 size, bool invalidate_mirror = true);
     void NoteTouched(const std::shared_ptr<Storage>& storage);
+    /// Writes GPU-modified linear storages in CPU-readable pools back to their pools so guest
+    /// CPU readers (and intra-submission buffer ops over those addresses) see the GPU's texels.
+    void FlushLinearWritebacks(const Pool* filter_pool = nullptr, u64 filter_begin = 0,
+                               u64 filter_end = 0);
     void WriteReadbacks();
 
     void Unsupported(std::string_view op, const std::string& reason);
@@ -893,6 +897,8 @@ private:
     u64 download_size{};
     std::vector<InFlight::Readback> readbacks;
     std::unordered_set<Pool*> dirty_pool_set;
+    std::vector<std::shared_ptr<Storage>> linear_writebacks;
+    std::unordered_set<Storage*> linear_writeback_set;
     std::vector<std::shared_ptr<Storage>> touched;
     std::unordered_set<Storage*> touched_set;
 };
@@ -931,6 +937,7 @@ void Recorder::EndSegment() {
     EndDrawPass(BreakCause::SegmentEnd);
     // Storage shadows go back to their pools before the host barrier below.
     draw.FlushShadows();
+    FlushLinearWritebacks();
     // Queries cannot span command buffers: fold the samples counted so far into the queue's
     // accumulator (the next draw of the next segment starts a new query); in-pass queries: the
     // events the passes left (queries and resets without a report) go into it as well.
@@ -1018,6 +1025,13 @@ void Recorder::Abort() {
         std::scoped_lock lock{pool->dirty_mutex};
         std::erase_if(pool->gpu_dirty, [&](const Pool::Dirty& d) { return d.seq == flight.seq; });
     }
+    for (const std::shared_ptr<Storage>& storage : linear_writebacks) {
+        if (storage->linear_writeback_seq == flight.seq) {
+            storage->linear_writeback_seq = 0;
+        }
+    }
+    linear_writebacks.clear();
+    linear_writeback_set.clear();
     readbacks.clear();
 }
 
@@ -1570,6 +1584,10 @@ bool Recorder::ResolvePoolRange(u64 address, u64 size, Pool*& pool, u64& offset,
         return false;
     }
     impl.NoteUse(pool->serial, flight.seq);
+    if (!linear_writebacks.empty() && !draw.PassOpen()) {
+        const u64 clamped = (std::min)(pool->size - offset, (std::max<u64>)(size, 1));
+        FlushLinearWritebacks(pool, offset, offset + clamped);
+    }
     if (flush_shadows && draw.HasShadows()) {
         // An op outside the draw path touches the bytes through host memory.
         draw.FlushShadowsOverlapping(*pool, offset, (std::max<u64>)(size, 1));
@@ -1735,6 +1753,19 @@ Pool* CpuReadablePoolOf(Context::Impl& impl, const Storage& s) {
     return &pool;
 }
 
+/// True when GPU writes to `s` should be copied back to its CPU-readable pool so guest CPU
+/// reads of the linear texels observe what the GPU rendered or copied into the image.
+bool ShouldWriteBackLinear(Context::Impl& impl, const Storage& s) {
+    if (!IsLinearStorage(s.desc) || s.sparse || s.scale_owner != nullptr ||
+        s.host.needs_transcode || s.host.guest_layout_differs || s.host.depth ||
+        s.host.stencil || s.aspect != VK_IMAGE_ASPECT_COLOR_BIT ||
+        s.samples != VK_SAMPLE_COUNT_1_BIT || s.levels != 1 || s.layers != 1 ||
+        s.type == VK_IMAGE_TYPE_3D || CpuReadablePoolOf(impl, s) == nullptr) {
+        return false;
+    }
+    return FormatBlockInfo(s.desc.format).bytes != 0;
+}
+
 /// The pool's CPU write tracking registration for the overlap rule, created on first use; 0 when
 /// the guest memory has no write tracking.
 u64 TakeoverTrackOf(Context::Impl& impl, Pool& pool) {
@@ -1824,7 +1855,20 @@ void Recorder::NoteGpuWrite(Storage& s) {
         owner->scale_state = Rescale::AfterScaledWrite();
         return;
     }
-    if (s.origin != StorageOrigin::Gpu) {
+    const bool linear_wb = ShouldWriteBackLinear(impl, s);
+    if (linear_wb) {
+        // Pending write-back will overwrite the guest bytes; takeover signature and page tracking
+        // are refreshed once the submission completes (Context::Impl::SettleLinearWriteback).
+        s.gpu_guest_sig = 0;
+        s.gpu_guest_sig_valid = false;
+        s.gpu_takeover_armed = false;
+        s.linear_writeback_seq = flight.seq;
+        std::shared_ptr<Storage> owner = s.shared_from_this();
+        NoteTouched(owner);
+        if (linear_writeback_set.insert(&s).second) {
+            linear_writebacks.push_back(std::move(owner));
+        }
+    } else if (s.origin != StorageOrigin::Gpu) {
         // The guest bytes these GPU contents supersede. GPU writes never reach guest memory, so
         // the bytes only differ from this later if the CPU rewrote them (ResolveOverlaps).
         const std::optional<u64> signature = GuestSignatureOf(impl, s);
@@ -1850,6 +1894,90 @@ void Recorder::NoteGpuWrite(Storage& s) {
     }
     if (s.scaled) {
         s.scale_state = Rescale::AfterNativeWrite();
+    }
+}
+
+void Recorder::FlushLinearWritebacks(const Pool* filter_pool, u64 filter_begin, u64 filter_end) {
+    if (linear_writebacks.empty()) {
+        return;
+    }
+    std::vector<std::shared_ptr<Storage>> pending;
+    if (filter_pool == nullptr) {
+        pending.swap(linear_writebacks);
+        linear_writeback_set.clear();
+    } else {
+        std::vector<std::shared_ptr<Storage>> remaining;
+        remaining.reserve(linear_writebacks.size());
+        for (std::shared_ptr<Storage>& owner : linear_writebacks) {
+            const Storage& s = *owner;
+            const u64 s_begin = s.pool_offset;
+            const u64 s_end = s.pool_offset + s.layout.size;
+            if (s.pool_serial == filter_pool->serial && s_begin < filter_end &&
+                filter_begin < s_end) {
+                linear_writeback_set.erase(owner.get());
+                pending.push_back(std::move(owner));
+            } else {
+                remaining.push_back(std::move(owner));
+            }
+        }
+        linear_writebacks = std::move(remaining);
+    }
+    for (std::shared_ptr<Storage>& owner : pending) {
+        Storage& s = *owner;
+        if (!s.image || s.origin != StorageOrigin::Gpu) {
+            s.linear_writeback_seq = 0;
+            continue;
+        }
+        if (s.scaled && Rescale::NativeIsStale(s.scale_state)) {
+            MakeNativeCurrent(s);
+        }
+        Pool* const pool = CpuReadablePoolOf(impl, s);
+        if (!pool) {
+            s.linear_writeback_seq = 0;
+            continue;
+        }
+        impl.EnsureBacking(*pool);
+        if (pool->backing != Pool::Backing::Imported && pool->backing != Pool::Backing::Mirror) {
+            s.linear_writeback_seq = 0;
+            continue;
+        }
+        const BlockInfo block = FormatBlockInfo(s.desc.format);
+        const u64 available = pool->size - s.pool_offset;
+        const u64 row_bytes = static_cast<u64>(CeilDiv(s.extent.width, block.width)) * block.bytes;
+        const u32 stride =
+            s.desc.stride ? s.desc.stride
+                          : static_cast<u32>(s.layout.layer_size / (std::max)(s.extent.height, 1u));
+        if (block.bytes == 0 || row_bytes == 0 || available < row_bytes || stride < row_bytes) {
+            s.linear_writeback_seq = 0;
+            continue;
+        }
+        u32 copy_rows = s.extent.height;
+        if (copy_rows > 1 && static_cast<u64>(copy_rows - 1) * stride + row_bytes > available) {
+            copy_rows = static_cast<u32>((available - row_bytes) / stride + 1);
+        }
+        CopyGeometry geometry;
+        const VC::CopyRegion region{0, 0, 0, static_cast<s32>(s.extent.width),
+                                    static_cast<s32>(copy_rows), 1};
+        if (!MakeCopyGeometry(s, 0, 0, region, stride, 0, s.pool_offset, geometry) ||
+            s.pool_offset + geometry.span > pool->size) {
+            s.linear_writeback_seq = 0;
+            continue;
+        }
+        impl.NoteUse(pool->serial, flight.seq);
+        if (draw.HasShadows()) {
+            draw.FlushShadowsOverlapping(*pool, s.pool_offset, geometry.span);
+        }
+        if (geometry.padded) {
+            // Bytes between rows are not written: the mirror must hold the guest's version of them.
+            UploadRange(*pool, s.pool_offset, geometry.span);
+        }
+        const bool saved = std::exchange(track_writes, false);
+        PrepareImages({{&s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL}});
+        track_writes = saved;
+        Cmd().CopyImageToBuffer(*s.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, pool->Handle(),
+                                geometry.regions);
+        NotePoolWrite(*pool, s.pool_offset, geometry.span);
+        barrier_pending = true;
     }
 }
 
@@ -2109,6 +2237,7 @@ void Recorder::UploadStorage(Storage& s) {
     // are the game's initial fill and never change again.
     s.contents_valid = true; // RefitStandin may have replaced the image above.
     s.origin = cpu_visible ? StorageOrigin::Cpu : StorageOrigin::Gpu;
+    s.linear_writeback_seq = 0;
     s.watch_valid = false;
     s.unchanged_checks = 0;
     const u64 now = impl.PollTick();
@@ -3067,7 +3196,9 @@ void Recorder::ResolveOverlaps(Storage& s) {
             // and, for pools without tracking, a changed guest signature.
             bool rewritten = false;
             const char* how = "";
-            if (!LegacyFirstUpload()) {
+            const bool writeback_settled =
+                other->linear_writeback_seq == 0 || impl.SettleLinearWriteback(*other);
+            if (writeback_settled && !LegacyFirstUpload()) {
                 if (other->gpu_takeover_armed) {
                     Pool* const pool = CpuReadablePoolOf(impl, *other);
                     VC::GuestMemory* const memory = impl.guest.load(std::memory_order_acquire);
@@ -3100,7 +3231,8 @@ void Recorder::ResolveOverlaps(Storage& s) {
                          other->desc.format, other->pool_offset, other->layout.size,
                          other->gpu_write_gen,
                          rewritten ? "skipped, the CPU wrote the bytes after the GPU write"
-                         : other->gpu_takeover_armed || other->gpu_guest_sig_valid
+                         : writeback_settled &&
+                                 (other->gpu_takeover_armed || other->gpu_guest_sig_valid)
                              ? "copied, no CPU write since the GPU write"
                              : "copied, no CPU write tracking for the source",
                          how);
@@ -6085,6 +6217,7 @@ void Recorder::Finish(std::span<const VkSemaphore> binary_signals) {
     // Deferred report zero-fills first: the write-back copies below must see them.
     EndRenderCondition();
     EndDrawPass();
+    FlushLinearWritebacks();
     WriteReadbacks();
     EndSegment();
     draw.EndSubmission();

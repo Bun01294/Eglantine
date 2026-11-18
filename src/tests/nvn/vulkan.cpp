@@ -1343,3 +1343,196 @@ TEST_CASE("NVN Vulkan: contexts created and destroyed back to back", "[nvn]") {
         context.SetGuestMemory(nullptr);
     }
 }
+
+namespace {
+
+void RunLinearTextureWriteback(HeadlessVulkan& vulkan, bool allow_import) {
+    constexpr u64 TEX_POOL = 1;
+    constexpr u64 READBACK_POOL = 2;
+    constexpr u64 TEX_LINEAR_RT = 10;
+    constexpr u64 TEX_BLOCK_SRC = 11;
+    constexpr u64 TEX_LINEAR_COPY = 12;
+    constexpr u64 TEX_POOL_VA = 0x7A00'0000;
+    constexpr u64 READBACK_VA = 0x7B00'0000;
+    constexpr u32 WIDTH = 5;
+    constexpr u32 HEIGHT = 4;
+    constexpr u32 STRIDE = 128;
+    constexpr u32 ROW_BYTES = WIDTH * 8; // RGBA16F = 8 bytes/texel
+    constexpr u64 RT_OFFSET = 256;
+    constexpr u64 SRC_OFFSET = 4096;
+    constexpr u64 COPY_OFFSET = 16384;
+
+    FakeMemory memory;
+    u8* tex_mem = memory.Add(TEX_POOL_VA, 64_KiB);
+    u8* readback = memory.Add(READBACK_VA, 64_KiB);
+    // Pre-fill the entire texture pool with fp16 -65504.0f (0xFBFF), the stale sentinel pattern
+    // observed in MKW's recycled linear texture pools.
+    for (size_t i = 0; i < 64_KiB; i += 2) {
+        tex_mem[i] = 0xFF;
+        tex_mem[i + 1] = 0xFB;
+    }
+    std::memset(readback, 0xCD, 64_KiB);
+
+    Vulkan::Nvn::Context context(*vulkan.device, vulkan.submit_mutex, nullptr,
+                                 {.allow_host_import = allow_import});
+    CompletionLog log;
+    context.SetCompletionCallback([&log](u64 seq) {
+        std::scoped_lock lock{log.mutex};
+        log.seqs.push_back(seq);
+    });
+    context.SetGuestMemory(&memory);
+
+    context.CreatePool({.serial = TEX_POOL, .guest_address = TEX_POOL_VA, .size = 64_KiB,
+                        .flags = POOL_CPU_CACHED});
+    context.CreatePool({.serial = READBACK_POOL, .guest_address = READBACK_VA, .size = 64_KiB,
+                        .flags = POOL_CPU_CACHED});
+
+    auto make_rgba16f = [](u64 serial, u64 offset, s32 flags, u32 stride) {
+        VC::TextureDesc desc{};
+        desc.target = 1;   // 2D
+        desc.format = 0x29; // RGBA16F
+        desc.flags = flags;
+        desc.samples = 0;
+        desc.width = WIDTH;
+        desc.height = HEIGHT;
+        desc.depth = 1;
+        desc.levels = 1;
+        desc.stride = stride;
+        desc.serial = serial;
+        desc.pool_serial = TEX_POOL;
+        desc.pool_offset = offset;
+        return desc;
+    };
+
+    context.CreateTexture(make_rgba16f(TEX_LINEAR_RT, RT_OFFSET,
+                                       Vulkan::Nvn::TexFlag::LinearRenderTarget, STRIDE));
+    context.CreateTexture(make_rgba16f(TEX_BLOCK_SRC, SRC_OFFSET, 0, 0));
+    context.CreateTexture(
+        make_rgba16f(TEX_LINEAR_COPY, COPY_OFFSET, Vulkan::Nvn::TexFlag::Linear, STRIDE));
+
+    // Submission 1: GPU-clear the LinearRenderTarget texture and GPU-copy a block-linear RGBA16F
+    // texture into the Linear texture.
+    {
+        std::vector<u64> list;
+        VC::ClearTexturePayload clear_rt{};
+        clear_rt.texture = {.serial = TEX_LINEAR_RT, .level = 0, .layer = 0};
+        clear_rt.region = {0, 0, 0, static_cast<s32>(WIDTH), static_cast<s32>(HEIGHT), 1};
+        clear_rt.layer_count = 1;
+        clear_rt.is_integer = 0;
+        const float rt_color[4] = {1.0f, -0.5f, 0.25f, 2.0f};
+        std::memcpy(clear_rt.color, rt_color, sizeof(rt_color));
+        Push(list, VC::Op::ClearTexture, clear_rt, 0xF);
+
+        VC::ClearTexturePayload clear_src{};
+        clear_src.texture = {.serial = TEX_BLOCK_SRC, .level = 0, .layer = 0};
+        clear_src.region = {0, 0, 0, static_cast<s32>(WIDTH), static_cast<s32>(HEIGHT), 1};
+        clear_src.layer_count = 1;
+        clear_src.is_integer = 0;
+        const float src_color[4] = {0.5f, -1.0f, 0.0f, 4.0f};
+        std::memcpy(clear_src.color, src_color, sizeof(src_color));
+        Push(list, VC::Op::ClearTexture, clear_src, 0xF);
+
+        VC::CopyTextureToTexturePayload copy_lin{};
+        copy_lin.src = {.serial = TEX_BLOCK_SRC, .level = 0, .layer = 0};
+        copy_lin.src_region = {0, 0, 0, static_cast<s32>(WIDTH), static_cast<s32>(HEIGHT), 1};
+        copy_lin.dst = {.serial = TEX_LINEAR_COPY, .level = 0, .layer = 0};
+        copy_lin.dst_region = {0, 0, 0, static_cast<s32>(WIDTH), static_cast<s32>(HEIGHT), 1};
+        Push(list, VC::Op::CopyTextureToTexture, copy_lin);
+        PushEnd(list);
+
+        context.Submit(MakeSubmission(1, 0, std::move(list),
+                                      {TEX_LINEAR_RT, TEX_BLOCK_SRC, TEX_LINEAR_COPY}));
+        REQUIRE(context.Wait(1, 20s));
+    }
+
+    {
+        std::scoped_lock lock{log.mutex};
+        REQUIRE(log.seqs == std::vector<u64>{1});
+    }
+
+    const auto check_linear_guest = [&](u64 offset, const std::array<u16, 4>& expected_texel) {
+        const u8* base = tex_mem + offset;
+        for (u32 y = 0; y < HEIGHT; ++y) {
+            const u8* row = base + y * STRIDE;
+            for (u32 x = 0; x < WIDTH; ++x) {
+                std::array<u16, 4> actual{};
+                std::memcpy(actual.data(), row + x * sizeof(actual), sizeof(actual));
+                INFO("y=" << y << " x=" << x << " allow_import=" << allow_import);
+                REQUIRE(actual == expected_texel);
+            }
+            for (u32 b = ROW_BYTES; b < STRIDE; ++b) {
+                INFO("padding y=" << y << " byte=" << b << " allow_import=" << allow_import);
+                REQUIRE(row[b] == ((b & 1) != 0 ? 0xFB : 0xFF));
+            }
+        }
+    };
+
+    // Exact IEEE-754 binary16 encodings for {1.0f, -0.5f, 0.25f, 2.0f} and {0.5f, -1.0f, 0.0f, 4.0f}.
+    const std::array<u16, 4> expected_rt{0x3C00, 0xB800, 0x3400, 0x4000};
+    const std::array<u16, 4> expected_copy{0x3800, 0xBC00, 0x0000, 0x4400};
+    check_linear_guest(RT_OFFSET, expected_rt);
+    check_linear_guest(COPY_OFFSET, expected_copy);
+
+    // Submission 2: Without CPU writes, subsequent GPU reads must still see the GPU contents.
+    {
+        std::vector<u64> list;
+        VC::CopyBufferTexturePayload rb{};
+        rb.buffer = READBACK_VA;
+        rb.texture = {.serial = TEX_LINEAR_RT, .level = 0, .layer = 0};
+        rb.region = {0, 0, 0, static_cast<s32>(WIDTH), static_cast<s32>(HEIGHT), 1};
+        Push(list, VC::Op::CopyTextureToBuffer, rb);
+        PushEnd(list);
+        context.Submit(MakeSubmission(2, 0, std::move(list), {TEX_LINEAR_RT}));
+        REQUIRE(context.Wait(2, 20s));
+    }
+    for (u32 p = 0; p < WIDTH * HEIGHT; ++p) {
+        std::array<u16, 4> actual{};
+        std::memcpy(actual.data(), readback + p * sizeof(actual), sizeof(actual));
+        REQUIRE(actual == expected_rt);
+    }
+
+    // Submission 3: Genuine CPU rewrites followed by NotifyCpuWrite must re-upload cleanly.
+    const std::array<u16, 4> cpu_texel{0x3400, 0x3800, 0x3C00, 0x4000}; // {0.25f, 0.5f, 1.0f, 2.0f}
+    for (u32 y = 0; y < HEIGHT; ++y) {
+        u8* row = tex_mem + RT_OFFSET + y * STRIDE;
+        for (u32 x = 0; x < WIDTH; ++x) {
+            std::memcpy(row + x * sizeof(cpu_texel), cpu_texel.data(), sizeof(cpu_texel));
+        }
+    }
+    context.NotifyCpuWrite(TEX_POOL_VA + RT_OFFSET, HEIGHT * STRIDE);
+    {
+        std::vector<u64> list;
+        VC::CopyBufferTexturePayload rb{};
+        rb.buffer = READBACK_VA + 4096;
+        rb.texture = {.serial = TEX_LINEAR_RT, .level = 0, .layer = 0};
+        rb.region = {0, 0, 0, static_cast<s32>(WIDTH), static_cast<s32>(HEIGHT), 1};
+        Push(list, VC::Op::CopyTextureToBuffer, rb);
+        PushEnd(list);
+        context.Submit(MakeSubmission(3, 0, std::move(list), {TEX_LINEAR_RT}));
+        REQUIRE(context.Wait(3, 20s));
+    }
+    for (u32 p = 0; p < WIDTH * HEIGHT; ++p) {
+        std::array<u16, 4> actual{};
+        std::memcpy(actual.data(), readback + 4096 + p * sizeof(actual), sizeof(actual));
+        REQUIRE(actual == cpu_texel);
+    }
+
+    REQUIRE(context.Stats().ops_failed == 0);
+    context.SetGuestMemory(nullptr);
+}
+
+} // namespace
+
+TEST_CASE("NVN Vulkan: GPU writes to linear textures in CPU-readable pools write back to guest memory",
+          "[nvn]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    SECTION("imported pool") {
+        RunLinearTextureWriteback(*vulkan, true);
+    }
+    SECTION("mirror pool") {
+        RunLinearTextureWriteback(*vulkan, false);
+    }
+}
