@@ -1692,6 +1692,11 @@ u64 DrawGeometryKey(const Tegra::Engines::Maxwell3D& maxwell3d, bool is_indexed)
         mix((u64{draw_state.index_buffer.first} << 32) | draw_state.index_buffer.count);
         mix(draw_state.base_index);
     } else {
+        // Without a vertex stream the count alone is no identity (Switch 2 titles pull their
+        // vertices from storage buffers), so unrelated draws would match.
+        if (!maxwell3d.regs.vertex_streams[0].IsEnabled()) {
+            return 0;
+        }
         mix(maxwell3d.regs.vertex_streams[0].Address());
         mix((u64{draw_state.vertex_buffer.first} << 32) | draw_state.vertex_buffer.count);
     }
@@ -1797,7 +1802,8 @@ void PipelineCache::RecordSkippedGeometry(bool is_indexed,
     last_skipped_geometry_frame = frame_count;
 }
 
-bool PipelineCache::ShouldSkipDepthOnlyGeometry(bool is_indexed) noexcept {
+bool PipelineCache::ShouldSkipDepthOnlyGeometry(bool is_indexed,
+                                                const GraphicsPipeline& pipeline) noexcept {
     if (!maxwell3d || last_skipped_geometry_frame == ~u64{} ||
         frame_count > last_skipped_geometry_frame + 1 ||
         !VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::GeometryConsistency) ||
@@ -1817,7 +1823,15 @@ bool PipelineCache::ShouldSkipDepthOnlyGeometry(bool is_indexed) noexcept {
         }
         if (frame_count <= entry.frame + 1 &&
             (entry.pipeline == nullptr || !entry.pipeline->IsBuilt())) {
-            return true;
+            // Only depth goes missing for a frame or two, unless the draw writes memory or counts
+            // samples for an occlusion query: the game reads those back (Mario Kart World's cups
+            // misread the query results and broke their macros or froze while loading).
+            const bool writes = pipeline.Nx2MayWriteMemory();
+            const bool query = maxwell3d->regs.zpass_pixel_count_enable != 0;
+            LOG_DEBUG(Render_Vulkan,
+                      "Geometry consistency: depth-only draw {} (writes memory {}, query {})",
+                      writes || query ? "kept" : "skipped", writes, query);
+            return !writes && !query;
         }
         entry = {};
         return false;
@@ -2366,7 +2380,7 @@ void PipelineCache::StopShaderPrecache() {
 GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline,
                                                bool is_indexed) noexcept {
     if (pipeline->IsBuilt()) {
-        if (ShouldSkipDepthOnlyGeometry(is_indexed)) {
+        if (ShouldSkipDepthOnlyGeometry(is_indexed, *pipeline)) {
             graphics_miss = "geometry-consistency";
             return nullptr;
         }
