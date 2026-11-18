@@ -128,8 +128,11 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
     // A texture the CPU keeps writing parts of (a glyph atlas) shows new content only in a few
     // lines the signature may not sample: small uncompressed ones and ones that changed before
     // are compared in full at every check. Block-compressed data is rewritten whole (a streamed
-    // tile), so its signature plus the scheduled full compare are enough.
-    constexpr u64 SMALL_STORAGE = u64{4} << 20;
+    // tile), so its signature plus the scheduled full compare are enough. Mario Kart World's
+    // glyph atlas is 1024x8192 R8 (8 MiB): above 4 MiB it only had the scheduled full compare,
+    // whose per-present budget (FULL_HASH_BYTES_PER_PRESENT) the many new textures of a cold
+    // start used up first, so glyphs written then stayed blank.
+    constexpr u64 SMALL_STORAGE = u64{16} << 20;
     const bool compressed = s.desc.format != 0 && FormatBlockInfo(s.desc.format).width > 1;
     const bool every_check = forced || s.dynamic || (size <= SMALL_STORAGE && !compressed);
     bool full = every_check || tick >= s.next_full_tick;
