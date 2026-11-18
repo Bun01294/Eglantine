@@ -296,6 +296,14 @@ private:
 
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};
+    Tegra::Engines::Maxwell3D* graphics_key_engine{};
+    u64 graphics_key_memory{};
+    u64 graphics_key_map{};
+    u64 graphics_key_invalidation{};
+    Maxwell::PrimitiveTopology graphics_key_topology{};
+    Tegra::Engines::Maxwell3D::EngineHint graphics_key_hint{};
+    bool graphics_key_squashed_blend{};
+    bool graphics_key_current{};
     mutable const char* graphics_miss{"no-pipeline"};
 
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.

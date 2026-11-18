@@ -90,7 +90,7 @@ using VideoCommon::GraphicsEnvironment;
 // translated again at boot and written back under the new one. Bump MIN_COMPATIBLE_CACHE_VERSION
 // too only when the record layout (environment or key serialization) changes, which deletes older
 // caches. 20 changed the environment layout; the keys last changed before it.
-constexpr u32 CACHE_VERSION = 34;
+constexpr u32 CACHE_VERSION = 35; // 35: set-bit indexed texture tables get 32-element arrays
 static_assert(CACHE_VERSION == VideoCommon::ShaderWarm::WarmCacheVersion,
               "Shader precache files use the pipeline cache version");
 constexpr u32 MIN_COMPATIBLE_CACHE_VERSION = 20;
@@ -904,18 +904,57 @@ size_t GraphicsFastCacheSlot(const GraphicsPipelineCacheKey& key, size_t size) {
 } // Anonymous namespace
 
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline(bool is_indexed) {
-
+    static constexpr bool reuse_key = true;
+    const bool reuse = reuse_key && maxwell3d->GetNativeMacroEngine().native_turing &&
+                       !maxwell3d->regs.IsMeshEnabled();
+    auto& dirty = maxwell3d->dirty;
+    const bool new_engine = graphics_key_engine != maxwell3d;
+    const u64 memory = reuse ? gpu_memory->GetID() : 0;
+    const u64 map = reuse ? gpu_memory->GetMapSerial() : 0;
+    const u64 invalidation = reuse ? InvalidationSerial() : 0;
+    const auto topology = maxwell3d->draw_manager.draw_state.topology;
+    const auto hint = maxwell3d->engine_state;
+    const bool squashed_blend = Settings::values.use_squashed_iterated_blend;
+    if (reuse && new_engine) {
+        FixedPipelineState::SetupDirtyRegisters(*maxwell3d, dynamic_features);
+    }
+    const bool stages_changed = reuse &&
+        (new_engine || memory != graphics_key_memory || map != graphics_key_map ||
+         invalidation != graphics_key_invalidation);
+    if (stages_changed) {
+        dirty.flags[VideoCommon::Dirty::Shaders] = true;
+    }
+    const bool refresh_state = !reuse || new_engine || dirty.pipeline_state_dirty ||
+                              topology != graphics_key_topology || hint != graphics_key_hint ||
+                              squashed_blend != graphics_key_squashed_blend;
+    if (reuse && !refresh_state && !dirty.flags[VideoCommon::Dirty::Shaders] &&
+        last_shaders_valid && graphics_key_current && current_pipeline != nullptr) {
+        current_pipeline->MarkUsed(frame_count);
+        return BuiltPipeline(current_pipeline, is_indexed);
+    }
+    graphics_key_current = false;
     if (!RefreshStages(graphics_key.unique_hashes)) {
         current_pipeline = nullptr;
         graphics_miss = "stage-rejected";
         return nullptr;
     }
-    graphics_key.state.Refresh(*maxwell3d, dynamic_features);
+    if (refresh_state) {
+        graphics_key.state.Refresh(*maxwell3d, dynamic_features);
+    }
+    graphics_key_engine = reuse ? maxwell3d : nullptr;
+    graphics_key_memory = memory;
+    graphics_key_map = map;
+    graphics_key_invalidation = invalidation;
+    graphics_key_topology = topology;
+    graphics_key_hint = hint;
+    graphics_key_squashed_blend = squashed_blend;
+    dirty.pipeline_state_dirty = false;
 
     if (current_pipeline) {
         GraphicsPipeline* const next{current_pipeline->Next(graphics_key)};
         if (next) {
             current_pipeline = next;
+            graphics_key_current = true;
             current_pipeline->MarkUsed(frame_count);
             return BuiltPipeline(current_pipeline, is_indexed);
         }
@@ -951,6 +990,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline(bool is_indexed) {
                 current_pipeline->AddTransition(pipeline);
             }
             current_pipeline = pipeline;
+            graphics_key_current = true;
             current_pipeline->MarkUsed(frame_count);
             return BuiltPipeline(current_pipeline, is_indexed);
         }
@@ -1997,6 +2037,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath(bool is_indexed
         current_pipeline->AddTransition(pipeline.get());
     }
     current_pipeline = pipeline.get();
+    graphics_key_current = true;
     current_pipeline->MarkUsed(frame_count);
     return BuiltPipeline(current_pipeline, is_indexed);
 }

@@ -795,7 +795,6 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr = dld.vkGetInstanceProcAddr;
     functions.vkGetDeviceProcAddr = dld.vkGetDeviceProcAddr;
-
     VmaAllocatorCreateFlags flags = VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT;
     if (extensions.memory_budget) {
         flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
@@ -869,9 +868,10 @@ VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
         const VmaPoolCreateInfo ci{
             .memoryTypeIndex = memory_type,
             .flags = 0,
-            .blockSize = SeparatePoolBlockSize,
+            .blockSize = kind == SeparatePool::TransientImages ? TransientImageBlockSize
+                                                               : SeparatePoolBlockSize,
             .minBlockCount = 0,
-            .maxBlockCount = 0,
+            .maxBlockCount = kind == SeparatePool::TransientImages ? size_t{2} : size_t{0},
             .priority = 0.f,
             .minAllocationAlignment = 0,
             .pMemoryAllocateNext = nullptr,
