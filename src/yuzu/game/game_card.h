@@ -25,9 +25,6 @@ public:
     QSize sizeHint(const QStyleOptionViewItem& option, const QModelIndex& index) const override;
     void setSize(const QSize& newSize, const QSize& contentSize, const int padding, const int columns);
 
-    /// Draws the Switch 2 or Switch 1 border over each card's icon.
-    void setShowPlatformBorders(bool show);
-
 private:
     static constexpr int cardMargin = 8;
 
@@ -35,5 +32,4 @@ private:
     QSize m_contentSize;
     int m_padding;
     int m_columns;
-    bool m_showPlatformBorders = false;
 };

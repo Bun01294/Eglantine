@@ -225,6 +225,8 @@ struct Values {
     Setting<u8> row_2_text_id{linkage, 2, "row_2_text_id", Category::UiGameList};
     Setting<Settings::GameListMode> game_list_mode{linkage, Settings::GameListMode::TreeView, "game_list_mode", Category::UiGameList};
     Setting<bool> show_game_name{linkage, true, "show_game_name", Category::UiGameList};
+    /// Draws the Switch / Switch 2 frame around game icons in the grid and carousel views.
+    Setting<bool> game_icon_borders{linkage, true, "game_icon_borders", Category::UiGameList};
     Setting<std::string> home_background{linkage, {}, "home_background", Category::UiGameList};
     QStringList recent_home_backgrounds;
 

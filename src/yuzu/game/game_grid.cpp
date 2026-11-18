@@ -12,7 +12,6 @@
 
 GameGrid::GameGrid(QWidget* parent) : QListView{parent} {
     m_gameCard = new GameCard(this);
-    m_gameCard->setShowPlatformBorders(true);
     setItemDelegate(m_gameCard);
 
     setViewMode(QListView::ListMode);

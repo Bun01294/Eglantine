@@ -15,6 +15,7 @@
 
 class HomeBackground;
 class QButtonGroup;
+class QCheckBox;
 class QLabel;
 class QListWidget;
 class QListWidgetItem;
@@ -68,6 +69,7 @@ signals:
     void RecentBackgroundRemoved(const QString& path);
     void GameListModeRequested(Settings::GameListMode mode);
     void GameIconSizeRequested(u32 size);
+    void GameIconBordersRequested(bool show);
 
 protected:
     void OnPaletteChanged() override;
@@ -94,6 +96,7 @@ private:
     QLabel* mode_label = nullptr;
     QButtonGroup* mode_group = nullptr;
     std::array<QToolButton*, 3> mode_buttons{};
+    QCheckBox* border_check = nullptr;
     QLabel* icon_size_title = nullptr;
     QLabel* icon_size_value = nullptr;
     QSlider* icon_size_slider = nullptr;

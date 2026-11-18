@@ -365,6 +365,12 @@ void GameList::SetupCustomization() {
             &GameList::GameListModeRequested);
     connect(customize_panel, &HomeCustomizePanel::GameIconSizeRequested, this,
             &GameList::GameIconSizeRequested);
+    connect(customize_panel, &HomeCustomizePanel::GameIconBordersRequested, this,
+            [this](bool show) {
+                UISettings::values.game_icon_borders = show;
+                grid_view->viewport()->update();
+                carousel_view->viewport()->update();
+            });
 
     customize_button = new FloatingActionButton(surface);
     customize_button->setToolTip(tr("Customize Home Screen"));

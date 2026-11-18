@@ -178,7 +178,7 @@ void GameCard::paint(QPainter* painter, const QStyleOptionViewItem& option,
         painter->restore();
 
         // The platform border sits on top of the icon; its centre is transparent.
-        if (m_showPlatformBorders) {
+        if (UISettings::values.game_icon_borders.GetValue()) {
             const QPixmap border = GetPlatformBorder(
                 index.data(GameListItemPath::Switch2Role).toBool(), iconRect.width(), dpr);
             if (!border.isNull()) {
@@ -275,8 +275,4 @@ void GameCard::setSize(const QSize& newSize, const QSize& contentSize, const int
     m_contentSize = contentSize;
     m_padding = padding;
     m_columns = columns;
-}
-
-void GameCard::setShowPlatformBorders(bool show) {
-    m_showPlatformBorders = show;
 }

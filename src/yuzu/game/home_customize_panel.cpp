@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <QButtonGroup>
+#include <QCheckBox>
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QFileDialog>
@@ -349,6 +350,16 @@ HomeCustomizePanel::HomeCustomizePanel(HomeBackground* background_, QWidget* par
     });
     layout->addLayout(mode_row);
 
+    // The platform frame drawn over game icons; only the icon modes can show it.
+    border_check = new QCheckBox(scroll_content);
+    border_check->setCursor(Qt::PointingHandCursor);
+    connect(border_check, &QCheckBox::toggled, this, [this](bool show) {
+        if (!syncing) {
+            emit GameIconBordersRequested(show);
+        }
+    });
+    layout->addWidget(border_check);
+
     // Icon size
     auto* size_row = new QHBoxLayout;
     icon_size_title = new QLabel(scroll_content);
@@ -396,6 +407,11 @@ void HomeCustomizePanel::SyncFromSettings() {
         icon_size_slider->setValue(IconSizeToStep(icon_size));
     }
     UpdateIconSizeLabel();
+
+    {
+        const QSignalBlocker blocker(border_check);
+        border_check->setChecked(UISettings::values.game_icon_borders.GetValue());
+    }
 
     RefreshRecents();
     drop_zone->update();
@@ -537,6 +553,9 @@ void HomeCustomizePanel::RetranslateUI() {
     mode_buttons[0]->setText(tr("Tree"));
     mode_buttons[1]->setText(tr("Grid"));
     mode_buttons[2]->setText(tr("Carousel"));
+    border_check->setText(tr("Game icon borders"));
+    border_check->setToolTip(tr("Draw the console frame around game icons in the grid and "
+                                "carousel views"));
     icon_size_title->setText(tr("Icon size"));
     UpdateIconSizeLabel();
 }

@@ -6,7 +6,6 @@
 
 #include <QBuffer>
 #include <QCheckBox>
-#include <QCoreApplication>
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -23,7 +22,6 @@
 #include <QPainterPath>
 #include <QPushButton>
 #include <QStyle>
-#include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
 
@@ -267,31 +265,91 @@ private:
     QString full_text;
 };
 
-QToolButton* MakeOverlayButton(QWidget* parent) {
-    auto* button = new QToolButton(parent);
-    button->setFixedSize(OverlayButtonSize, OverlayButtonSize);
-    // At 16 px the brush's handle and bristles collapse into one diagonal stroke.
-    button->setIconSize(QSize(20, 20));
-    button->setCursor(Qt::PointingHandCursor);
-    button->setFocusPolicy(Qt::TabFocus);
-    button->setToolButtonStyle(Qt::ToolButtonIconOnly);
-    return button;
-}
+/// Icon-only button that paints its pill and glyph itself. A styled QToolButton has its frame
+/// and icon laid out by the platform style, which draws the surface smaller than the widget and
+/// scales the glyph down to fit: at 28 px the icon came out at roughly half its size, which read
+/// as broken artwork buttons. Painting both keeps the geometry exact on every style and theme,
+/// and lets the panel own the surface instead of a translucent scrim over the artwork.
+class IconButton : public QToolButton {
+public:
+    enum class Kind {
+        /// Sits on the banner and the game icon.
+        Overlay,
+        /// Secondary control in the action bar.
+        Outline,
+    };
 
-/// Buttons floating on the banner. They use the panel's own surface instead of a translucent
-/// scrim, so they read as controls of the panel rather than as a tinted square of whatever
-/// artwork is behind them, and stay legible on bright banners too.
-QString OverlayButtonStyle(const QPalette& pal) {
-    const QColor text = pal.color(QPalette::WindowText);
-    const QColor surface = pal.color(QPalette::Window);
-    return QStringLiteral(
-        "QToolButton { border: 1px solid %1; border-radius: 8px; background: %2; } "
-        "QToolButton:hover { background: %3; border-color: %4; } "
-        "QToolButton:pressed { background: %5; } "
-        "QToolButton::menu-indicator { image: none; }")
-        .arg(Rgba(WithAlpha(text, 55)), Rgba(WithAlpha(surface, 235)),
-             Rgba(WithAlpha(Emphasized(surface, 135), 245)), Rgba(WithAlpha(text, 110)),
-             Rgba(WithAlpha(Emphasized(surface, 115), 245)));
+    IconButton(Kind kind_, int size, int icon_size, QWidget* parent)
+        : QToolButton{parent}, kind{kind_} {
+        setFixedSize(size, size);
+        setIconSize(QSize(icon_size, icon_size));
+        setCursor(Qt::PointingHandCursor);
+        setFocusPolicy(Qt::TabFocus);
+        setToolButtonStyle(Qt::ToolButtonIconOnly);
+        setAttribute(Qt::WA_Hover);
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing);
+
+        const QPalette& pal = palette();
+        const QColor text = pal.color(QPalette::WindowText);
+        const QColor surface = pal.color(QPalette::Window);
+        const bool hovered = underMouse();
+        const bool pressed = isDown();
+
+        QColor fill;
+        QColor border;
+        if (kind == Kind::Overlay) {
+            if (pressed) {
+                fill = WithAlpha(Emphasized(surface, 115), 245);
+            } else if (hovered) {
+                fill = WithAlpha(Emphasized(surface, 135), 245);
+            } else {
+                fill = WithAlpha(surface, 235);
+            }
+            border = WithAlpha(text, hovered ? 110 : 55);
+        } else {
+            fill = pressed ? WithAlpha(text, 45)
+                           : (hovered ? WithAlpha(text, 25) : QColor(Qt::transparent));
+            border = WithAlpha(text, 60);
+        }
+
+        const QRectF box = QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5);
+        p.setPen(Qt::NoPen);
+        p.setBrush(fill);
+        p.drawRoundedRect(box, 8, 8);
+
+        p.setBrush(Qt::NoBrush);
+        p.setPen(QPen(hasFocus() ? pal.color(QPalette::Highlight) : border, 1));
+        p.drawRoundedRect(box, 8, 8);
+
+        const QSize glyph = iconSize();
+        const QRect glyph_rect(QPoint((width() - glyph.width()) / 2, (height() - glyph.height()) / 2),
+                               glyph);
+        const QIcon::Mode mode = !isEnabled() ? QIcon::Disabled
+                                              : (hovered ? QIcon::Active : QIcon::Normal);
+        icon().paint(&p, glyph_rect, Qt::AlignCenter, mode, QIcon::Off);
+    }
+
+    void enterEvent(QEnterEvent* event) override {
+        update();
+        QToolButton::enterEvent(event);
+    }
+    void leaveEvent(QEvent* event) override {
+        update();
+        QToolButton::leaveEvent(event);
+    }
+
+private:
+    Kind kind;
+};
+
+IconButton* MakeOverlayButton(QWidget* parent) {
+    // At 16 px the brush's handle and bristles collapse into one diagonal stroke.
+    return new IconButton(IconButton::Kind::Overlay, OverlayButtonSize, 20, parent);
 }
 
 /// Secondary button in the panel body. Outlined like the action bar's tool buttons and derived
@@ -461,16 +519,16 @@ void GameDetailsHeader::resizeEvent(QResizeEvent* event) {
 void GameDetailsHeader::RefreshGlyphs() {
     const qreal dpr = devicePixelRatioF();
     const QColor color = palette().color(QPalette::WindowText);
-    const QString style = OverlayButtonStyle(palette());
 
-    for (QToolButton* button : {close_button, banner_edit, icon_edit}) {
-        button->setStyleSheet(style);
-    }
     close_button->setIcon(HomeGlyphs::Close(color, dpr, 20));
     // The brush the home screen already uses to mean "change the artwork", so both panels ask
     // for it with the same symbol.
     banner_edit->setIcon(HomeGlyphs::Brush(color, dpr, 20));
     icon_edit->setIcon(HomeGlyphs::Brush(color, dpr, 20));
+    // The glyphs are palette-derived: repaint the buttons that paint them.
+    for (QToolButton* button : {close_button, banner_edit, icon_edit}) {
+        button->update();
+    }
 }
 
 void GameDetailsHeader::changeEvent(QEvent* event) {
@@ -678,10 +736,7 @@ GameDetailsPanel::GameDetailsPanel(QWidget* parent) : HomeSidePanel{parent} {
     actions->addWidget(play_button, 1);
 
     const auto make_action = [&] {
-        auto* button = new QToolButton(action_bar);
-        button->setFixedSize(ActionButtonHeight, ActionButtonHeight);
-        button->setIconSize(QSize(18, 18));
-        button->setCursor(Qt::PointingHandCursor);
+        auto* button = new IconButton(IconButton::Kind::Outline, ActionButtonHeight, 18, action_bar);
         actions->addWidget(button);
         return button;
     };
@@ -731,43 +786,6 @@ GameDetailsPanel::GameDetailsPanel(QWidget* parent) : HomeSidePanel{parent} {
     RetranslateUI();
     RefreshGlyphs();
 
-    // TEMP GRAB
-    if (const QByteArray path = qgetenv("EGLANTINE_GRAB_PANEL"); !path.isEmpty()) {
-        GameDetailsInfo fake;
-        fake.program_id = 0x0100000000010000ULL;
-        fake.title = QStringLiteral("The Legend of Zelda: Tears of the Kingdom");
-        fake.developer = QStringLiteral("Nintendo");
-        fake.version = QStringLiteral("1.2.1");
-        fake.file_type = QStringLiteral("NSP");
-        fake.size = QStringLiteral("16.4 GiB");
-        fake.play_time = QStringLiteral("42h 10m");
-        fake.path = QStringLiteral("/home/alex/games/totk/totk.nsp");
-        fake.icon = QPixmap(256, 256);
-        fake.icon.fill(QColor(210, 190, 120));
-
-        auto* probe = new QWidget;
-        probe->setAutoFillBackground(true);
-        probe->setBackgroundRole(QPalette::Window);
-        auto* probe_panel = new GameDetailsPanel(probe);
-        probe->resize(GameDetailsPanel::PanelWidth, 980);
-        probe_panel->resize(GameDetailsPanel::PanelWidth, 980);
-        probe_panel->SetGame(fake);
-        probe_panel->SetExtras(GameDetailsExtras{.program_id = fake.program_id,
-                                                 .path = fake.path});
-        probe_panel->technical_toggle->setChecked(true);
-        probe->show();
-        QTimer::singleShot(400, this, [this, probe, path] {
-            qWarning("GEOM precompile %dx%d row %d,%d toggle %dx%d at %d,%d",
-                     precompile_button->width(), precompile_button->height(),
-                     precompile_button->x(), precompile_button->y(),
-                     technical_toggle->width(), technical_toggle->height(),
-                     technical_toggle->x(), technical_toggle->y());
-            probe->grab().save(QString::fromUtf8(path));
-            precompile_button->grab().save(QString::fromUtf8(path) + QStringLiteral(".precompile.png"));
-            technical_toggle->grab().save(QString::fromUtf8(path) + QStringLiteral(".toggle.png"));
-            QCoreApplication::quit();
-        });
-    }
 }
 
 GameDetailsPanel::~GameDetailsPanel() = default;
@@ -1070,15 +1088,6 @@ void GameDetailsPanel::RefreshGlyphs() {
                        "QPushButton:pressed { background: %3; }")
             .arg(QString::number(ActionButtonHeight), Rgba(accent.lighter(112)),
                  Rgba(accent.darker(112))));
-
-    const QString tool_style =
-        QStringLiteral("QToolButton { border: 1px solid %1; border-radius: 8px; "
-                       "background: transparent; } QToolButton:hover { background: %2; } "
-                       "QToolButton::menu-indicator { image: none; }")
-            .arg(Rgba(WithAlpha(text, 60)), Rgba(WithAlpha(text, 25)));
-    configure_button->setStyleSheet(tool_style);
-    favorite_button->setStyleSheet(tool_style);
-    more_button->setStyleSheet(tool_style);
 
     configure_button->setIcon(MakeGlyph(Glyph::Configure, text, dpr));
     favorite_button->setIcon(game.favorite ? MakeGlyph(Glyph::StarFilled, accent, dpr)
