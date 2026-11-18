@@ -509,6 +509,32 @@ HomeCustomizePanel::HomeCustomizePanel(HomeBackground* background_, QWidget* par
     });
     layout->addWidget(border_check);
 
+    // The centered card's share of the carousel view's height.
+    card_size_row = new QWidget(scroll_content);
+    auto* card_size_layout = new QVBoxLayout(card_size_row);
+    card_size_layout->setContentsMargins(0, 0, 0, 0);
+    card_size_layout->setSpacing(8);
+    card_size_label = MakeHeading(card_size_row);
+    card_size_layout->addWidget(card_size_label);
+    auto* card_size_buttons_row = new QHBoxLayout;
+    card_size_buttons_row->setSpacing(8);
+    card_size_group = new QButtonGroup(this);
+    card_size_group->setExclusive(true);
+    for (size_t i = 0; i < card_size_buttons.size(); ++i) {
+        auto* button = new QToolButton(card_size_row);
+        button->setCheckable(true);
+        button->setFixedHeight(28);
+        button->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        card_size_group->addButton(button, static_cast<int>(i));
+        card_size_buttons_row->addWidget(button);
+        card_size_buttons[i] = button;
+    }
+    connect(card_size_group, &QButtonGroup::idClicked, this, [this](int id) {
+        emit CarouselCardSizeRequested(static_cast<u8>(id));
+    });
+    card_size_layout->addLayout(card_size_buttons_row);
+    layout->addWidget(card_size_row);
+
     // Icon size
     auto* size_row = new QHBoxLayout;
     icon_size_title = new QLabel(scroll_content);
@@ -541,6 +567,7 @@ HomeCustomizePanel::HomeCustomizePanel(HomeBackground* background_, QWidget* par
     RetranslateUI();
     RefreshGlyphs();
     SyncFromSettings();
+
 }
 
 void HomeCustomizePanel::SyncFromSettings() {
@@ -549,6 +576,16 @@ void HomeCustomizePanel::SyncFromSettings() {
     const auto mode = UISettings::values.game_list_mode.GetValue();
     for (size_t i = 0; i < Modes.size(); ++i) {
         mode_buttons[i]->setChecked(Modes[i] == mode);
+    }
+
+    // The card size choice only exists in the carousel.
+    card_size_row->setVisible(mode == Settings::GameListMode::CarouselView);
+    size_t size_index = UISettings::values.carousel_card_size.GetValue();
+    if (size_index >= card_size_buttons.size()) {
+        size_index = 0;
+    }
+    for (size_t i = 0; i < card_size_buttons.size(); ++i) {
+        card_size_buttons[i]->setChecked(i == size_index);
     }
 
     const auto kind =
@@ -735,7 +772,14 @@ void HomeCustomizePanel::RetranslateUI() {
     mode_buttons[2]->setText(tr("Carousel"));
     border_check->setText(tr("Game icon borders"));
     border_check->setToolTip(tr("Draw the console frame around game icons in the grid and "
-                                "carousel views"));
+                                 "carousel views"));
+    card_size_label->setText(tr("Card size"));
+    card_size_label->setToolTip(tr("Size of the centered game card in the carousel view"));
+    card_size_buttons[0]->setText(tr("Full"));
+    card_size_buttons[1]->setText(tr("3/4"));
+    card_size_buttons[2]->setText(tr("2/3"));
+    card_size_buttons[3]->setText(tr("1/2"));
+    card_size_buttons[4]->setText(tr("1/3"));
     icon_size_title->setText(tr("Icon size"));
     UpdateIconSizeLabel();
 }

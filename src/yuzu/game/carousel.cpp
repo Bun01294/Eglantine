@@ -216,9 +216,18 @@ CarouselMetrics MetricsFor(const QSize& area) {
     CarouselMetrics m;
     m.names = UISettings::values.show_game_name.GetValue();
     const qreal title = m.names ? TitleReserve : 0.0;
-    m.card_h = std::max<qreal>(MinCenterSize, area.height() - 2 * SideGap - title);
+    // The stored index picks a share of the available height; anything out of range reads as
+    // full, so a stale value can never shrink the card away.
+    const auto fractions = GameCarousel::CardSizeFractions;
+    size_t size_index = UISettings::values.carousel_card_size.GetValue();
+    if (size_index >= fractions.size()) {
+        size_index = 0;
+    }
+    const qreal available = std::max<qreal>(0.0, area.height() - 2 * SideGap - title);
+    m.card_h = std::max<qreal>(MinCenterSize, available * fractions[size_index]);
     m.card_w = m.card_h;
-    m.center = QPointF(area.width() / 2.0, SideGap + m.card_h / 2.0);
+    // The card floats centered in the available height at every size.
+    m.center = QPointF(area.width() / 2.0, SideGap + available / 2.0);
     m.peek = std::clamp(m.card_w * PeekFraction, qreal(28), qreal(64));
     return m;
 }

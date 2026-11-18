@@ -227,6 +227,8 @@ struct Values {
     Setting<bool> show_game_name{linkage, true, "show_game_name", Category::UiGameList};
     /// Draws the Switch / Switch 2 frame around game icons in the grid and carousel views.
     Setting<bool> game_icon_borders{linkage, true, "game_icon_borders", Category::UiGameList};
+    /// The carousel's centered card size: an index into GameCarousel::CardSizeFractions.
+    Setting<u8> carousel_card_size{linkage, 0, "carousel_card_size", Category::UiGameList};
     Setting<std::string> home_background{linkage, {}, "home_background", Category::UiGameList};
     QStringList recent_home_backgrounds;
     /// The home screen background's fill: 0 picture, 1 solid color, 2 two-color gradient.

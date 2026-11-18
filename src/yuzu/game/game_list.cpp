@@ -429,6 +429,12 @@ void GameList::SetupCustomization() {
                 grid_view->viewport()->update();
                 carousel_view->viewport()->update();
             });
+    connect(customize_panel, &HomeCustomizePanel::CarouselCardSizeRequested, this,
+            [this](u8 index) {
+                UISettings::values.carousel_card_size = index;
+                carousel_view->viewport()->update();
+                emit SaveConfig();
+            });
 
     customize_button = new FloatingActionButton(surface);
     customize_button->setToolTip(tr("Customize Home Screen"));

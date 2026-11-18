@@ -94,6 +94,7 @@ signals:
     void GameListModeRequested(Settings::GameListMode mode);
     void GameIconSizeRequested(u32 size);
     void GameIconBordersRequested(bool show);
+    void CarouselCardSizeRequested(u8 index);
 
 protected:
     void OnPaletteChanged() override;
@@ -130,6 +131,10 @@ private:
     QButtonGroup* mode_group = nullptr;
     std::array<QToolButton*, 3> mode_buttons{};
     QCheckBox* border_check = nullptr;
+    QWidget* card_size_row = nullptr;
+    QLabel* card_size_label = nullptr;
+    QButtonGroup* card_size_group = nullptr;
+    std::array<QToolButton*, 5> card_size_buttons{};
     QLabel* icon_size_title = nullptr;
     QLabel* icon_size_value = nullptr;
     QSlider* icon_size_slider = nullptr;

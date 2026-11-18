@@ -6,6 +6,7 @@
 #include <QListView>
 #include <QString>
 
+#include <array>
 #include <vector>
 
 class GameListModel;
@@ -20,6 +21,11 @@ class GameCarousel : public QListView {
     Q_OBJECT
 
 public:
+    /// The centered card's share of the available view height, in the order the
+    /// carousel_card_size setting stores them (full, three quarters, two thirds, half, a
+    /// third). An out-of-range stored index reads as full.
+    static constexpr std::array<qreal, 5> CardSizeFractions{1.0, 0.75, 2.0 / 3.0, 0.5, 1.0 / 3.0};
+
     explicit GameCarousel(QWidget* parent = nullptr);
 
     void SetModel(GameListModel* model);
