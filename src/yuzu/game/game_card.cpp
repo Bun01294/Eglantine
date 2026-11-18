@@ -19,10 +19,12 @@ constexpr int MaxTitleLines = 2;
 /// How far the icon's drop shadow extends past the icon on each side.
 constexpr int ShadowSpread = 6;
 
+} // namespace
+
 /// The platform border for a game icon, scaled to `size` logical pixels and loaded once per
 /// process. Scaling a 1024x1024 pixmap on every card paint is far too slow to scroll at 60 fps,
 /// so the result is cached per size and device pixel ratio.
-QPixmap GetPlatformBorder(bool is_switch2, int size, qreal dpr) {
+QPixmap GameCard::PlatformBorderPixmap(bool is_switch2, int size, qreal dpr) {
     const QString key = QStringLiteral("eglantine-border-%1-%2-%3")
                             .arg(is_switch2 ? QStringLiteral("switch2") : QStringLiteral("switch1"))
                             .arg(size)
@@ -45,6 +47,8 @@ QPixmap GetPlatformBorder(bool is_switch2, int size, qreal dpr) {
     QPixmapCache::insert(key, border);
     return border;
 }
+
+namespace {
 
 /// The soft drop shadow drawn under a game icon: six stacked translucent rounded rects, rendered
 /// once per icon size and device pixel ratio. Drawing them per card per frame costs about as much
@@ -179,7 +183,7 @@ void GameCard::paint(QPainter* painter, const QStyleOptionViewItem& option,
 
         // The platform border sits on top of the icon; its centre is transparent.
         if (UISettings::values.game_icon_borders.GetValue()) {
-            const QPixmap border = GetPlatformBorder(
+            const QPixmap border = GameCard::PlatformBorderPixmap(
                 index.data(GameListItemPath::Switch2Role).toBool(), iconRect.width(), dpr);
             if (!border.isNull()) {
                 painter->drawPixmap(iconRect, border);

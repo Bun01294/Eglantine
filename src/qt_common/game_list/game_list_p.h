@@ -219,9 +219,10 @@ public:
         // Without a picture, data() serves a palette-tinted placeholder instead.
         QPixmap picture;
         if (picture.loadFromData(picture_data.data(), static_cast<u32>(picture_data.size()))) {
-            picture = picture.scaled(size, size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+            // The original resolution, for views that draw icons much larger than the setting.
             setData(picture, OriginalIconRole);
-            setData(picture, Qt::DecorationRole);
+            setData(picture.scaled(size, size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation),
+                    Qt::DecorationRole);
         }
         if (QtCommon::GameArt::HasIcon(program_id)) {
             QPixmap custom(QtCommon::GameArt::IconPath(program_id));

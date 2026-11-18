@@ -14,6 +14,10 @@ class GameCard : public QStyledItemDelegate {
 public:
     explicit GameCard(QObject* parent = nullptr);
 
+    /// The Switch 2 or Switch 1 frame for a game icon, scaled to `size` logical pixels and
+    /// cached per size and device pixel ratio.
+    static QPixmap PlatformBorderPixmap(bool is_switch2, int size, qreal dpr);
+
     void paint(QPainter* painter, const QStyleOptionViewItem& option,
                const QModelIndex& index) const override;
 
