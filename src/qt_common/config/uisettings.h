@@ -229,6 +229,14 @@ struct Values {
     Setting<bool> game_icon_borders{linkage, true, "game_icon_borders", Category::UiGameList};
     Setting<std::string> home_background{linkage, {}, "home_background", Category::UiGameList};
     QStringList recent_home_backgrounds;
+    /// The home screen background's fill: 0 picture, 1 solid color, 2 two-color gradient.
+    Setting<u8> home_background_kind{linkage, 0, "home_background_kind", Category::UiGameList};
+    /// The solid background color, or the gradient's start color, as "#rrggbb".
+    Setting<std::string> home_background_color{linkage, "#313946", "home_background_color",
+                                               Category::UiGameList};
+    /// The gradient's end color, as "#rrggbb".
+    Setting<std::string> home_background_color2{linkage, "#15171e", "home_background_color2",
+                                                Category::UiGameList};
 
     std::atomic_bool is_game_list_reload_pending{false};
     Setting<bool> cache_game_list{linkage, true, "cache_game_list", Category::UiGameList};

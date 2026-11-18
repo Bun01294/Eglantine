@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <QColor>
 #include <QImage>
 #include <QObject>
 #include <QString>
@@ -17,22 +18,42 @@ class QMediaPlayer;
 class QVideoSink;
 #endif
 
-/// The home screen background: a still image, an animated image (GIF, WebP) or, when built with
-/// QtMultimedia, a muted looping video. Consumers paint Frame() and repaint on FrameChanged.
+/// The home screen background: a picture (a still, an animated image or a muted video), a solid
+/// color or a two-color gradient. Consumers paint Frame() for pictures and the kind's colors
+/// otherwise, and repaint on FrameChanged.
 class HomeBackground : public QObject {
     Q_OBJECT
 
 public:
+    /// What the background shows, in the order the home_background_kind setting stores them.
+    enum class Kind : int { Picture, Solid, Gradient };
+
     explicit HomeBackground(QObject* parent = nullptr);
     ~HomeBackground() override;
 
-    /// Loads `path`; an empty path clears the background. Returns false if it could not be loaded.
+    /// Loads `path` and switches back to the picture kind; an empty path clears the picture.
+    /// Returns false if it could not be loaded.
     bool SetSource(const QString& path);
+    /// Fills the background with one color, or with a diagonal blend of two. The loaded picture,
+    /// if any, stays ready for a switch back to the picture kind.
+    void SetSolid(const QColor& color);
+    void SetGradient(const QColor& start, const QColor& end);
     const QString& Source() const {
         return source;
     }
+    Kind GetKind() const {
+        return kind;
+    }
+    /// The solid color, and the gradient's start color.
+    const QColor& Color() const {
+        return color;
+    }
+    /// The gradient's end color.
+    const QColor& Color2() const {
+        return color2;
+    }
     bool IsEmpty() const {
-        return frame.isNull();
+        return kind == Kind::Picture && frame.isNull();
     }
     const QImage& Frame() const {
         return frame;
@@ -48,6 +69,12 @@ public:
     static QImage LoadThumbnail(const QString& path, const QSize& size);
     /// Scales `image` to cover `target`, cropping the overflow evenly on both sides.
     static void PaintCover(QPainter& painter, const QRect& target, const QImage& image);
+    /// The stored kind value; anything outside Picture..Gradient reads as a picture.
+    static Kind KindFromInt(int value) {
+        return value == 1 ? Kind::Solid : value == 2 ? Kind::Gradient : Kind::Picture;
+    }
+    /// Parses a stored "#rrggbb" color; a missing or invalid value falls back to a neutral dark.
+    static QColor ColorFromString(const QString& name);
 
 signals:
     void FrameChanged();
@@ -56,6 +83,9 @@ private:
     void Clear();
     void UpdatePlayback();
 
+    Kind kind = Kind::Picture;
+    QColor color;
+    QColor color2;
     QString source;
     QImage frame;
     bool active = true;

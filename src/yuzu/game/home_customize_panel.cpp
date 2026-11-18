@@ -3,6 +3,7 @@
 
 #include <QButtonGroup>
 #include <QCheckBox>
+#include <QColorDialog>
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QFileDialog>
@@ -36,6 +37,12 @@ constexpr std::array<Settings::GameListMode, 3> Modes{
     Settings::GameListMode::TreeView,
     Settings::GameListMode::GridView,
     Settings::GameListMode::CarouselView,
+};
+
+constexpr std::array<HomeBackground::Kind, 3> Kinds{
+    HomeBackground::Kind::Picture,
+    HomeBackground::Kind::Solid,
+    HomeBackground::Kind::Gradient,
 };
 
 int IconSizeToStep(u32 size) {
@@ -91,6 +98,47 @@ QIcon MakeModeIcon(Settings::GameListMode mode, const QColor& color, qreal dpr) 
         p.drawRoundedRect(QRectF(31, 11, 8, 18), 2, 2);
         p.setBrush(color);
         p.drawRoundedRect(QRectF(11, 6, 18, 28), 3, 3);
+        break;
+    }
+    }
+    return QIcon(pixmap);
+}
+
+QIcon MakeKindIcon(HomeBackground::Kind kind, const QColor& color, qreal dpr) {
+    constexpr int size = 40;
+    QPixmap pixmap(QSize(size, size) * dpr);
+    pixmap.setDevicePixelRatio(dpr);
+    pixmap.fill(Qt::transparent);
+
+    QPainter p(&pixmap);
+    p.setRenderHint(QPainter::Antialiasing);
+    p.setPen(Qt::NoPen);
+
+    switch (kind) {
+    case HomeBackground::Kind::Picture: {
+        // A pale photo frame with a sun and a mountain.
+        QColor frame = color;
+        frame.setAlphaF(color.alphaF() * 0.35);
+        p.setBrush(frame);
+        p.drawRoundedRect(QRectF(4, 4, 32, 32), 3, 3);
+        p.setBrush(color);
+        p.drawEllipse(QRectF(10, 10, 7, 7));
+        p.drawPolygon(QPolygonF{QPointF(8, 31), QPointF(18, 19), QPointF(28, 31)});
+        break;
+    }
+    case HomeBackground::Kind::Solid:
+        p.setBrush(color);
+        p.drawRoundedRect(QRectF(4, 4, 32, 32), 3, 3);
+        break;
+    case HomeBackground::Kind::Gradient: {
+        // A diagonal blend from the full color to a faint tint of it.
+        QLinearGradient blend(QPointF(4, 4), QPointF(36, 36));
+        blend.setColorAt(0.0, color);
+        QColor end = color;
+        end.setAlphaF(color.alphaF() * 0.25);
+        blend.setColorAt(1.0, end);
+        p.setBrush(blend);
+        p.drawRoundedRect(QRectF(4, 4, 32, 32), 3, 3);
         break;
     }
     }
@@ -266,6 +314,49 @@ void BackgroundDropZone::dropEvent(QDropEvent* event) {
     }
 }
 
+ColorSwatchButton::ColorSwatchButton(QWidget* parent) : QPushButton{parent} {
+    setCursor(Qt::PointingHandCursor);
+    setFixedSize(72, 24);
+}
+
+void ColorSwatchButton::SetColor(const QColor& color_) {
+    if (color != color_) {
+        color = color_;
+        update();
+    }
+}
+
+void ColorSwatchButton::paintEvent(QPaintEvent*) {
+    QPainter p(this);
+    p.setRenderHint(QPainter::Antialiasing);
+
+    // The body shows the background color itself; only the border is palette-derived.
+    const QPalette& pal = palette();
+    QColor border = pal.color(QPalette::Text);
+    border.setAlpha(70);
+    if (hasFocus()) {
+        border = pal.color(QPalette::Highlight);
+    } else if (hovered) {
+        border = pal.color(QPalette::Highlight);
+        border.setAlpha(160);
+    }
+    p.setPen(QPen(border, 1));
+    p.setBrush(color.isValid() ? color : pal.color(QPalette::Base));
+    p.drawRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), CornerRadius, CornerRadius);
+}
+
+void ColorSwatchButton::enterEvent(QEnterEvent* event) {
+    hovered = true;
+    update();
+    QPushButton::enterEvent(event);
+}
+
+void ColorSwatchButton::leaveEvent(QEvent* event) {
+    hovered = false;
+    update();
+    QPushButton::leaveEvent(event);
+}
+
 HomeCustomizePanel::HomeCustomizePanel(HomeBackground* background_, QWidget* parent)
     : HomeSidePanel{parent}, background{background_} {
     QWidget* scroll_content = Content();
@@ -290,6 +381,64 @@ HomeCustomizePanel::HomeCustomizePanel(HomeBackground* background_, QWidget* par
     // Background
     background_label = MakeHeading(scroll_content, 1.15);
     layout->addWidget(background_label);
+
+    // The background kind: a picture, a solid color or a two-color gradient.
+    kind_group = new QButtonGroup(this);
+    kind_group->setExclusive(true);
+    auto* kind_row = new QHBoxLayout;
+    kind_row->setSpacing(8);
+    for (size_t i = 0; i < Kinds.size(); ++i) {
+        auto* button = new QToolButton(scroll_content);
+        button->setCheckable(true);
+        button->setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
+        button->setIconSize(QSize(40, 40));
+        button->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        button->setMinimumHeight(84);
+        kind_group->addButton(button, static_cast<int>(i));
+        kind_row->addWidget(button);
+        kind_buttons[i] = button;
+    }
+    connect(kind_group, &QButtonGroup::idClicked, this, [this](int id) {
+        emit BackgroundKindRequested(Kinds[id]);
+    });
+    layout->addLayout(kind_row);
+
+    const auto choose_color = [this](ColorSwatchButton* swatch, int index) {
+        const QColor picked = QColorDialog::getColor(swatch->GetColor(), this,
+                                                    tr("Choose Home Screen Background Color"));
+        if (picked.isValid()) {
+            emit BackgroundColorRequested(index, picked);
+        }
+    };
+    solid_row = new QWidget(scroll_content);
+    auto* solid_layout = new QHBoxLayout(solid_row);
+    solid_layout->setContentsMargins(0, 0, 0, 0);
+    solid_layout->setSpacing(8);
+    solid_label = new QLabel(solid_row);
+    solid_swatch = new ColorSwatchButton(solid_row);
+    solid_layout->addWidget(solid_label);
+    solid_layout->addStretch(1);
+    solid_layout->addWidget(solid_swatch);
+    connect(solid_swatch, &QAbstractButton::clicked, this,
+            [this, choose_color] { choose_color(solid_swatch, 0); });
+    layout->addWidget(solid_row);
+
+    gradient_row = new QWidget(scroll_content);
+    auto* gradient_layout = new QHBoxLayout(gradient_row);
+    gradient_layout->setContentsMargins(0, 0, 0, 0);
+    gradient_layout->setSpacing(8);
+    gradient_label = new QLabel(gradient_row);
+    gradient_swatch_start = new ColorSwatchButton(gradient_row);
+    gradient_swatch_end = new ColorSwatchButton(gradient_row);
+    gradient_layout->addWidget(gradient_label);
+    gradient_layout->addStretch(1);
+    gradient_layout->addWidget(gradient_swatch_start);
+    gradient_layout->addWidget(gradient_swatch_end);
+    connect(gradient_swatch_start, &QAbstractButton::clicked, this,
+            [this, choose_color] { choose_color(gradient_swatch_start, 0); });
+    connect(gradient_swatch_end, &QAbstractButton::clicked, this,
+            [this, choose_color] { choose_color(gradient_swatch_end, 1); });
+    layout->addWidget(gradient_row);
 
     drop_zone = new BackgroundDropZone(background, scroll_content);
     connect(drop_zone, &BackgroundDropZone::BrowseRequested, this, &HomeCustomizePanel::Browse);
@@ -402,6 +551,23 @@ void HomeCustomizePanel::SyncFromSettings() {
         mode_buttons[i]->setChecked(Modes[i] == mode);
     }
 
+    const auto kind =
+        HomeBackground::KindFromInt(UISettings::values.home_background_kind.GetValue());
+    for (size_t i = 0; i < Kinds.size(); ++i) {
+        kind_buttons[i]->setChecked(Kinds[i] == kind);
+    }
+    const QColor color = HomeBackground::ColorFromString(
+        QString::fromStdString(UISettings::values.home_background_color.GetValue()));
+    const QColor color2 = HomeBackground::ColorFromString(
+        QString::fromStdString(UISettings::values.home_background_color2.GetValue()));
+    solid_swatch->SetColor(color);
+    gradient_swatch_start->SetColor(color);
+    gradient_swatch_end->SetColor(color2);
+    // Only the picture kind uses the drop zone; each fill kind shows its own color row.
+    drop_zone->setVisible(kind == HomeBackground::Kind::Picture);
+    solid_row->setVisible(kind == HomeBackground::Kind::Solid);
+    gradient_row->setVisible(kind == HomeBackground::Kind::Gradient);
+
     const u32 icon_size = UISettings::values.game_icon_size.GetValue();
     if (!icon_size_slider->isSliderDown()) {
         icon_size_slider->setValue(IconSizeToStep(icon_size));
@@ -486,10 +652,13 @@ void HomeCustomizePanel::RefreshRecents() {
         }
     }
 
-    // Only offer recents once a background has been used.
+    // Only offer recents once a background has been used, and only while a picture can use them.
     const bool show_recents = paths.size() > 1 || !current.isEmpty();
-    recent_label->setVisible(show_recents);
-    recent_list->setVisible(show_recents);
+    const bool picture =
+        HomeBackground::KindFromInt(UISettings::values.home_background_kind.GetValue()) ==
+        HomeBackground::Kind::Picture;
+    recent_label->setVisible(show_recents && picture);
+    recent_list->setVisible(show_recents && picture);
 
     recent_list->clear();
     for (const QString& path : paths) {
@@ -529,6 +698,9 @@ void HomeCustomizePanel::RefreshGlyphs() {
     for (size_t i = 0; i < Modes.size(); ++i) {
         mode_buttons[i]->setIcon(MakeModeIcon(Modes[i], color, dpr));
     }
+    for (size_t i = 0; i < Kinds.size(); ++i) {
+        kind_buttons[i]->setIcon(MakeKindIcon(Kinds[i], color, dpr));
+    }
     close_button->setIcon(HomeGlyphs::Close(color, dpr));
     title_icon->setPixmap(
         HomeGlyphs::Brush(pal.color(QPalette::Highlight), dpr, 22).pixmap(QSize(22, 22), dpr));
@@ -547,6 +719,14 @@ void HomeCustomizePanel::RetranslateUI() {
     title_label->setText(tr("Customization"));
     background_label->setText(tr("Background"));
     close_button->setToolTip(tr("Close"));
+    kind_buttons[0]->setText(tr("Picture"));
+    kind_buttons[1]->setText(tr("Solid"));
+    kind_buttons[2]->setText(tr("Gradient"));
+    solid_label->setText(tr("Color"));
+    gradient_label->setText(tr("Colors"));
+    solid_swatch->setToolTip(tr("Choose the solid background color"));
+    gradient_swatch_start->setToolTip(tr("Choose the gradient start color"));
+    gradient_swatch_end->setToolTip(tr("Choose the gradient end color"));
     drop_zone->setToolTip(tr("Click to choose a background, or drop an image or video here"));
     recent_label->setText(tr("Recent backgrounds"));
     mode_label->setText(tr("Display Mode"));

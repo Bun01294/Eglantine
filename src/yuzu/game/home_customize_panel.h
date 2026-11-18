@@ -8,12 +8,13 @@
 #include <QFrame>
 #include <QHash>
 #include <QPixmap>
+#include <QPushButton>
 
 #include "common/common_types.h"
 #include "common/settings_enums.h"
+#include "yuzu/game/home_background.h"
 #include "yuzu/game/home_side_panel.h"
 
-class HomeBackground;
 class QButtonGroup;
 class QCheckBox;
 class QLabel;
@@ -52,6 +53,26 @@ private:
     bool drag_active = false;
 };
 
+/// A small push button whose body shows one background color; the panel opens the color dialog.
+class ColorSwatchButton : public QPushButton {
+public:
+    explicit ColorSwatchButton(QWidget* parent = nullptr);
+
+    void SetColor(const QColor& color);
+    const QColor& GetColor() const {
+        return color;
+    }
+
+protected:
+    void paintEvent(QPaintEvent* event) override;
+    void enterEvent(QEnterEvent* event) override;
+    void leaveEvent(QEvent* event) override;
+
+private:
+    QColor color;
+    bool hovered = false;
+};
+
 /// Sidebar opened from the home screen's brush button or context menu. Every change applies
 /// immediately.
 class HomeCustomizePanel : public HomeSidePanel {
@@ -67,6 +88,9 @@ signals:
     /// Empty path means no background.
     void BackgroundChosen(const QString& path);
     void RecentBackgroundRemoved(const QString& path);
+    /// `index` is 0 for the solid color and the gradient's start, 1 for the gradient's end.
+    void BackgroundKindRequested(HomeBackground::Kind kind);
+    void BackgroundColorRequested(int index, const QColor& color);
     void GameListModeRequested(Settings::GameListMode mode);
     void GameIconSizeRequested(u32 size);
     void GameIconBordersRequested(bool show);
@@ -90,6 +114,15 @@ private:
     QLabel* title_label = nullptr;
     QToolButton* close_button = nullptr;
     QLabel* background_label = nullptr;
+    QButtonGroup* kind_group = nullptr;
+    std::array<QToolButton*, 3> kind_buttons{};
+    QWidget* solid_row = nullptr;
+    QLabel* solid_label = nullptr;
+    ColorSwatchButton* solid_swatch = nullptr;
+    QWidget* gradient_row = nullptr;
+    QLabel* gradient_label = nullptr;
+    ColorSwatchButton* gradient_swatch_start = nullptr;
+    ColorSwatchButton* gradient_swatch_end = nullptr;
     BackgroundDropZone* drop_zone = nullptr;
     QLabel* recent_label = nullptr;
     QListWidget* recent_list = nullptr;

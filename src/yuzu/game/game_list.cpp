@@ -76,6 +76,20 @@ public:
 
 protected:
     void paintEvent(QPaintEvent*) override {
+        // A solid or gradient fill paints directly; only a picture needs the scaled cover.
+        const auto kind = background->GetKind();
+        if (kind != HomeBackground::Kind::Picture) {
+            QPainter p(this);
+            if (kind == HomeBackground::Kind::Gradient) {
+                QLinearGradient gradient(rect().topLeft(), rect().bottomRight());
+                gradient.setColorAt(0.0, background->Color());
+                gradient.setColorAt(1.0, background->Color2());
+                p.fillRect(rect(), gradient);
+            } else {
+                p.fillRect(rect(), background->Color());
+            }
+            return;
+        }
         if (background->IsEmpty()) {
             return;
         }
@@ -361,6 +375,50 @@ void GameList::SetupCustomization() {
             &GameList::SetHomeBackground);
     connect(customize_panel, &HomeCustomizePanel::RecentBackgroundRemoved, this,
             &GameList::RemoveRecentBackground);
+
+    // Applies the saved background: the saved picture file for the picture kind, or the saved
+    // colors for a solid or gradient fill.
+    const auto saved_color = [](const Setting<std::string>& setting) {
+        return HomeBackground::ColorFromString(QString::fromStdString(setting.GetValue()));
+    };
+    const auto apply_background = [this, saved_color](HomeBackground::Kind kind) {
+        switch (kind) {
+        case HomeBackground::Kind::Solid:
+            background->SetSolid(saved_color(UISettings::values.home_background_color));
+            break;
+        case HomeBackground::Kind::Gradient:
+            background->SetGradient(saved_color(UISettings::values.home_background_color),
+                                     saved_color(UISettings::values.home_background_color2));
+            break;
+        case HomeBackground::Kind::Picture: {
+            const QString saved =
+                QString::fromStdString(UISettings::values.home_background.GetValue());
+            if (!saved.isEmpty() && !background->SetSource(saved)) {
+                LOG_WARNING(Frontend, "Home screen background {} could not be loaded",
+                            saved.toStdString());
+            }
+            break;
+        }
+        }
+        UpdateViewTransparency();
+    };
+    connect(customize_panel, &HomeCustomizePanel::BackgroundKindRequested, this,
+            [this, apply_background](HomeBackground::Kind kind) {
+                UISettings::values.home_background_kind = static_cast<u8>(kind);
+                apply_background(kind);
+                customize_panel->SyncFromSettings();
+                emit SaveConfig();
+            });
+    connect(customize_panel, &HomeCustomizePanel::BackgroundColorRequested, this,
+            [this, apply_background](int index, const QColor& color) {
+                auto& setting = index == 1 ? UISettings::values.home_background_color2
+                                           : UISettings::values.home_background_color;
+                setting = color.name().toStdString();
+                apply_background(HomeBackground::KindFromInt(
+                    UISettings::values.home_background_kind.GetValue()));
+                customize_panel->SyncFromSettings();
+                emit SaveConfig();
+            });
     connect(customize_panel, &HomeCustomizePanel::GameListModeRequested, this,
             &GameList::GameListModeRequested);
     connect(customize_panel, &HomeCustomizePanel::GameIconSizeRequested, this,
@@ -382,11 +440,9 @@ void GameList::SetupCustomization() {
     search_field->installEventFilter(this);
     PlaceCustomizeButton();
 
-    const QString saved = QString::fromStdString(UISettings::values.home_background.GetValue());
-    if (!saved.isEmpty() && !background->SetSource(saved)) {
-        LOG_WARNING(Frontend, "Home screen background {} could not be loaded", saved.toStdString());
-    }
-    UpdateViewTransparency();
+    // Restore the saved background kind, and with it the saved picture when it is the kind.
+    apply_background(
+        HomeBackground::KindFromInt(UISettings::values.home_background_kind.GetValue()));
 }
 
 void GameList::PlaceCustomizeButton() {

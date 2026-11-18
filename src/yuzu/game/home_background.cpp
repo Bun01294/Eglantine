@@ -108,7 +108,18 @@ void HomeBackground::PaintCover(QPainter& painter, const QRect& target, const QI
     painter.drawImage(QRectF(target), image, source);
 }
 
+QColor HomeBackground::ColorFromString(const QString& name) {
+    const QColor color(name);
+    return color.isValid() ? color : QColor(30, 33, 40);
+}
+
 bool HomeBackground::SetSource(const QString& path) {
+    if (kind != Kind::Picture) {
+        // Selecting a picture switches back to it, even when that picture is already loaded.
+        kind = Kind::Picture;
+        UpdatePlayback();
+        emit FrameChanged();
+    }
     if (path == source && (path.isEmpty() || !frame.isNull())) {
         return true;
     }
@@ -162,6 +173,21 @@ bool HomeBackground::SetSource(const QString& path) {
     return true;
 }
 
+void HomeBackground::SetSolid(const QColor& solid) {
+    kind = Kind::Solid;
+    color = solid;
+    UpdatePlayback();
+    emit FrameChanged();
+}
+
+void HomeBackground::SetGradient(const QColor& start, const QColor& end) {
+    kind = Kind::Gradient;
+    color = start;
+    color2 = end;
+    UpdatePlayback();
+    emit FrameChanged();
+}
+
 void HomeBackground::SetActive(bool active_) {
     if (active == active_) {
         return;
@@ -171,8 +197,10 @@ void HomeBackground::SetActive(bool active_) {
 }
 
 void HomeBackground::UpdatePlayback() {
+    // A fill replaces the picture on screen, so its playback pauses until it shows again.
+    const bool playing = active && kind == Kind::Picture;
     if (movie) {
-        if (!active) {
+        if (!playing) {
             movie->setPaused(true);
         } else if (movie->state() == QMovie::Paused) {
             movie->setPaused(false);
@@ -182,7 +210,7 @@ void HomeBackground::UpdatePlayback() {
     }
 #if YUZU_USE_QT_MULTIMEDIA
     if (player) {
-        if (active) {
+        if (playing) {
             player->play();
         } else {
             player->pause();
