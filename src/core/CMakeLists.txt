@@ -1254,21 +1254,6 @@ target_link_libraries(core PRIVATE
 
 target_link_libraries(core PUBLIC httplib::httplib zstd::zstd)
 
-# Music extraction can encode FLAC when libFLAC is present; without it the feature is
-# WAV-only and the option is hidden in the UI.
-find_package(PkgConfig QUIET)
-if (PKG_CONFIG_FOUND)
-    pkg_check_modules(LIBFLAC QUIET flac)
-endif()
-if (LIBFLAC_FOUND)
-    message(STATUS "libFLAC ${LIBFLAC_VERSION} found, enabling FLAC music extraction")
-    target_include_directories(core PRIVATE ${LIBFLAC_INCLUDE_DIRS})
-    target_compile_definitions(core PRIVATE EGLANTINE_HAS_FLAC=1)
-    target_link_libraries(core PRIVATE ${LIBFLAC_LIBRARIES})
-else()
-    message(STATUS "libFLAC not found, music extraction will be WAV-only")
-endif()
-
 if (ENABLE_WEB_SERVICE)
     target_compile_definitions(core PUBLIC ENABLE_WEB_SERVICE)
     target_link_libraries(core PUBLIC web_service)

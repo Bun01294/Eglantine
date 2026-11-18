@@ -7,6 +7,7 @@
 #include <array>
 #include <cctype>
 #include <charconv>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -26,14 +27,8 @@
 #include "core/file_sys/nup_writer.h"
 #include "core/file_sys/vfs/vfs_real.h"
 
-#ifdef EGLANTINE_HAS_FLAC
-extern "C" {
-#include <FLAC/metadata.h>
-#include <FLAC/stream_encoder.h>
-}
-#endif
-
 #include <opus.h>
+#include <opus_multistream.h>
 
 namespace FileSys::Music {
 
@@ -300,18 +295,18 @@ bool Collect(const std::string& game_path, RealVfsFilesystem& vfs, Collected& co
 // Track classification
 // -------------------------------------------------------------------------------------
 
-std::string KindOf(const std::string& name) {
+Kind KindOf(const std::string& name) {
     const std::string stem = EndsWithCI(name, ".bwav") ? name.substr(0, name.size() - 5) : name;
     if (stem.starts_with("Dm_Title")) {
-        return "title";
+        return Kind::Title;
     }
     if (stem.starts_with("Dm_")) {
-        return "cutscene";
+        return Kind::Cutscene;
     }
     // Layers the game mixes live: close/far ambience, vocal or noise stems, final-lap variants.
     for (const std::string_view marker : {"_Close_", "_Far_", "_Noise", "_Pad", "_Vocal_", "_FL"}) {
         if (stem.find(marker) != std::string::npos) {
-            return "stems";
+            return Kind::Stems;
         }
     }
     // Sequenced parts: intros, loops, jingles, outros and A/B/C sections.
@@ -320,14 +315,14 @@ std::string KindOf(const std::string& name) {
     };
     for (const std::string_view marker : SegmentMarkers) {
         if (stem.find(marker) != std::string::npos) {
-            return "segments";
+            return Kind::Segments;
         }
     }
     if (stem.size() >= 2 && stem.back() >= 'A' && stem.back() <= 'C' &&
         stem[stem.size() - 2] == '_') {
-        return "segments";
+        return Kind::Segments;
     }
-    return "bgm";
+    return Kind::Bgm;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -759,7 +754,7 @@ struct TrackTags {
     std::string_view cover_mime{};
 };
 
-// PNG and JPEG headers carry the pixel size; the FLAC picture block wants it.
+// PNG and JPEG headers carry the pixel size; the OpusTags picture block wants it.
 void ImageInfo(std::span<const u8> data, std::string_view& mime, u32& width, u32& height) {
     mime = {};
     width = height = 0;
@@ -894,114 +889,396 @@ bool WriteWav(const std::filesystem::path& path, const DecodedTrack& track,
     return out.good();
 }
 
-#ifdef EGLANTINE_HAS_FLAC
+// -------------------------------------------------------------------------------------------
+// Ogg Opus output (RFC 7845). The encoder always runs at 48 kHz - Opus is a 48 kHz
+// codec - and the stream's original rate is kept in the OpusHead for reference.
+// -------------------------------------------------------------------------------------
 
-bool WriteFlac(const std::filesystem::path& path, const DecodedTrack& track,
-               const TrackTags& tags) {
-    FLAC__StreamEncoder* encoder = FLAC__stream_encoder_new();
-    if (encoder == nullptr) {
-        return false;
-    }
-    FLAC__stream_encoder_set_channels(encoder, track.channels);
-    FLAC__stream_encoder_set_sample_rate(encoder, track.sample_rate);
-    FLAC__stream_encoder_set_bits_per_sample(encoder, 16);
-    FLAC__stream_encoder_set_compression_level(encoder, 5);
+constexpr u32 OpusRate = 48000;
+constexpr std::size_t OpusFrameSamples = 960; // 20 ms
 
-    // Vorbis comments plus the NUP cover as a front-cover picture block. The blocks
-    // stay alive until the encoder finishes; libFLAC does not copy them.
-    std::vector<FLAC__StreamMetadata*> blocks;
-    FLAC__StreamMetadata* vorbis =
-        FLAC__metadata_object_new(FLAC__METADATA_TYPE_VORBIS_COMMENT);
-    if (vorbis != nullptr) {
-        const auto add_comment = [&vorbis](const char* name, const std::string& value) {
-            if (value.empty()) {
-                return;
-            }
-            FLAC__StreamMetadata_VorbisComment_Entry entry;
-            if (FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(
-                    &entry, name, value.c_str()) != 0) {
-                FLAC__metadata_object_vorbiscomment_append_comment(vorbis, entry, true);
-            }
-        };
-        add_comment("TITLE", tags.title);
-        add_comment("ARTIST", tags.artist);
-        add_comment("ALBUM", tags.album);
-        blocks.push_back(vorbis);
+void PutLE16(std::string& out, u16 value) {
+    out.push_back(static_cast<char>(value & 0xFF));
+    out.push_back(static_cast<char>(value >> 8));
+}
+
+void PutLE32(std::string& out, u32 value) {
+    for (int shift = 0; shift < 32; shift += 8) {
+        out.push_back(static_cast<char>((value >> shift) & 0xFF));
     }
-    FLAC__StreamMetadata* picture = nullptr;
-    if (!tags.cover.empty() && !tags.cover_mime.empty()) {
-        picture = FLAC__metadata_object_new(FLAC__METADATA_TYPE_PICTURE);
+}
+
+// The Ogg page CRC: the non-reflected CRC-32 with polynomial 0x04c11db7, no final
+// xor, computed over the header with the CRC field zeroed plus the page body.
+u32 OggCrcUpdate(u32 crc, const u8* data, std::size_t size) {
+    static const auto table = [] {
+        std::array<u32, 256> out{};
+        for (u32 i = 0; i < 256; ++i) {
+            u32 value{i << 24};
+            for (int bit = 0; bit < 8; ++bit) {
+                value = (value & 0x80000000) != 0 ? (value << 1) ^ 0x04c11db7 : value << 1;
+            }
+            out[i] = value;
+        }
+        return out;
+    }();
+    for (std::size_t i = 0; i < size; ++i) {
+        crc = (crc << 8) ^ table[(crc >> 24) ^ data[i]];
     }
-    if (picture != nullptr) {
+    return crc;
+}
+
+// Pages packets out to a file (RFC 3533). A packet bigger than a page's lacing
+// capacity - the tags packet when the cover art is large - is split across
+// pages with the continued flag; audio packets (20 ms each) never span.
+class OggWriter {
+public:
+    OggWriter(std::ofstream& out, u32 serial, u16 preskip)
+        : out(out), serial(serial), preskip(preskip) {}
+
+    // A header packet (OpusHead, OpusTags); its pages carry granule 0.
+    bool WriteHeader(std::string_view packet) {
+        header_pages = true;
+        return Place(reinterpret_cast<const u8*>(packet.data()), packet.size()) && FlushPage();
+    }
+
+    // A whole audio packet; a page closes once its body fills up, its granule
+    // counting the samples of every packet completed so far.
+    bool AddAudio(std::string_view packet, std::size_t samples) {
+        header_pages = false;
+        pending_samples += static_cast<s64>(samples);
+        if (!Place(reinterpret_cast<const u8*>(packet.data()), packet.size())) {
+            return false;
+        }
+        samples_done += pending_samples;
+        pending_samples = 0;
+        return body.size() < 32 * 1024 || FlushPage();
+    }
+
+    bool Finish() {
+        return FlushPage(true);
+    }
+
+private:
+    // Lacing values for the whole packet: runs of 255 closed by a remainder
+    // (0 when the size is a whole multiple of 255). A packet larger than a
+    // page's 255-entry lacing table spans pages, the continued flag set on
+    // each page that starts inside it.
+    bool Place(const u8* data, std::size_t size) {
+        std::vector<u8> values;
+        std::size_t left = size;
+        while (left >= 255) {
+            values.push_back(255);
+            left -= 255;
+        }
+        values.push_back(static_cast<u8>(left));
+        open_packet = true;
+        std::size_t at = 0;
+        for (const u8 value : values) {
+            if (lacing.size() == 255 && !FlushPage()) {
+                return false;
+            }
+            lacing.push_back(value);
+            body.append(reinterpret_cast<const char*>(data + at), value);
+            at += value;
+        }
+        open_packet = false;
+        return out.good();
+    }
+
+    bool FlushPage(bool eos = false) {
+        u8 flags = 0;
+        if (first_page) {
+            flags |= 0x02;
+        }
+        if (page_starts_continued) {
+            flags |= 0x01;
+        }
+        if (eos) {
+            flags |= 0x04;
+        }
+        const s64 granule = header_pages ? 0 : preskip + samples_done;
+        std::array<u8, 27> header{};
+        std::memcpy(header.data(), "OggS", 4);
+        header[5] = flags;
+        std::memcpy(header.data() + 6, &granule, sizeof(granule));
+        std::memcpy(header.data() + 14, &serial, sizeof(serial));
+        std::memcpy(header.data() + 18, &page_sequence, sizeof(page_sequence));
+        header[26] = static_cast<u8>(lacing.size());
+        // The CRC covers the header with the CRC field zeroed, then the lacing table
+        // and the body (RFC 3533 6.1).
+        u32 crc = OggCrcUpdate(0, header.data(), header.size());
+        crc = OggCrcUpdate(crc, lacing.data(), lacing.size());
+        crc = OggCrcUpdate(crc, reinterpret_cast<const u8*>(body.data()), body.size());
+        std::memcpy(header.data() + 22, &crc, sizeof(crc));
+        out.write(reinterpret_cast<const char*>(header.data()),
+                  static_cast<std::streamsize>(header.size()));
+        out.write(reinterpret_cast<const char*>(lacing.data()),
+                  static_cast<std::streamsize>(lacing.size()));
+        out.write(body.data(), static_cast<std::streamsize>(body.size()));
+        ++page_sequence;
+        lacing.clear();
+        body.clear();
+        first_page = false;
+        page_starts_continued = open_packet;
+        return out.good();
+    }
+
+    std::ofstream& out;
+    u32 serial;
+    u16 preskip;
+    bool header_pages{true};
+    bool open_packet{false};
+    bool page_starts_continued{false};
+    s64 samples_done{};
+    s64 pending_samples{};
+    u32 page_sequence{};
+    bool first_page{true};
+    std::vector<u8> lacing;
+    std::string body;
+};
+
+// Linear interpolation on the way up, box averaging on the way down: enough for
+// feeding a lossy encoder whose sources are DSP- or Opus-compressed already.
+std::vector<s16> ResampleTo48k(const std::vector<s16>& pcm, u16 channels, u32 from_rate) {
+    if (from_rate == OpusRate || channels == 0 || pcm.empty()) {
+        return pcm;
+    }
+    const std::size_t frames = pcm.size() / channels;
+    if (frames == 0) {
+        return pcm;
+    }
+    const double ratio = static_cast<double>(OpusRate) / from_rate;
+    const std::size_t out_frames =
+        static_cast<std::size_t>(std::llround(static_cast<double>(frames) * ratio));
+    std::vector<s16> out(out_frames * channels);
+    if (ratio > 1.0) {
+        const double step = 1.0 / ratio;
+        for (std::size_t frame = 0; frame < out_frames; ++frame) {
+            const double pos = frame * step;
+            const std::size_t left =
+                std::min<std::size_t>(static_cast<std::size_t>(pos), frames - 1);
+            const std::size_t right = std::min(left + 1, frames - 1);
+            const double frac = std::min(pos - left, 1.0);
+            for (u16 ch = 0; ch < channels; ++ch) {
+                const double a = pcm[left * channels + ch];
+                const double b = pcm[right * channels + ch];
+                out[frame * channels + ch] =
+                    static_cast<s16>(std::lround(a + (b - a) * frac));
+            }
+        }
+    } else {
+        const double step = 1.0 / ratio;
+        for (std::size_t frame = 0; frame < out_frames; ++frame) {
+            const std::size_t begin =
+                std::min<std::size_t>(static_cast<std::size_t>(frame * step), frames - 1);
+            const std::size_t end =
+                std::min<std::size_t>(static_cast<std::size_t>((frame + 1) * step) + 1, frames);
+            for (u16 ch = 0; ch < channels; ++ch) {
+                s64 sum = 0;
+                for (std::size_t i = begin; i < end; ++i) {
+                    sum += pcm[i * channels + ch];
+                }
+                out[frame * channels + ch] =
+                    static_cast<s16>(std::lround(static_cast<double>(sum) / (end - begin)));
+            }
+        }
+    }
+    return out;
+}
+
+std::string Base64(const std::string& data) {
+    static constexpr std::string_view alphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((data.size() + 2) / 3 * 4);
+    u32 buffer = 0;
+    int bits = 0;
+    for (const char c : data) {
+        buffer = (buffer << 8) | static_cast<u8>(c);
+        bits += 8;
+        while (bits >= 6) {
+            bits -= 6;
+            out.push_back(alphabet[(buffer >> bits) & 0x3F]);
+        }
+    }
+    if (bits > 0) {
+        out.push_back(alphabet[(buffer << (6 - bits)) & 0x3F]);
+    }
+    while (out.size() % 4 != 0) {
+        out.push_back('=');
+    }
+    return out;
+}
+
+// The OpusTags cover picture uses the FLAC picture block layout inside base64.
+std::string MakePictureBlock(std::span<const u8> cover, std::string_view mime, u32 width,
+                             u32 height) {
+    std::string out;
+    const auto put_be32 = [&out](u32 value) {
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            out.push_back(static_cast<char>((value >> shift) & 0xFF));
+        }
+    };
+    put_be32(3); // front cover
+    put_be32(static_cast<u32>(mime.size()));
+    out.append(mime);
+    put_be32(0); // empty description
+    put_be32(width);
+    put_be32(height);
+    put_be32(24); // depth
+    put_be32(0);  // colors
+    put_be32(static_cast<u32>(cover.size()));
+    out.append(reinterpret_cast<const char*>(cover.data()), cover.size());
+    return out;
+}
+
+std::string MakeOpusTags(const TrackTags& tags) {
+    std::string out = "OpusTags";
+    const std::string_view vendor = "Eglantine music extraction";
+    PutLE32(out, static_cast<u32>(vendor.size()));
+    out.append(vendor);
+    std::vector<std::string> comments;
+    const auto add = [&comments](std::string_view name, const std::string& value) {
+        if (!value.empty()) {
+            comments.push_back(fmt::format("{}={}", name, value));
+        }
+    };
+    add("TITLE", tags.title);
+    add("ARTIST", tags.artist);
+    add("ALBUM", tags.album);
+    if (!tags.cover.empty()) {
         std::string_view mime;
         u32 width{};
         u32 height{};
         ImageInfo(tags.cover, mime, width, height);
         if (!mime.empty()) {
-            const std::string mime_text{mime};
-            FLAC__StreamMetadata_Picture& picture_data = picture->data.picture;
-            picture_data.type = FLAC__STREAM_METADATA_PICTURE_TYPE_FRONT_COVER;
-            FLAC__metadata_object_picture_set_mime_type(
-                picture, const_cast<char*>(mime_text.c_str()), true);
-            FLAC__byte empty_description[] = "";
-            FLAC__metadata_object_picture_set_description(picture, empty_description, true);
-            picture_data.width = width;
-            picture_data.height = height;
-            picture_data.depth = 24;
-            picture_data.colors = 0;
-            FLAC__metadata_object_picture_set_data(
-                picture, const_cast<FLAC__byte*>(tags.cover.data()),
-                static_cast<u32>(tags.cover.size()), true);
-            blocks.push_back(picture);
+            comments.push_back("METADATA_BLOCK_PICTURE=" +
+                              Base64(MakePictureBlock(tags.cover, mime, width, height)));
         }
     }
-    if (!blocks.empty()) {
-        FLAC__stream_encoder_set_metadata(encoder, blocks.data(),
-                                          static_cast<u32>(blocks.size()));
+    PutLE32(out, static_cast<u32>(comments.size()));
+    for (const std::string& comment : comments) {
+        PutLE32(out, static_cast<u32>(comment.size()));
+        out.append(comment);
     }
-
-    bool ok = FLAC__stream_encoder_init_file(encoder, path.c_str(), nullptr, nullptr) ==
-              FLAC__STREAM_ENCODER_INIT_STATUS_OK;
-    if (ok) {
-        const std::size_t frames_per_chunk = 65536;
-        std::vector<FLAC__int32> buffer(frames_per_chunk * track.channels);
-        const std::size_t total_frames = track.pcm.size() / track.channels;
-        for (std::size_t start = 0; start < total_frames && ok; start += frames_per_chunk) {
-            const std::size_t count = std::min(frames_per_chunk, total_frames - start);
-            for (std::size_t i = 0; i < count * track.channels; ++i) {
-                buffer[i] = track.pcm[start * track.channels + i];
-            }
-            ok = FLAC__stream_encoder_process_interleaved(
-                encoder, buffer.data(), static_cast<unsigned>(count));
-        }
-        ok = ok && FLAC__stream_encoder_finish(encoder);
-    }
-    if (picture != nullptr) {
-        FLAC__metadata_object_delete(picture);
-    }
-    if (vorbis != nullptr) {
-        FLAC__metadata_object_delete(vorbis);
-    }
-    FLAC__stream_encoder_delete(encoder);
-    return ok;
+    return out;
 }
 
-#endif // EGLANTINE_HAS_FLAC
+bool WriteOpus(const std::filesystem::path& path, const DecodedTrack& track,
+               const TrackTags& tags) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        return false;
+    }
+    const std::vector<s16> pcm = ResampleTo48k(track.pcm, track.channels, track.sample_rate);
+    const std::size_t frames = track.channels == 0 ? 0 : pcm.size() / track.channels;
+    if (frames == 0) {
+        return false;
+    }
+
+    // Mono and stereo through the plain encoder; wider layouts as uncoupled
+    // multistream so every channel survives.
+    int opus_error = OPUS_OK;
+    using EncoderPtr = std::unique_ptr<OpusEncoder, void (*)(OpusEncoder*)>;
+    using MsEncoderPtr = std::unique_ptr<OpusMSEncoder, void (*)(OpusMSEncoder*)>;
+    EncoderPtr encoder{nullptr, &opus_encoder_destroy};
+    MsEncoderPtr ms_encoder{nullptr, &opus_multistream_encoder_destroy};
+    std::vector<unsigned char> mapping;
+    if (track.channels <= 2) {
+        encoder.reset(opus_encoder_create(OpusRate, track.channels, OPUS_APPLICATION_AUDIO,
+                                           &opus_error));
+    } else {
+        mapping.resize(track.channels);
+        for (u16 ch = 0; ch < track.channels; ++ch) {
+            mapping[ch] = ch;
+        }
+        ms_encoder.reset(opus_multistream_encoder_create(OpusRate, track.channels,
+                                                         track.channels, 0, mapping.data(),
+                                                         OPUS_APPLICATION_AUDIO, &opus_error));
+    }
+    if (opus_error != OPUS_OK || (!encoder && !ms_encoder)) {
+        return false;
+    }
+    // Game audio through a lossy encoder: 96 kbps stereo keeps the mix transparent
+    // at a fraction of the WAV size.
+    const opus_int32 bitrate = track.channels == 1   ? 64000
+                               : track.channels == 2 ? 96000
+                                                    : 48000 * track.channels;
+    opus_int32 lookahead = 0;
+    if (encoder) {
+        opus_encoder_ctl(encoder.get(), OPUS_SET_BITRATE(bitrate));
+        opus_encoder_ctl(encoder.get(), OPUS_GET_LOOKAHEAD(&lookahead));
+    } else {
+        opus_multistream_encoder_ctl(ms_encoder.get(), OPUS_SET_BITRATE(bitrate));
+        opus_multistream_encoder_ctl(ms_encoder.get(), OPUS_GET_LOOKAHEAD(&lookahead));
+    }
+    const u16 preskip = static_cast<u16>(std::clamp<opus_int32>(lookahead, 0, 0xFFFF));
+
+    std::string head = "OpusHead";
+    head.push_back('\x01'); // version
+    head.push_back(static_cast<char>(track.channels));
+    PutLE16(head, preskip);
+    PutLE32(head, track.sample_rate); // informational
+    PutLE16(head, 0);                 // output gain
+    if (mapping.empty()) {
+        head.push_back('\x00');
+    } else {
+        // Family 1: uncoupled streams, one per channel, identity mapping.
+        head.push_back('\x01');
+        head.push_back(static_cast<char>(mapping.size()));
+        head.push_back('\x00');
+        head.append(reinterpret_cast<const char*>(mapping.data()), mapping.size());
+    }
+
+    // Players trim through the granule position, so one stream's serial is enough.
+    const u32 serial =
+        static_cast<u32>(Common::CityHash64(tags.title.data(), tags.title.size()) ^ pcm.size()) |
+        1;
+    OggWriter writer(out, serial, preskip);
+    if (!writer.WriteHeader(head) || !writer.WriteHeader(MakeOpusTags(tags))) {
+        return false;
+    }
+
+    std::vector<u8> packet(1275 * track.channels + 16);
+    std::vector<s16> frame(OpusFrameSamples * track.channels);
+    for (std::size_t start = 0; start < frames; start += OpusFrameSamples) {
+        const std::size_t count = std::min(OpusFrameSamples, frames - start);
+        // The tail is zero-padded into a whole 20 ms frame; the granule position
+        // keeps the true sample count so the padding never plays.
+        std::fill(frame.begin(), frame.end(), s16{});
+        std::memcpy(frame.data(), pcm.data() + start * track.channels,
+                    count * track.channels * sizeof(s16));
+        const opus_int32 size =
+            encoder != nullptr
+                ? opus_encode(encoder.get(), frame.data(),
+                              static_cast<opus_int32>(OpusFrameSamples), packet.data(),
+                              static_cast<opus_int32>(packet.size()))
+                : opus_multistream_encode(ms_encoder.get(), frame.data(),
+                                          static_cast<opus_int32>(OpusFrameSamples),
+                                          packet.data(), static_cast<opus_int32>(packet.size()));
+        if (size <= 0) {
+            return false;
+        }
+        if (!writer.AddAudio(std::string_view{reinterpret_cast<const char*>(packet.data()),
+                                               static_cast<std::size_t>(size)},
+                             count)) {
+            return false;
+        }
+    }
+    return writer.Finish();
+}
 
 bool WriteEncoded(const std::filesystem::path& path, const DecodedTrack& track,
                   Encoding encoding, const TrackTags& tags) {
-    if (encoding == Encoding::Flac) {
-#ifdef EGLANTINE_HAS_FLAC
-        return WriteFlac(path, track, tags);
-#else
-        return false;
-#endif
+    if (encoding == Encoding::Opus) {
+        return WriteOpus(path, track, tags);
     }
     return WriteWav(path, track, tags);
 }
 
 std::string_view ExtensionOf(Encoding encoding) {
-    return encoding == Encoding::Flac ? ".flac" : ".wav";
+    return encoding == Encoding::Opus ? ".opus" : ".wav";
 }
 
 std::string CsvEscape(std::string_view value) {
@@ -1035,12 +1312,21 @@ u64 TrackDigest(const std::vector<s16>& pcm) {
 
 } // namespace
 
-bool HasFlacSupport() {
-#ifdef EGLANTINE_HAS_FLAC
-    return true;
-#else
-    return false;
-#endif
+std::string_view KindName(Kind kind) {
+    switch (kind) {
+    case Kind::Bgm:
+        return "bgm";
+    case Kind::Cutscene:
+        return "cutscene";
+    case Kind::Title:
+        return "title";
+    case Kind::Segments:
+        return "segments";
+    case Kind::Stems:
+        return "stems";
+    default:
+        return "";
+    }
 }
 
 bool ScanMusic(const std::string& game_path, SourceInfo& info) {
@@ -1055,6 +1341,7 @@ bool ScanMusic(const std::string& game_path, SourceInfo& info) {
     info.stream_count = collected.entries.size();
     info.cover = collected.icon;
     for (const auto& entry : collected.entries) {
+        info.kind_counts[static_cast<std::size_t>(KindOf(entry.name))]++;
         info.stream_bytes += entry.file != nullptr ? entry.file->GetSize() : 0;
     }
     return true;
@@ -1077,6 +1364,27 @@ Result ExtractMusic(const std::string& game_path, const Options& options,
         if (error_out != nullptr) {
             *error_out = "no music streams found (looked for BGM_/Dm_/ExampleMelody_ .bwav "
                          "under Sound/Resource/Stream)";
+        }
+        return Result::NoMusic;
+    }
+    if (std::none_of(options.kinds.begin(), options.kinds.end(), [](bool on) { return on; })) {
+        if (error_out != nullptr) {
+            *error_out = "no track kinds selected";
+        }
+        return Result::NoMusic;
+    }
+    // Drop the streams of unselected kinds so the totals, the output names and the
+    // manifest describe exactly what gets written.
+    for (std::size_t index = collected.entries.size(); index-- > 0;) {
+        if (!options.kinds[static_cast<std::size_t>(KindOf(collected.entries[index].name))]) {
+            collected.entries.erase(collected.entries.begin() +
+                                    static_cast<std::ptrdiff_t>(index));
+        }
+    }
+    if (collected.entries.empty()) {
+        if (error_out != nullptr) {
+            *error_out = "no streams of the selected kinds (music, cutscene, title, "
+                         "segments, stems)";
         }
         return Result::NoMusic;
     }
@@ -1181,7 +1489,7 @@ Result ExtractMusic(const std::string& game_path, const Options& options,
             }
         }
 
-        const std::string kind = KindOf(entry.name);
+        const std::string_view kind = KindName(KindOf(entry.name));
         const std::string output_rel =
             plan.folder.empty() ? plan.file_name : plan.folder + "/" + plan.file_name;
 

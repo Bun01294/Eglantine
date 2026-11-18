@@ -4962,6 +4962,7 @@ void MainWindow::OnGameListExtractMusic(const std::string& game_path) {
     options.out_dir = dialog.OutDir();
     options.layout = dialog.Layout();
     options.encoding = dialog.Encoding();
+    options.kinds = dialog.Kinds();
     options.cover_override = dialog.CoverOverride();
     if (options.out_dir.empty()) {
         return;

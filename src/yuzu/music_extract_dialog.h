@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <filesystem>
 #include <vector>
 
@@ -10,6 +11,7 @@
 
 #include "core/file_sys/music_extract.h"
 
+class QCheckBox;
 class QComboBox;
 class QLabel;
 class QLineEdit;
@@ -17,8 +19,9 @@ class QPushButton;
 class QRadioButton;
 
 // Asks where the music of a NUP archive or loose dump goes and how it is written:
-// output folder, WAV or FLAC, subfolders by kind or a flat directory, and the cover
-// art embedded into every track (the NUP icon by default, or a chosen image).
+// output folder, which kinds of stream (music, cutscenes, ...), WAV or Opus,
+// subfolders by scene or a flat directory, and the cover art embedded into every
+// track (the NUP icon by default, or a chosen image).
 class MusicExtractDialog : public QDialog {
     Q_OBJECT
 public:
@@ -27,6 +30,8 @@ public:
     std::filesystem::path OutDir() const;
     FileSys::Music::Layout Layout() const;
     FileSys::Music::Encoding Encoding() const;
+    // Which kinds of stream to write, one entry per FileSys::Music::Kind.
+    std::array<bool, FileSys::Music::KindCount> Kinds() const;
     // Empty when the NUP's own icon should be used (or none when it has no icon).
     const std::vector<u8>& CoverOverride() const;
 
@@ -39,6 +44,7 @@ private:
 
     QLineEdit* out_edit;
     QComboBox* encoding_combo;
+    std::array<QCheckBox*, FileSys::Music::KindCount> kind_boxes{};
     QRadioButton* layout_tree;
     QRadioButton* layout_flat;
     QPushButton* ok_button;

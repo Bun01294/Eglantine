@@ -3,6 +3,7 @@
 
 #include "yuzu/music_extract_dialog.h"
 
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QDir>
@@ -10,6 +11,7 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
+#include <QGridLayout>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
@@ -18,6 +20,7 @@
 #include <QStandardPaths>
 #include <QVBoxLayout>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -44,6 +47,19 @@ std::vector<u8> ReadImageBytes(const QString& path) {
     std::ifstream in(path.toStdString(), std::ios::binary);
     return {std::istreambuf_iterator<char>(in), {}};
 }
+
+// One checkbox per stream kind, in FileSys::Music::Kind order.
+struct KindChoice {
+    const char* label;
+    const char* tooltip;
+};
+constexpr std::array<KindChoice, FileSys::Music::KindCount> KindRows{{
+    {"Music", "The BGM_ songs played during normal play."},
+    {"Cutscenes", "Dm_ cutscene music."},
+    {"Title", "The title screen performance (Dm_Title)."},
+    {"Segments", "Intros, loops, jingles and other sequenced parts of a song."},
+    {"Stems", "Close and far ambience, vocal and noise layers the game mixes live."},
+}};
 
 } // namespace
 
@@ -79,9 +95,32 @@ MusicExtractDialog::MusicExtractDialog(const FileSys::Music::SourceInfo& info,
 
     encoding_combo = new QComboBox;
     encoding_combo->addItem(tr("WAV (PCM 16-bit)"), int(FileSys::Music::Encoding::Wav));
-    if (FileSys::Music::HasFlacSupport()) {
-        encoding_combo->addItem(tr("FLAC (lossless)"), int(FileSys::Music::Encoding::Flac));
+    encoding_combo->addItem(tr("Opus (compact)"), int(FileSys::Music::Encoding::Opus));
+    encoding_combo->setItemData(
+        1, tr("Ogg Opus at 48 kHz; roughly a tenth of the WAV size for the same game audio."),
+        Qt::ToolTipRole);
+
+    // Which kinds of stream come out; each shows how many this game holds, and kinds
+    // with nothing to write are disabled rather than hidden.
+    auto* kinds_grid = new QGridLayout;
+    kinds_grid->setContentsMargins(0, 0, 0, 0);
+    kinds_grid->setHorizontalSpacing(12);
+    kinds_grid->setVerticalSpacing(4);
+    for (std::size_t index = 0; index < KindRows.size(); ++index) {
+        const KindChoice& choice = KindRows[index];
+        auto* box = new QCheckBox(tr("%1 (%2)")
+                                      .arg(tr(choice.label))
+                                      .arg(info.kind_counts[index]));
+        box->setToolTip(tr(choice.tooltip));
+        box->setChecked(info.kind_counts[index] > 0);
+        box->setEnabled(info.kind_counts[index] > 0);
+        connect(box, &QCheckBox::toggled, this, &MusicExtractDialog::UpdateOkEnabled);
+        kind_boxes[index] = box;
+        kinds_grid->addWidget(box, static_cast<int>(index / 3),
+                              static_cast<int>(index % 3));
     }
+    auto* kinds_holder = new QWidget;
+    kinds_holder->setLayout(kinds_grid);
 
     layout_tree =
         new QRadioButton(tr("Sort into subfolders (one per area, scene or category)"));
@@ -113,6 +152,7 @@ MusicExtractDialog::MusicExtractDialog(const FileSys::Music::SourceInfo& info,
     UpdateCoverLabel();
 
     auto* form = new QFormLayout;
+    form->addRow(tr("Extract:"), kinds_holder);
     form->addRow(tr("Encoding:"), encoding_combo);
     form->addRow(tr("Structure:"), structure_holder);
     form->addRow(tr("Cover art:"), cover_holder);
@@ -180,7 +220,10 @@ void MusicExtractDialog::UpdateCoverLabel() {
 }
 
 void MusicExtractDialog::UpdateOkEnabled() {
-    ok_button->setEnabled(!out_edit->text().trimmed().isEmpty());
+    const bool any_kind =
+        std::any_of(kind_boxes.begin(), kind_boxes.end(),
+                    [](const QCheckBox* box) { return box->isChecked(); });
+    ok_button->setEnabled(!out_edit->text().trimmed().isEmpty() && any_kind);
 }
 
 std::filesystem::path MusicExtractDialog::OutDir() const {
@@ -194,6 +237,14 @@ FileSys::Music::Layout MusicExtractDialog::Layout() const {
 
 FileSys::Music::Encoding MusicExtractDialog::Encoding() const {
     return static_cast<FileSys::Music::Encoding>(encoding_combo->currentData().toInt());
+}
+
+std::array<bool, FileSys::Music::KindCount> MusicExtractDialog::Kinds() const {
+    std::array<bool, FileSys::Music::KindCount> out{};
+    for (std::size_t index = 0; index < out.size(); ++index) {
+        out[index] = kind_boxes[index]->isChecked();
+    }
+    return out;
 }
 
 const std::vector<u8>& MusicExtractDialog::CoverOverride() const {
