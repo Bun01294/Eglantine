@@ -71,17 +71,21 @@ public:
 
 private:
     struct Row {
-        std::string line; ///< NAME=VALUE
+        std::string line;      ///< NAME=VALUE written when the flag is ticked
+        std::string alternate; ///< NAME=VALUE written instead when unticked, if it has an off form
+        bool on_by_default{};  ///< Ticked while neither line nor off form is in the file
         QCheckBox* box{};
     };
 
     void AddDefaults();
     void Refresh();
+    /// Tick or untick one flag, writing its off form in place of the line when it has one.
+    void SetFlag(const Row& row, bool on);
 
     Performance::Platform platform;
     Performance::State& state;
     std::vector<Row> rows;
-    std::vector<std::string> recommended_lines; ///< Recommended and supported
+    std::vector<std::pair<std::string, std::string>> recommended_lines; ///< Recommended and supported
 };
 
 /// The GPU tab: one page of launch arguments per GPU vendor, picked from a dropdown that starts on

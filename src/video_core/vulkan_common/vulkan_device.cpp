@@ -1638,15 +1638,24 @@ void Device::RemoveUnsuitableExtensions() {
     // AMD runs task shaders on a compute queue ganged with the graphics queue. With the guest's
     // task programs that hangs the GPU (RDNA2 on RADV 26.2: gfx ring timeout, device lost),
     // while the compute fallback runs the same draws fine. NVIDIA and Intel have task and mesh
-    // stages in the graphics pipe. EDEN_NX2_NATIVE_MESH=1 keeps the extension for testing.
+    // stages in the graphics pipe. EDEN_NX2_NATIVE_MESH is the Performance tab's flag: "0" asks
+    // for the fallback, "1" for the driver's own stages even on AMD, unset leaves the default.
     const VkDriverId mesh_driver{properties.driver.driverID};
     const bool amd_task_on_compute_queue{mesh_driver == VK_DRIVER_ID_MESA_RADV ||
                                          mesh_driver == VK_DRIVER_ID_AMD_PROPRIETARY ||
                                          mesh_driver == VK_DRIVER_ID_AMD_OPEN_SOURCE};
-    if (extensions.mesh_shader && amd_task_on_compute_queue &&
-        std::getenv("EDEN_NX2_NATIVE_MESH") == nullptr) {
-        LOG_INFO(Render_Vulkan, "AMD driver: VK_EXT_mesh_shader disabled, task/mesh draws use the "
-                                "compute fallback (EDEN_NX2_NATIVE_MESH=1 keeps it)");
+    const char* native_mesh = std::getenv("EDEN_NX2_NATIVE_MESH");
+    const bool native_mesh_off = native_mesh != nullptr && native_mesh[0] == '0';
+    const bool native_mesh_on = native_mesh != nullptr && native_mesh[0] != '0';
+    if (extensions.mesh_shader && native_mesh_on) {
+        LOG_INFO(Render_Vulkan, "EDEN_NX2_NATIVE_MESH={}: task/mesh draws use the driver's own "
+                                "task and mesh stages",
+                 native_mesh);
+    } else if (extensions.mesh_shader && (native_mesh_off || amd_task_on_compute_queue)) {
+        LOG_INFO(Render_Vulkan, "Task/mesh draws use the compute fallback{}",
+                 amd_task_on_compute_queue ? " (AMD driver default, EDEN_NX2_NATIVE_MESH=1 keeps "
+                                             "the driver's own stages)"
+                                           : " (EDEN_NX2_NATIVE_MESH=0)");
         extensions.mesh_shader = false;
     }
     RemoveExtensionFeatureIfUnsuitable(extensions.mesh_shader, features.mesh_shader,

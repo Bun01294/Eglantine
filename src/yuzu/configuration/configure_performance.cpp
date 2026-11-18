@@ -62,6 +62,11 @@ struct Feature {
     const char* description;
     bool recommended;
     std::function<Verdict(const Context&)> check;
+    /// NAME=VALUE written in place of the line when the flag is unticked: a flag that is on by
+    /// default needs something to record the user turning it off.
+    const char* alternate{};
+    /// Shows ticked before anything is written, for a flag whose code default is already on.
+    bool on_by_default{};
 };
 
 std::string Line(const Feature& feature) {
@@ -149,6 +154,39 @@ std::vector<Feature> FeaturesFor(Platform platform) {
                      "behave differently. Please report if it does not work on your AMD GPU.");
                  return verdict;
              }});
+        // AMD runs task shaders on a compute queue ganged with the graphics queue; with Ocarina of
+        // Time's task programs that hangs the GPU (RDNA2 on RADV 26.2: gfx ring timeout, device
+        // lost), while the compute fallback runs the same draws. Ticked writes
+        // EDEN_NX2_NATIVE_MESH=0, which is the code default on AMD too; unticked writes =1, the way
+        // back to the driver's own stages on a driver that handles them.
+        features.push_back(
+            {"EDEN_NX2_NATIVE_MESH", "0",
+             QT_TR_NOOP("Use the compute fallback for task/mesh shaders"),
+             QT_TR_NOOP("Draws task and mesh geometry as compute dispatches instead of with the "
+                        "driver's own task and mesh stages. AMD drivers run task shaders on a "
+                        "compute queue ganged with the graphics queue, and Ocarina of Time loses "
+                        "the device (gfx ring timeout) seconds after its first task/mesh draws on "
+                        "an RDNA2 GPU with RADV 26.2. On by default on AMD, where the fallback "
+                        "costs nothing measured. Untick it to give a driver that handles task and "
+                        "mesh shaders its own stages."),
+             true, [](const Context& context) {
+                 Verdict verdict;
+                 if (context.device != nullptr && !context.device->capabilities.HasExtension(
+                                                      VK_EXT_MESH_SHADER_EXTENSION_NAME)) {
+                     // Not unsupported: the flag is the default on this card too, it just has
+                     // nothing to turn off, so it stays recommended and ticked.
+                     verdict.note =
+                         QObject::tr("%1 has no VK_EXT_mesh_shader, so its task/mesh draws always "
+                                     "use the compute fallback.")
+                             .arg(QString::fromStdString(context.device->name));
+                     return verdict;
+                 }
+                 verdict.note = QObject::tr(
+                     "Unticking this asks the driver for its own task and mesh stages, which is "
+                     "what hangs the GPU on AMD.");
+                 return verdict;
+             },
+             "EDEN_NX2_NATIVE_MESH=1", /*on_by_default=*/true});
     }
     if (platform == Platform::Nvidia) {
         features.push_back(
@@ -375,6 +413,8 @@ ConfigurePerformance::ConfigurePerformance(Performance::Platform platform_,
         const bool from_environment = std::getenv(feature.name) != nullptr;
         Row row;
         row.line = Line(feature);
+        row.alternate = feature.alternate != nullptr ? feature.alternate : std::string{};
+        row.on_by_default = feature.on_by_default && !unsupported;
 
         QStringList details{tr(feature.description)};
         if (unsupported) {
@@ -432,10 +472,15 @@ ConfigurePerformance::ConfigurePerformance(Performance::Platform platform_,
         ++grid_row;
 
         if (feature.recommended && !unsupported) {
-            recommended_lines.push_back(row.line);
+            recommended_lines.emplace_back(row.line, row.alternate);
         }
         connect(row.box, &QCheckBox::toggled, this,
-                [this, line = row.line](bool on) { state.SetEnabled(line, on); });
+                [this, line = row.line, alternate = row.alternate](bool on) {
+                    Row flag;
+                    flag.line = line;
+                    flag.alternate = alternate;
+                    SetFlag(flag, on);
+                });
         rows.push_back(std::move(row));
     }
     layout->addWidget(frame);
@@ -448,7 +493,7 @@ ConfigurePerformance::ConfigurePerformance(Performance::Platform platform_,
     none->setToolTip(tr("Unticks every flag on this page."));
     connect(none, &QPushButton::clicked, this, [this] {
         for (const Row& row : rows) {
-            state.SetEnabled(row.line, false);
+            SetFlag(row, false);
         }
     });
     buttons->addWidget(defaults);
@@ -475,16 +520,28 @@ ConfigurePerformance::ConfigurePerformance(Performance::Platform platform_,
 ConfigurePerformance::~ConfigurePerformance() = default;
 
 void ConfigurePerformance::AddDefaults() {
-    for (const auto& line : recommended_lines) {
+    for (const auto& [line, alternate] : recommended_lines) {
+        if (!alternate.empty()) {
+            state.SetEnabled(alternate, false);
+        }
         state.SetEnabled(line, true);
     }
     Refresh();
 }
 
+void ConfigurePerformance::SetFlag(const Row& row, bool on) {
+    if (!row.alternate.empty()) {
+        state.SetEnabled(row.alternate, !on);
+    }
+    state.SetEnabled(row.line, on);
+}
+
 void ConfigurePerformance::Refresh() {
     for (Row& row : rows) {
         const QSignalBlocker blocker(row.box);
-        row.box->setChecked(state.IsEnabled(row.line));
+        row.box->setChecked(state.IsEnabled(row.line) ||
+                            (row.on_by_default &&
+                             (row.alternate.empty() || !state.IsEnabled(row.alternate))));
     }
 }
 
