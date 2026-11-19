@@ -340,6 +340,8 @@ struct DrawPayload {
 struct DrawIndexedPayload {
     u32 mode;
     u32 index_type; // NVNindexType
+    /// Indices of a direct draw. Indirect draw: the bytes from index_address to the end of the
+    /// buffer object that holds it (saturated; 0 = unknown), which bound the indices it can reach.
     u32 count;
     s32 base_vertex;
     u32 base_instance;

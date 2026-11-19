@@ -15,6 +15,7 @@
 #include <fmt/format.h>
 
 #include "video_core/renderer_vulkan/nvn/nvn_draw.h"
+#include "video_core/renderer_vulkan/nvn/nvn_quad_indirect.h"
 
 namespace Vulkan::Nvn {
 namespace {
@@ -29,6 +30,7 @@ constexpr u32 COUNT_SIZE = 4;
 
 /// QUADS, QUAD_STRIP and LINE_LOOP have no Vulkan topology: a direct draw converts them with
 /// generated indices, which need the count that an indirect draw's GPU-written arguments hold.
+/// Non-indexed QUADS are drawn all the same: the GPU rewrites their arguments (QuadIndirectGpu).
 bool NeedsGeneratedIndices(u32 mode) {
     return mode == 7 || mode == 8 || mode == 2;
 }
@@ -41,6 +43,8 @@ struct IndirectCall {
     u32 stride;
     u64 indirect;
     u64 count_address;
+    /// QUADS whose arguments the GPU rewrites as indexed triangle draws (QuadIndirectGpu).
+    bool quads_converted{};
 };
 
 /// Resolves the argument and count buffers and checks what the device can do. False = the draw is
@@ -53,7 +57,7 @@ bool ResolveArguments(DrawContext& context, DrawHost& host, const IndirectCall& 
         host.HostUnsupported(call.op, reason);
         return false;
     };
-    if (NeedsGeneratedIndices(call.mode)) {
+    if (NeedsGeneratedIndices(call.mode) && !call.quads_converted) {
         return drop(fmt::format("indirect draw of primitive {}: the host converts it with indices "
                                 "that depend on the GPU-written count",
                                 call.mode));
@@ -134,6 +138,7 @@ void DrawContext::OrderIndirectArguments(const BufferRef& args, u64 args_size,
 
 void DrawContext::DrawIndirect(const VC::DrawPayload& p) {
     const bool counted = p.count_address != 0;
+    QuadIndirectGpu* const quads = p.mode == 7 ? impl.QuadIndirect() : nullptr;
     const IndirectCall call{
         .op = "DrawIndirect",
         .mode = p.mode,
@@ -142,6 +147,7 @@ void DrawContext::DrawIndirect(const VC::DrawPayload& p) {
         .stride = p.stride != 0 ? p.stride : ARRAYS_COMMAND_SIZE,
         .indirect = p.indirect,
         .count_address = p.count_address,
+        .quads_converted = quads != nullptr,
     };
     if (call.max_draws == 0) {
         return;
@@ -166,6 +172,64 @@ void DrawContext::DrawIndirect(const VC::DrawPayload& p) {
     // The pass changes happen before conditional rendering begins: a conditional region cannot
     // straddle the end of a render pass.
     OrderIndirectArguments(args, args_size, count, counted, nullptr);
+    if (quads != nullptr) {
+        // {count, instances, first, base} become VkDrawIndexedIndirectCommand records over the
+        // fixed quad index buffer on the GPU, outside the pass and before conditional rendering
+        // begins (nvn_quad_indirect.comp).
+        if (args.offset % sizeof(u32) != 0 || call.stride % sizeof(u32) != 0) {
+            impl.stats.indirect_unsupported.fetch_add(1, std::memory_order_relaxed);
+            host->HostUnsupported(call.op, "quad arguments not aligned to 4 bytes");
+            return;
+        }
+        const u64 alignment = (std::max<u64>)(impl.device.GetStorageBufferAlignment(), 4);
+        const u64 base = args.offset / alignment * alignment;
+        const u64 range = args.offset - base +
+                          (call.max_draws > 0 ? static_cast<u64>(call.max_draws - 1) * call.stride
+                                              : 0) +
+                          QUAD_ARRAYS_COMMAND_SIZE;
+        if (range > impl.device.GetMaxStorageBufferRange()) {
+            impl.stats.indirect_unsupported.fetch_add(1, std::memory_order_relaxed);
+            host->HostUnsupported(call.op, "quad arguments exceed maxStorageBufferRange");
+            return;
+        }
+        EndPass(BreakCause::MeshIndirectConvert);
+        u8* unused = nullptr;
+        const BufferRef converted =
+            AllocArena(static_cast<u64>(call.max_draws) * QUAD_INDEXED_COMMAND_SIZE,
+                       impl.device.GetStorageBufferAlignment(), &unused);
+        if (!converted.buffer) {
+            host->HostFailed(call.op, "no arena space for the converted arguments");
+            return;
+        }
+        host->HostMarkWritten();
+        host->HostFlushBarrier();
+        quads->Convert(host->HostCmd(), args.buffer, args.offset, call.stride, call.max_draws,
+                       converted.buffer, converted.offset);
+        // The pass the draw opens starts with the barrier that makes the records visible.
+        host->HostMarkWritten();
+        if (!host->HostBeginRenderCondition()) {
+            return;
+        }
+        PreparedDraw prepared;
+        HostIndex host_index;
+        if (PrepareDraw(p.mode, 0, nullptr, prepared, host_index)) {
+            vk::CommandBuffer cmd = host->HostCmd();
+            cmd.BindIndexBuffer(quads->IndexBuffer(), 0, VK_INDEX_TYPE_UINT32);
+            bound_state.ForgetIndexBuffer();
+            if (counted) {
+                cmd.DrawIndexedIndirectCount(converted.buffer, converted.offset, count.buffer,
+                                             count.offset, call.max_draws,
+                                             QUAD_INDEXED_COMMAND_SIZE);
+                impl.stats.indirect_counted_draws.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                cmd.DrawIndexedIndirect(converted.buffer, converted.offset, 1,
+                                        QUAD_INDEXED_COMMAND_SIZE);
+            }
+            impl.stats.indirect_draws.fetch_add(1, std::memory_order_relaxed);
+        }
+        host->HostEndRenderCondition();
+        return;
+    }
     if (!host->HostBeginRenderCondition()) {
         return;
     }
@@ -212,7 +276,8 @@ void DrawContext::DrawIndexedIndirect(const VC::DrawIndexedPayload& p) {
         return;
     }
     // The index range an indirect draw can reach is not known: everything from the base address
-    // to the end of its pool.
+    // to the end of the game's buffer object (p.count), or of its pool when no object holds it.
+    // Bounding it matters for a mirror pool, whose whole range is hashed and uploaded before use.
     BufferRef index;
     if (!ResolveBuffer(p.index_address, 1, false, index) || index.pool == nullptr) {
         host->HostFailed(call.op, fmt::format("index buffer {:#x} is not in a pool",
@@ -220,6 +285,9 @@ void DrawContext::DrawIndexedIndirect(const VC::DrawIndexedPayload& p) {
         return;
     }
     index.range = index.pool->size - index.pool_offset;
+    if (p.count != 0) {
+        index.range = (std::min<u64>)(index.range, p.count);
+    }
     if (Debug::Tracing()) {
         dbg_call = {};
         dbg_call.indexed = true;

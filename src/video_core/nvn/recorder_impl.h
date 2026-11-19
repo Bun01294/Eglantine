@@ -427,6 +427,17 @@ struct Recorder::Impl {
     Slab<TextureObject> textures{ObjectKind::Texture};
     Slab<SamplerObject> samplers{ObjectKind::Sampler};
     Slab<BufferObject> buffers{ObjectKind::Buffer};
+    /// The guest range of every live buffer object, for BufferEndOf.
+    struct BufferSpan {
+        u64 begin;
+        u64 end;
+        u64 serial;
+    };
+    std::mutex buffer_spans_mutex;
+    std::vector<BufferSpan> buffer_spans;
+    /// Bytes from `address` to the end of the largest live buffer object that holds it, saturated
+    /// to 32 bits; 0 when none does.
+    [[nodiscard]] u32 BufferBytesFrom(u64 address);
     Slab<ProgramObject> programs{ObjectKind::Program};
     Slab<SyncObject> syncs{ObjectKind::Sync};
     Slab<EventObject> events{ObjectKind::Event};

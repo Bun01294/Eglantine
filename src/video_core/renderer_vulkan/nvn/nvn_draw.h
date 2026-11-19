@@ -1042,6 +1042,20 @@ private:
     std::vector<VkWriteDescriptorSet> scratch_writes;
     std::vector<VkDescriptorBufferInfo> scratch_buffers;
     std::vector<VkDescriptorImageInfo> scratch_images;
+    std::vector<VkBufferView> scratch_views;
+    /// Texture buffers bound in the current submission: a view over an arena copy of the guest
+    /// bytes each, made once per submission (TexelBufferView).
+    struct TexelView {
+        u64 address;
+        u64 size;
+        VkFormat format;
+        VkBufferView view;
+    };
+    std::vector<TexelView> texel_views;
+    u64 texel_views_seq{~u64{0}};
+    /// The view a texel buffer descriptor binds for `texture` (a texture buffer); null or
+    /// unreadable: a view of zeros. VK_NULL_HANDLE when no arena space is left.
+    [[nodiscard]] VkBufferView TexelBufferView(const Texture* texture);
     DrawPlan draw_plan; ///< the plan of the draw being prepared (capacity kept between draws)
     std::array<u32, 2> fallback_logged{}; ///< DescReason bits logged once, per bind point
 

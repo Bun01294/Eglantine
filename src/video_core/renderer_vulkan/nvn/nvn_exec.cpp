@@ -1205,65 +1205,7 @@ u64 Recorder::GuestPageHash(const Pool& pool, u64 page) const {
 }
 
 bool Recorder::MirrorTakeCpuWrites(Pool& pool) {
-    if (!impl.mirror_hash_tracked) {
-        return false;
-    }
-    VC::GuestMemory* const memory = impl.guest.load(std::memory_order_acquire);
-    if (memory == nullptr) {
-        return false;
-    }
-    if (!pool.split_runs.empty()) {
-        // Raw stores reach a split pool's guest bytes past the tracker: once one completed, every
-        // page is hashed again before it is trusted.
-        const u64 raw_epoch = impl.split_raw_epoch.load(std::memory_order_acquire);
-        if (raw_epoch != pool.split_raw_epoch_seen) {
-            pool.split_raw_epoch_seen = raw_epoch;
-            if (!impl.mario_kart_world) {
-                for (Pool::MirrorPage& page : pool.mirror_pages) {
-                    page.trusted = false;
-                }
-            }
-        }
-    }
-    if (pool.mirror_track == 0) {
-        if (pool.mirror_track_tried) {
-            return false;
-        }
-        pool.mirror_track_tried = true;
-        pool.mirror_track = memory->Track(pool.address, pool.size);
-        if (pool.mirror_track == 0) {
-            return false;
-        }
-        // Watched from now on: a page hashed after this shows any later CPU write. No page is
-        // trusted yet.
-        memory->Arm(pool.mirror_track, pool.address, pool.size);
-        pool.mirror_write_epoch = memory->WriteEpoch(pool.mirror_track);
-        if (pool.mirror_write_epoch) {
-            pool.mirror_epoch_clean = pool.mirror_write_epoch->load(std::memory_order_acquire);
-        }
-        return true;
-    }
-    u64 epoch = 0;
-    if (pool.mirror_write_epoch) {
-        epoch = pool.mirror_write_epoch->load(std::memory_order_acquire);
-        if (epoch == pool.mirror_epoch_clean) {
-            return true;
-        }
-    }
-    // The whole pool: a taken write lives on as an untrusted page until that page is hashed, so a
-    // range checked later does not lose it.
-    thread_local std::vector<std::pair<u64, u64>> written;
-    written.clear();
-    memory->TakeWritten(pool.mirror_track, pool.address, pool.size, written);
-    for (const auto& [begin, end] : written) {
-        const u64 from = (std::max)(begin, pool.address) - pool.address;
-        const u64 to = (std::min)(end - pool.address, pool.size);
-        for (u64 page = from / Pool::MIRROR_PAGE; page * Pool::MIRROR_PAGE < to; ++page) {
-            pool.mirror_pages[static_cast<size_t>(page)].trusted = false;
-        }
-    }
-    pool.mirror_epoch_clean = epoch; // read before the take: a write in between shows as a change
-    return true;
+    return impl.TakePoolCpuWrites(pool);
 }
 
 MirrorWriteCoverage Recorder::MirrorPageWrites(Pool& pool, u64 page, bool& pending_read) {
@@ -2181,6 +2123,8 @@ void Recorder::UploadStorage(Storage& s) {
         const auto begin = std::chrono::steady_clock::now();
         s.guest_hash = HashGuestBytes(data, size);
         s.sample_hash = SampleGuestBytes(data, size, impl.mario_kart_world);
+        s.cpu_trusted_gen = 0;
+        s.page_hashes.clear();
         impl.stats.hash_ns.fetch_add(
             static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                  std::chrono::steady_clock::now() - begin)

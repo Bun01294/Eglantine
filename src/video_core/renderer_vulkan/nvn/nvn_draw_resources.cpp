@@ -107,7 +107,7 @@ constexpr VkBufferUsageFlags ARENA_USAGE =
     VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
     VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-    VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+    VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT;
 
 VkSamplerAddressMode WrapMode(u32 nvn) {
     switch (nvn) {
@@ -725,21 +725,27 @@ DrawResources::Scratch* DrawResources::GetScratch(const Storage& source, u32 slo
 }
 
 DrawResources::Scratch* DrawResources::GetRetypedScratch(const Storage& source, u32 slot,
-                                                         bool cube) {
-    const VkImageType type = cube ? VK_IMAGE_TYPE_2D : VK_IMAGE_TYPE_3D;
+                                                         RetypeTarget target) {
+    const bool cube = target == RetypeTarget::Cube;
+    const VkImageType type = cube                          ? VK_IMAGE_TYPE_2D
+                             : target == RetypeTarget::Row ? VK_IMAGE_TYPE_1D
+                                                           : VK_IMAGE_TYPE_3D;
     const u32 layers = cube ? 6u : 1u;
+    const VkExtent3D extent{source.extent.width,
+                            target == RetypeTarget::Row ? 1u : source.extent.height, 1};
     for (Scratch& scratch : scratch_images) {
         const Storage& s = *scratch.storage;
         if (scratch.slot == slot && s.host.format == source.host.format && s.type == type &&
-            s.extent.width == source.extent.width && s.extent.height == source.extent.height &&
-            s.extent.depth == 1 && s.layers == layers && s.aspect == source.aspect) {
+            s.extent.width == extent.width && s.extent.height == extent.height &&
+            s.extent.depth == 1 &&
+            s.layers == layers && s.aspect == source.aspect) {
             return &scratch;
         }
     }
     auto storage = std::make_shared<Storage>();
     storage->host = source.host;
     storage->type = type;
-    storage->extent = {source.extent.width, source.extent.height, 1};
+    storage->extent = extent;
     storage->levels = 1;
     storage->layers = layers;
     storage->aspect = source.aspect;
@@ -769,7 +775,8 @@ DrawResources::Scratch* DrawResources::GetRetypedScratch(const Storage& source, 
         });
     } catch (const vk::Exception& exception) {
         LOG_ERROR(Render_Vulkan, "[nvn] placeholder image (format {}, {}) failed: {}",
-                  static_cast<int>(source.host.format), cube ? "cube" : "3D", exception.what());
+                  static_cast<int>(source.host.format),
+                  cube ? "cube" : target == RetypeTarget::Row ? "1D" : "3D", exception.what());
         return nullptr;
     }
     storage->contents_valid = true;

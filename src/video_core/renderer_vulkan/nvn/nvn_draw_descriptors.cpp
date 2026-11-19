@@ -366,6 +366,13 @@ std::optional<u32> DrawContext::ReadBindingHandleWord(const VC::DescriptorLayout
 
 namespace {
 
+/// A texture buffer: a view of a pool range with no image (and so no storage).
+bool IsTextureBuffer(const Texture& texture) {
+    const s32 target = texture.desc.view.set_target ? texture.desc.view.target : texture.desc.target;
+    return target == static_cast<s32>(TexTarget::Buffer) &&
+           texture.host.format != VK_FORMAT_UNDEFINED;
+}
+
 /// What the shader translation needs to know about the texture behind a handle.
 TextureInfo InfoOfTexture(const Texture& texture) {
     const s32 target = texture.desc.view.set_target ? texture.desc.view.target : texture.desc.target;
@@ -511,7 +518,7 @@ std::unique_ptr<TextureOracle> DrawContext::FreezeOracle(
             return;
         }
         const std::shared_ptr<Texture> texture = TextureOfId(id);
-        if (texture && texture->storage) {
+        if (texture && (texture->storage || IsTextureBuffer(*texture))) {
             frozen->textures.emplace(id, InfoOfTexture(*texture));
         }
     };
@@ -610,7 +617,7 @@ TextureInfo DrawContext::QueryTexture(u32 stage, const VC::NvnHandleRecord& reco
         return {};
     }
     const std::shared_ptr<Texture>& texture = TextureOfId(VC::TextureIdOf(*word));
-    if (!texture || !texture->storage) {
+    if (!texture || (!texture->storage && !IsTextureBuffer(*texture))) {
         return {};
     }
     return InfoOfTexture(*texture);
@@ -879,6 +886,7 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
     scratch_writes.clear();
     scratch_buffers.clear();
     scratch_images.clear();
+    scratch_views.clear();
     size_t total = 0;
     for (const VC::DescriptorBinding& binding : layout.bindings) {
         total += binding.count;
@@ -886,6 +894,7 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
     scratch_writes.reserve(layout.bindings.size());
     scratch_buffers.reserve(total);
     scratch_images.reserve(total);
+    scratch_views.reserve(total);
 
     prof_zero_size = false;
     std::array<BufferRef, BIND_STAGES> driver_bank{};
@@ -1398,7 +1407,8 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                             } else {
                                 DrawPlan::FeedbackCopy* entry = nullptr;
                                 for (DrawPlan::FeedbackCopy& existing : plan.feedback) {
-                                    if (existing.source == texture->storage) {
+                                    if (existing.source == texture->storage &&
+                                        existing.retype_layers == 0 && !existing.retype_row) {
                                         entry = &existing;
                                         break;
                                     }
@@ -1453,22 +1463,29 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                                                      scratch});
                         }
                     } else {
-                        // A 1x1x1 2D placeholder where the shader samples a 3D or cube texture:
-                        // sample a one-texel image of the shader's type holding its texel (what
-                        // the hardware returns for a single texel), refreshed by a copy per draw.
+                        // A 2D placeholder where the shader samples a 3D or cube texture: sample a
+                        // one-texel image of the shader's type holding its texel (what the
+                        // hardware returns for a single texel), refreshed by a copy per draw. One
+                        // sampled as 1D (Hyrule Warriors' vertex shaders on its 8x8 default
+                        // texture): a 1D image holding its first row.
+                        const bool row = binding.type == Shader::TextureType::Color1D &&
+                                         impl.device.IsKhrMaintenance5Supported();
                         const bool typed_target =
-                            binding.type == Shader::TextureType::Color3D ||
+                            row || binding.type == Shader::TextureType::Color3D ||
                             binding.type == Shader::TextureType::ColorCube ||
                             binding.type == Shader::TextureType::ColorArrayCube;
                         if (typed_target && !is_image && s.type == VK_IMAGE_TYPE_2D &&
                             s.levels == 1 && s.layers == 1 &&
-                            (binding.type == Shader::TextureType::Color3D ||
+                            (row || binding.type == Shader::TextureType::Color3D ||
                              s.extent.width == s.extent.height) &&
                             s.layers == 1 && s.samples == VK_SAMPLE_COUNT_1_BIT &&
                             !s.host.depth && !s.host.stencil) {
-                            const bool cube = binding.type != Shader::TextureType::Color3D;
+                            const bool cube = !row && binding.type != Shader::TextureType::Color3D;
+                            const auto target = row    ? DrawResources::RetypeTarget::Row
+                                                : cube ? DrawResources::RetypeTarget::Cube
+                                                       : DrawResources::RetypeTarget::Volume;
                             DrawResources::Scratch* made = resources.GetRetypedScratch(
-                                s, 200u + static_cast<u32>(binding.type), cube);
+                                s, 200u + static_cast<u32>(binding.type), target);
                             if (made) {
                                 if (placeholder_logged
                                         .insert(texture->serial << 8 ^ static_cast<u64>(binding.type))
@@ -1476,11 +1493,14 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                                     LOG_INFO(Render_Vulkan,
                                              "[nvn] texture {:#x} ({}x{} 2D, format {:#x}) is "
                                              "sampled as {} by program {:016x} stage {}: bound as "
-                                             "a one-texel {} holding its texel",
+                                             "{}",
                                              texture->serial, s.extent.width, s.extent.height,
-                                             s.desc.format, cube ? "a cube" : "a 3D texture",
+                                             s.desc.format,
+                                             row ? "1D" : cube ? "a cube" : "a 3D texture",
                                              ProfStageHash(stage), stage,
-                                             cube ? "cube" : "3D texture");
+                                             row    ? "a 1D texture holding its first row"
+                                             : cube ? "a one-texel cube holding its texel"
+                                                    : "a one-texel 3D texture holding its texel");
                                 }
                                 const u32 faces = cube ? 6u : 1u;
                                 bool have_copy = false;
@@ -1490,9 +1510,11 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                                 }
                                 if (!have_copy) {
                                     plan.feedback.push_back({texture->storage, made->storage,
-                                                             made->texture, 0, 1, 0, 1, faces});
+                                                             made->texture, 0, 1, 0, 1,
+                                                             row ? 0u : faces, row});
                                 }
-                                key.type = !cube ? VK_IMAGE_VIEW_TYPE_3D
+                                key.type = row     ? VK_IMAGE_VIEW_TYPE_1D
+                                           : !cube ? VK_IMAGE_VIEW_TYPE_3D
                                            : binding.type == Shader::TextureType::ColorCube
                                                ? VK_IMAGE_VIEW_TYPE_CUBE
                                                : VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
@@ -1615,16 +1637,103 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
             write.pImageInfo = &scratch_images[first];
             break;
         }
+        case VC::DescriptorKind::UniformTexelBuffer: {
+            // A texture buffer the shader fetches texels from (Hyrule Warriors' light lists).
+            const size_t first = scratch_views.size();
+            bool usable = true;
+            for (u32 i = 0; i < count; ++i) {
+                VC::HandleRef texture_ref = binding.texture;
+                texture_ref.slot += i;
+                texture_ref.byte_offset += i * VC::HandleStride;
+                const u32 texture_word =
+                    ReadBindingHandleWord(layout, binding, texture_ref, VC::HandleWordKind::Texture)
+                        .value_or(0);
+                const std::shared_ptr<Texture>& texture =
+                    TextureOfId(VC::TextureIdOf(texture_word));
+                const bool is_buffer = texture && IsTextureBuffer(*texture);
+                if (!is_buffer) {
+                    note(DescReason::TexelBuffer);
+                }
+                const VkBufferView view = TexelBufferView(is_buffer ? texture.get() : nullptr);
+                usable &= view != VK_NULL_HANDLE;
+                scratch_views.push_back(view);
+            }
+            if (!usable) {
+                ++counters.descriptors_unsupported;
+                host->HostFailed("Draw", "no arena space for a texture buffer");
+                continue;
+            }
+            write.pTexelBufferView = &scratch_views[first];
+            break;
+        }
         default:
-            // Texel buffers: no VkBufferView support yet.
+            // Storage texel buffers: not supported yet.
             ++counters.descriptors_unsupported;
             note(DescReason::TexelBuffer);
-            host->HostUnsupported("Draw", "texel buffer descriptors are not supported");
+            host->HostUnsupported("Draw", "storage texel buffer descriptors are not supported");
             continue;
         }
         scratch_writes.push_back(write);
     }
     return true;
+}
+
+VkBufferView DrawContext::TexelBufferView(const Texture* texture) {
+    InFlight& flight = host->HostFlight();
+    if (texel_views_seq != flight.seq) {
+        texel_views.clear();
+        texel_views_seq = flight.seq;
+    }
+    // The bytes as the CPU sees them now, like a uniform buffer's; no texture: 256 bytes of zeros.
+    u64 address = 0;
+    u64 size = 256;
+    VkFormat format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    const u8* source = nullptr;
+    if (texture != nullptr) {
+        const VC::TextureDesc& desc = texture->desc;
+        const u64 bytes =
+            u64{desc.width} * VideoCore::Surface::BytesPerBlock(texture->host.pixel_format);
+        format = texture->host.format;
+        if (const auto it = impl.pools.find(desc.pool_serial); it != impl.pools.end() && bytes != 0) {
+            const u64 guest = it->second->address + desc.pool_offset;
+            source = impl.GuestPointer(guest, bytes);
+            if (source != nullptr) {
+                address = guest;
+                size = bytes;
+            }
+        }
+        if (source == nullptr) {
+            NoteFallback(true, DescReason::TexelBuffer);
+        }
+    }
+    for (const TexelView& entry : texel_views) {
+        if (entry.address == address && entry.size == size && entry.format == format) {
+            return entry.view;
+        }
+    }
+    u8* pointer = nullptr;
+    const BufferRef copy = AllocArena(size, 256, &pointer);
+    if (!copy.buffer) {
+        return VK_NULL_HANDLE;
+    }
+    if (source != nullptr) {
+        std::memcpy(pointer, source, size);
+    } else {
+        std::memset(pointer, 0, size);
+    }
+    auto view = std::make_shared<vk::BufferView>(impl.device.GetLogical().CreateBufferView({
+        .sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .buffer = copy.buffer,
+        .format = format,
+        .offset = copy.offset,
+        .range = size,
+    }));
+    const VkBufferView handle = **view;
+    flight.keepalive.push_back(std::move(view));
+    texel_views.push_back({address, size, format, handle});
+    return handle;
 }
 
 bool DrawContext::IsBoundTarget(const Storage* storage) const {
@@ -1709,6 +1818,26 @@ void DrawContext::RecordFeedbackCopies(DrawPlan& plan) {
                                           region);
             }
             host->HostMarkWritten();
+            ++counters.placeholder_copies;
+            continue;
+        }
+        if (copy.retype_row) {
+            // A 2D texture sampled as 1D: its first row of level 0.
+            const VkImageCopy region{
+                .srcSubresource = {.aspectMask = source.aspect, .mipLevel = 0,
+                                   .baseArrayLayer = 0, .layerCount = 1},
+                .srcOffset = {0, 0, 0},
+                .dstSubresource = {.aspectMask = source.aspect, .mipLevel = 0,
+                                   .baseArrayLayer = 0, .layerCount = 1},
+                .dstOffset = {0, 0, 0},
+                .extent = {source.extent.width, 1, 1},
+            };
+            host->HostCmd().CopyImage(*source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                      *scratch.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
+            host->HostMarkWritten();
+            if (DrawResources::Scratch* record = resources.FindScratch(scratch)) {
+                record->copied.Record(copy.source, this, render_target_epoch.value, {0, 1, 0, 1});
+            }
             ++counters.placeholder_copies;
             continue;
         }

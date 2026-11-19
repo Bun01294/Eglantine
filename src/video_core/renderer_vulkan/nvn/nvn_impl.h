@@ -38,6 +38,7 @@
 #include "video_core/renderer_vulkan/nvn/nvn_astc_gpu.h"
 #include "video_core/renderer_vulkan/nvn/nvn_bc_encode.h"
 #include "video_core/renderer_vulkan/nvn/nvn_mesh_indirect.h"
+#include "video_core/renderer_vulkan/nvn/nvn_quad_indirect.h"
 #include "video_core/renderer_vulkan/nvn/nvn_untile_gpu.h"
 #include "video_core/renderer_vulkan/nvn/nvn_vertex_stage_gpu.h"
 #include "video_core/renderer_vulkan/nvn/nvn_diag_textures.h"
@@ -148,6 +149,9 @@ struct Pool {
     /// there until the write-back at completion. Guarded by dirty_mutex.
     std::mutex dirty_mutex;
     std::vector<Dirty> gpu_dirty;
+    /// Write-backs that reached guest memory, {offset, end}: added at completion, taken by
+    /// Impl::TakePoolCpuWrites (texture trust). Guarded by dirty_mutex.
+    std::vector<std::pair<u64, u64>> landed_writebacks;
     /// Mirror pools: what the mirror holds, per MIRROR_PAGE bytes of the pool. Replay thread
     /// only once `pending` is false (sized before that).
     struct MirrorPage {
@@ -169,6 +173,11 @@ struct Pool {
     bool mirror_track_tried{false};
     std::shared_ptr<const std::atomic<u64>> mirror_write_epoch;
     u64 mirror_epoch_clean{}; ///< `mirror_write_epoch` before the last TakeWritten
+    /// Per MIRROR_PAGE of the pool: `cpu_write_gen` of the last Impl::TakePoolCpuWrites that found
+    /// the page written (0: not since the registration). Sized when `mirror_track` registers.
+    /// Lets a CPU-sourced texture skip its hash (Storage::cpu_trusted_gen). Replay thread.
+    std::vector<u32> page_write_gen;
+    u32 cpu_write_gen{1};
     /// Imported pools: the persistent device-local copy that storage bindings and indirect
     /// arguments use (EDEN_NX2_NVN_POOL_MIRROR, nvn_pool_mirror.h; not Backing::Mirror). Null until
     /// the first use that wants one. Replay thread only.
@@ -318,6 +327,17 @@ struct Storage : std::enable_shared_from_this<Storage> {
     u64 linear_writeback_seq{0};
     /// The CPU changed the bytes behind this storage at least once (checked in full from then on).
     bool dynamic{false};
+    /// CPU origin: the pool's `cpu_write_gen` when a full hash last found the guest bytes unchanged
+    /// while the page tracker watched the pool (0: never). While no page under the storage has a
+    /// later `page_write_gen`, the CPU did not write it and a check needs no hash
+    /// (Impl::tex_hash_tracked).
+    u32 cpu_trusted_gen{0};
+    /// CityHash64 of the storage's part of each pool page (Pool::MIRROR_PAGE grid, first page at
+    /// pool_offset / MIRROR_PAGE), taken with the full hash that set `cpu_trusted_gen`: a check
+    /// after a tracked write rehashes only the written pages. Empty: not taken.
+    std::vector<u64> page_hashes;
+    /// A tracked write once came after the trust: only such storages keep page hashes.
+    bool wants_page_hashes{false};
     /// The guest wrote the storage itself (WriteTexels): upload again whatever the origin.
     bool force_upload{false};
     u64 last_used_seq{0};
@@ -797,6 +817,9 @@ struct Context::Impl {
         std::atomic<u64> untile_cpu_fallbacks{}; ///< tiled storages the GPU untile could not take
         std::atomic<u64> upload_bytes{};
         std::atomic<u64> cpu_checks{};           ///< hash checks of CPU-sourced storages
+        std::atomic<u64> cpu_checks_trusted{};   ///< checks the page tracker answered (no hash)
+        std::atomic<u64> cpu_checks_pages{};     ///< checks answered by rehashing written pages
+        std::atomic<u64> cpu_pages_rehashed{};   ///< pages those checks hashed
         std::atomic<u64> cpu_changes{};          ///< ... that found changed guest bytes
         std::atomic<u64> host_write_uploads{};   ///< GPU-only pool ranges a host write re-uploaded
         std::atomic<u64> decode_ns{};            ///< ASTC/BCn decode time
@@ -1219,6 +1242,10 @@ struct Context::Impl {
     std::unique_ptr<MeshIndirectGpu> mesh_indirect;
     bool mesh_indirect_failed{false};
     [[nodiscard]] MeshIndirectGpu* MeshIndirect();
+    /// Indirect QUADS argument conversion (nvn_quad_indirect.h), created the same way.
+    std::unique_ptr<QuadIndirectGpu> quad_indirect;
+    bool quad_indirect_failed{false};
+    [[nodiscard]] QuadIndirectGpu* QuadIndirect();
     /// Vertex staging copies by shader (nvn_vertex_stage_gpu.h), created at the first staged pass
     /// on the replay thread; null when the device cannot run it (vkCmdCopyBuffer then).
     std::unique_ptr<VertexStageGpu> vertex_stage;
@@ -1337,6 +1364,15 @@ struct Context::Impl {
     /// ContextOptions::mirror_hash_tracked, else on unless EDEN_NX2_NVN_MIRROR_HASH_ALWAYS (set at
     /// construction): mirror pools hash only the guest pages the page tracker saw written.
     bool mirror_hash_tracked{false};
+    /// On with `mirror_hash_tracked` unless EDEN_NX2_NVN_TEX_HASH_ALWAYS (set at construction):
+    /// a CPU-sourced texture whose pages the page tracker saw unwritten since its last full hash is
+    /// not hashed again (DetectGuestChange).
+    bool tex_hash_tracked{false};
+    /// On with `tex_hash_tracked` unless EDEN_NX2_NVN_TEX_PAGE_HASH=0: a texture whose pages were
+    /// written since it was trusted rehashes only those pages (Storage::page_hashes).
+    bool tex_page_hash{false};
+    /// A tracked guest flush lets CPU-sourced storages keep going by the page tracker.
+    bool tex_flush_trusted{false};
     /// EDEN_NX2_TRY_INVALIDATE_WRITEBACK (ContextOptions / nvn_debug.h): milliseconds a guest
     /// invalidate waits for the GPU's unfinished writes to its range; 0 = off (nothing is noted).
     u32 invalidate_wait_ms{0};
@@ -1599,6 +1635,12 @@ struct Context::Impl {
     /// Looks at a CPU-sourced storage's guest bytes when its check is due (a cheap signature, no
     /// commands recorded) and sets `force_upload` when they changed. At most once per `seq`.
     void DetectGuestChange(Storage& s, u64 seq);
+    /// Registers `pool` with the page tracker at the first call (every page armed) and folds the
+    /// guest CPU writes since the last call into `mirror_pages` (untrusted) and `page_write_gen`.
+    /// False when the pool is not tracked. Replay thread.
+    bool TakePoolCpuWrites(Pool& pool);
+    /// Whether a page of [offset, offset + size) of `pool` was found written after `gen`.
+    [[nodiscard]] static bool PoolWrittenSince(const Pool& pool, u64 offset, u64 size, u32 gen);
     /// True when `Recorder::EnsureContents(s, will_overwrite)` would record commands (a first
     /// upload, a CPU change, an overlapping texture written more recently). Creates the image and
     /// runs the change check, so draw code can decide before it begins a render pass. `seq` is the

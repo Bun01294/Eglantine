@@ -217,6 +217,15 @@ struct Config {
     /// EDEN_NX2_NVN_RAW_SPLIT_IMPORT (default on, =0 off): import host-discontiguous CPU-visible
     /// pools run by run so raw global loads/stores reach them (OoT's Kokiri pool).
     bool raw_split_import{true};
+    /// EDEN_NX2_NVN_TEX_HASH_ALWAYS=1: CPU-sourced textures are hashed at every due check even when
+    /// the page tracker saw none of their pages written (A/B of Impl::tex_hash_tracked).
+    bool tex_hash_always{false};
+    /// EDEN_NX2_NVN_TEX_PAGE_HASH=0: a tracked write to a trusted texture hashes it whole again
+    /// instead of only the written pages (A/B of Impl::tex_page_hash).
+    bool tex_page_hash{true};
+    /// EDEN_NX2_NVN_TEX_FLUSH_TRUSTED=0: a tracked guest flush forces a full hash of the textures
+    /// it covers (A/B of Impl::tex_flush_trusted).
+    bool tex_flush_trusted{true};
     /// EDEN_NX2_TRY_INVALIDATE_WRITEBACK=<ms> (candidate, off; 1 = 250 ms): nvnMemoryPoolInvalidate
     /// MappedRange (the game's "I read what the GPU wrote now") waits, at most that long, until
     /// the submissions made before it that write its range have completed, so the CPU reads what

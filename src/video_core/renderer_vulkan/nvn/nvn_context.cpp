@@ -240,6 +240,9 @@ Context::Impl::Impl(const Device& device_, std::mutex& submit_mutex_,
     flush_tracked = options.flush_tracked.value_or(Debug::Get().try_flush_tracked);
     mirror_hash_tracked = options.mirror_hash_tracked.value_or(!Debug::Get().mirror_hash_always);
     raw_split_import.store(Debug::Get().raw_split_import, std::memory_order_relaxed);
+    tex_hash_tracked = mirror_hash_tracked && !Debug::Get().tex_hash_always;
+    tex_page_hash = tex_hash_tracked && Debug::Get().tex_page_hash;
+    tex_flush_trusted = tex_hash_tracked && Debug::Get().tex_flush_trusted;
     invalidate_wait_ms = options.invalidate_wait_ms.value_or(Debug::Get().try_invalidate_writeback);
     raw_keep_entries = options.raw_keep_entries.value_or(Debug::Get().try_raw_keep_entries);
     refused_shadow = options.refused_shadow.value_or(Debug::Get().try_refused_shadow);
@@ -662,6 +665,7 @@ Context::Impl::~Impl() {
     mirror_merge_stats = {}; // allocator-owned, like the pool buffers above
     bc_scratch.reset();
     staging_cache = {};
+    quad_indirect.reset();
     allocator.reset();
     command_buffer_allocations.clear();
     command_pool.reset();
@@ -940,6 +944,27 @@ MeshIndirectGpu* Context::Impl::MeshIndirect() {
         }
     }
     return mesh_indirect.get();
+}
+
+QuadIndirectGpu* Context::Impl::QuadIndirect() {
+    if (!quad_indirect && !quad_indirect_failed) {
+        if (!QuadIndirectGpu::Supported(device)) {
+            quad_indirect_failed = true;
+            LOG_ERROR(Render_Vulkan, "[nvn] indirect draws of quads need push descriptors "
+                                     "(2 or more): they are skipped");
+            return nullptr;
+        }
+        try {
+            quad_indirect = std::make_unique<QuadIndirectGpu>(
+                device, CreateHostBuffer(u64{QUAD_INDIRECT_MAX_QUADS} * 6 * sizeof(u32),
+                                         VK_BUFFER_USAGE_INDEX_BUFFER_BIT, MemoryUsage::Upload));
+        } catch (const std::exception& exception) {
+            quad_indirect_failed = true;
+            LOG_ERROR(Render_Vulkan, "[nvn] quad indirect argument conversion unavailable: {}",
+                      exception.what());
+        }
+    }
+    return quad_indirect.get();
 }
 
 VertexStageGpu* Context::Impl::VertexStage() {
@@ -1229,6 +1254,16 @@ void Context::Impl::CompleteMain() {
                 } else if (memory) {
                     memory->Write(readback.pool->address + readback.pool_offset, source,
                                   readback.size);
+                }
+                if (mirror_hash_tracked) {
+                    std::scoped_lock lock{readback.pool->dirty_mutex};
+                    auto& landed = readback.pool->landed_writebacks;
+                    if (landed.size() < 1024) {
+                        landed.push_back(
+                            {readback.pool_offset, readback.pool_offset + readback.size});
+                    } else {
+                        landed.assign(1, {0, readback.pool->size}); // not taken for long: all
+                    }
                 }
             }
         }
@@ -2041,14 +2076,15 @@ std::string Context::DescribeState() const {
     const auto& s = impl->stats;
     text += fmt::format(
         " mem(storages new/reuse/evict={}/{}/{} split_import(pools/runs)={}/{} uploads={} MB={} "
-        "cpu check/change={}/{} "
+        "cpu check/trusted/pages/change={}/{}/{}/{} pages_rehashed={} "
         "hash_ms={} hash_MB={} (compressed {} dynamic {}) decode_ms={} decode_MB={} alias_xfer={} "
         "alias_seen={} virt={} astc gpu/fallback/bc={}/{}/{} untile gpu/direct/fallback={}/{}/{} "
         "untile_gpu_MB={} storage_cache(MB/superseded/aged/pressure_evicted)={}/{}/{}/{})",
         s.storages_created.load(), s.storages_reused.load(), s.storages_evicted.load(),
         s.pools_split_imported.load(), s.split_runs.load(),
-        s.uploads.load(), s.upload_bytes.load() >> 20, s.cpu_checks.load(), s.cpu_changes.load(),
-        s.hash_ns.load() / 1'000'000, s.hash_bytes.load() >> 20,
+        s.uploads.load(), s.upload_bytes.load() >> 20, s.cpu_checks.load(),
+        s.cpu_checks_trusted.load(), s.cpu_checks_pages.load(), s.cpu_changes.load(),
+        s.cpu_pages_rehashed.load(), s.hash_ns.load() / 1'000'000, s.hash_bytes.load() >> 20,
         s.hash_bytes_compressed.load() >> 20, s.hash_bytes_dynamic.load() >> 20,
         s.decode_ns.load() / 1'000'000, s.decode_bytes.load() >> 20, s.alias_transfers.load(),
         s.alias_overlaps_seen.load(), s.virtual_maps.load(), s.astc_gpu_uploads.load(),
