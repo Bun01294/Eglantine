@@ -963,8 +963,8 @@ TEST_CASE("NVN storage shadow: a render pass writing a storage range reaches the
     CHECK(WordAt(data, 0x1008) == 0xCDCDCDCDu);
     CHECK(WordAt(data, 0x4000) == 0x1337);
     CHECK(WordAt(data, 0x4004) == 0xCDCDCDCDu);
-    CHECK(stats.driver_bank_uploads == (mkw ? 2 : 4));
-    CHECK(stats.pipeline_state_reuses == (mkw ? 1 : 0));
+    CHECK(stats.driver_bank_uploads == (mkw ? 2u : 4u));
+    CHECK(stats.pipeline_state_reuses == (mkw ? 1u : 0u));
     if (stats.pools_imported != 0) {
         CHECK(stats.shadow_creates == 1);
         CHECK(stats.shadow_redirects == 2);
@@ -3689,7 +3689,7 @@ TEST_CASE("NVN mirror pool: pending GPU pages skip hashes without losing later C
     copy(4);
     REQUIRE(await([&] { return phase.load() == 6; }));
     const u64 skipped = context.Stats().mirror_pages_gpu_owned - skipped_before;
-    CHECK(skipped == (written_bytes == 4096 ? 1 : 0));
+    CHECK(skipped == (written_bytes == 4096 ? 1u : 0u));
     release.store(true);
     REQUIRE(context.Wait(4, 20s));
     CHECK(WordAt(output, 0) == 100);
