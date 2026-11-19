@@ -1212,7 +1212,19 @@ void Context::Impl::CompleteMain() {
             VC::GuestMemory* memory = guest.load(std::memory_order_acquire);
             for (const InFlight::Readback& readback : flight->readbacks) {
                 const u8* source = mapped.data() + readback.download_offset;
-                if (readback.pool->host) {
+                if (readback.row_count > 0 && readback.row_bytes > 0) {
+                    for (u32 row = 0; row < readback.row_count; ++row) {
+                        const u64 rel = static_cast<u64>(row) * readback.row_stride;
+                        const u64 len = (std::min)(readback.row_bytes, readback.size - rel);
+                        if (readback.pool->host) {
+                            std::memcpy(readback.pool->host + readback.pool_offset + rel,
+                                        source + rel, static_cast<size_t>(len));
+                        } else if (memory) {
+                            memory->Write(readback.pool->address + readback.pool_offset + rel,
+                                          source + rel, static_cast<size_t>(len));
+                        }
+                    }
+                } else if (readback.pool->host) {
                     std::memcpy(readback.pool->host + readback.pool_offset, source, readback.size);
                 } else if (memory) {
                     memory->Write(readback.pool->address + readback.pool_offset, source,
@@ -2431,7 +2443,8 @@ bool Context::Impl::NeedsGpuFlushForUniform(u64 begin, u64 end, u64 current_seq)
 }
 
 void Context::Impl::ApplyPendingInlineWrites(u64 base_address, u8* dst, u64 size,
-                                             u64 current_seq) const {
+                                             u64 current_seq,
+                                             std::vector<std::pair<u64, u64>>* written) const {
     if (size == 0 || dst == nullptr || pending_pool_writes.empty()) {
         return;
     }
@@ -2446,6 +2459,9 @@ void Context::Impl::ApplyPendingInlineWrites(u64 base_address, u8* dst, u64 size
             std::memcpy(dst + (lo - base_address),
                         write.inline_bytes.data() + (lo - write.begin),
                         static_cast<size_t>(hi - lo));
+            if (written != nullptr) {
+                written->emplace_back(lo - base_address, hi - base_address);
+            }
         }
     }
 }

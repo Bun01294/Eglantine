@@ -415,6 +415,9 @@ struct InFlight {
         u64 pool_offset;
         u64 size;
         u64 download_offset;
+        u64 row_bytes{0};
+        u64 row_stride{0};
+        u32 row_count{0};
     };
 
     u64 seq{};
@@ -1034,7 +1037,8 @@ struct Context::Impl {
     void InvalidatePendingInlineBytesOverlapping(u64 address, u64 size);
     void ErasePendingPoolWritesForSeq(u64 seq);
     [[nodiscard]] bool NeedsGpuFlushForUniform(u64 begin, u64 end, u64 current_seq);
-    void ApplyPendingInlineWrites(u64 base_address, u8* dst, u64 size, u64 current_seq) const;
+    void ApplyPendingInlineWrites(u64 base_address, u8* dst, u64 size, u64 current_seq,
+                                  std::vector<std::pair<u64, u64>>* written = nullptr) const;
     /// Draw state per NVN queue index (it persists across submissions on a queue).
     std::map<u32, std::unique_ptr<DrawContext>> draw_contexts;
     std::map<u32, QueueState> queues;

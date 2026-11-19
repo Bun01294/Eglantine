@@ -1517,6 +1517,99 @@ void RunLinearTextureWriteback(HeadlessVulkan& vulkan, bool allow_import) {
         REQUIRE(actual == cpu_texel);
     }
 
+    // Submission 4: Overlapping linear storages written A, B, A must flush in write order
+    // so A's final value wins over B's earlier write.
+    constexpr u64 TEX_LINEAR_A = 13;
+    constexpr u64 TEX_LINEAR_B = 14;
+    constexpr u64 OVERLAP_OFFSET = 32768;
+    context.CreateTexture(make_rgba16f(TEX_LINEAR_A, OVERLAP_OFFSET,
+                                       Vulkan::Nvn::TexFlag::LinearRenderTarget, STRIDE));
+    context.CreateTexture(make_rgba16f(TEX_LINEAR_B, OVERLAP_OFFSET,
+                                       Vulkan::Nvn::TexFlag::LinearRenderTarget, STRIDE));
+    {
+        std::vector<u64> list;
+        auto push_clear = [&](u64 serial, float r, float g, float b, float a) {
+            VC::ClearTexturePayload clear{};
+            clear.texture = {.serial = serial, .level = 0, .layer = 0};
+            clear.region = {0, 0, 0, static_cast<s32>(WIDTH), static_cast<s32>(HEIGHT), 1};
+            clear.layer_count = 1;
+            clear.is_integer = 0;
+            const float color[4] = {r, g, b, a};
+            std::memcpy(clear.color, color, sizeof(color));
+            Push(list, VC::Op::ClearTexture, clear, 0xF);
+        };
+        push_clear(TEX_LINEAR_A, 1.0f, -0.5f, 0.25f, 2.0f);
+        push_clear(TEX_LINEAR_B, 0.5f, -1.0f, 0.0f, 4.0f);
+        push_clear(TEX_LINEAR_A, 0.25f, 0.5f, 1.0f, 2.0f);
+        PushEnd(list);
+        context.Submit(MakeSubmission(4, 0, std::move(list), {TEX_LINEAR_A, TEX_LINEAR_B}));
+        REQUIRE(context.Wait(4, 20s));
+    }
+    check_linear_guest(OVERLAP_OFFSET, cpu_texel);
+
+    if (!allow_import) {
+        // Submission 5: Padded mirror readback writes only the valid texel rows, preserving CPU
+        // modifications written to row padding gaps between capture and completion.
+        constexpr u64 EVENT_VA = READBACK_VA + 12288;
+        class GapHookMemory final : public VC::GuestMemory {
+        public:
+            GapHookMemory(VC::GuestMemory& inner_, u8* gap_byte_)
+                : inner{inner_}, gap_byte{gap_byte_} {}
+
+            bool Read(u64 va, void* dst, size_t size) override {
+                if (va == EVENT_VA && size == sizeof(u32) && !injected.exchange(true)) {
+                    *gap_byte = 0x77;
+                    const u32 signaled = 1;
+                    std::memcpy(dst, &signaled, sizeof(signaled));
+                    return true;
+                }
+                return inner.Read(va, dst, size);
+            }
+            bool Write(u64 va, const void* src, size_t size) override {
+                return inner.Write(va, src, size);
+            }
+            u8* Pointer(u64 va) override {
+                return inner.Pointer(va);
+            }
+
+            VC::GuestMemory& inner;
+            u8* gap_byte;
+            std::atomic<bool> injected{false};
+        } gap_hook{memory, tex_mem + RT_OFFSET + ROW_BYTES + 4};
+
+        context.SetGuestMemory(&gap_hook);
+        std::vector<u64> list;
+        VC::ClearTexturePayload clear{};
+        clear.texture = {.serial = TEX_LINEAR_RT, .level = 0, .layer = 0};
+        clear.region = {0, 0, 0, static_cast<s32>(WIDTH), static_cast<s32>(HEIGHT), 1};
+        clear.layer_count = 1;
+        clear.is_integer = 0;
+        const float color[4] = {0.5f, -1.0f, 0.0f, 4.0f};
+        std::memcpy(clear.color, color, sizeof(color));
+        Push(list, VC::Op::ClearTexture, clear, 0xF);
+        // Copy 4 bytes out of RT_OFFSET to force FlushLinearWritebacks (and mirror capture) before
+        // WaitEvent reads EVENT_VA.
+        Push(list, VC::Op::CopyBufferToBuffer,
+             VC::CopyBufferToBufferPayload{.src = TEX_POOL_VA + RT_OFFSET,
+                                            .dst = READBACK_VA + 8192,
+                                            .size = 4});
+        PushWaitEvent(list, EVENT_VA, VC::EVENT_WAIT_EQUAL, 1);
+        PushEnd(list);
+        context.Submit(MakeSubmission(5, 0, std::move(list), {TEX_LINEAR_RT}));
+        REQUIRE(context.Wait(5, 20s));
+        CHECK(gap_hook.injected.load());
+        CHECK(tex_mem[RT_OFFSET + ROW_BYTES + 4] == 0x77);
+        context.SetGuestMemory(&memory);
+        for (u32 y = 0; y < HEIGHT; ++y) {
+            const u8* row = tex_mem + RT_OFFSET + y * STRIDE;
+            for (u32 x = 0; x < WIDTH; ++x) {
+                std::array<u16, 4> actual{};
+                std::memcpy(actual.data(), row + x * sizeof(actual), sizeof(actual));
+                REQUIRE(actual == expected_copy);
+            }
+        }
+    }
+
     REQUIRE(context.Stats().ops_failed == 0);
     context.SetGuestMemory(nullptr);
 }

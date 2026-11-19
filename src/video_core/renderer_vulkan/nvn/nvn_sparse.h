@@ -66,9 +66,13 @@ public:
     /// reference). `reused`: the page existed before replay step `epoch`, so its texels were
     /// uploaded or written earlier in the command stream. NoPage when out of memory.
     [[nodiscard]] u32 AcquireShared(const SparseAliasKey& key, u32 memory_type_bits, u64 epoch,
-                                    bool& reused);
+                                    bool& reused, bool allow_alloc = true);
+    /// Whether `page` is currently held in the shared key map (regardless of key).
+    [[nodiscard]] bool IsShared(u32 page) const;
     /// Whether `page` is the shared page of `key`.
     [[nodiscard]] bool HoldsKey(u32 page, const SparseAliasKey& key) const;
+    void MarkSharedStale(u32 page);
+    void ClearSharedStale(u32 page);
     /// Drops one reference; the page is free when the last one goes.
     void Free(u32 page);
     /// Bytes saved by sharing: references beyond the first of each shared page.
@@ -114,6 +118,7 @@ private:
     std::vector<u32> free_;
     std::vector<u32> refs_;  ///< per page: references (0 free)
     std::vector<u64> epoch_; ///< per shared page: the replay step that allocated it
+    std::vector<u8> stale_;  ///< per shared page: owning tile has un-uploaded guest changes
     std::unordered_map<SparseAliasKey, u32, SparseAliasKeyHash> by_key_;
     std::unordered_map<u32, SparseAliasKey> key_of_;
     u64 shared_extra_refs_{0};
@@ -235,13 +240,18 @@ private:
     std::vector<u32>& TilePages(u32 id);
     bool BindUnit(Context::Impl& impl, const Storage& s, bool tail, u32 id, bool bind,
                   std::vector<VkSparseImageMemoryBind>& image_binds,
-                  std::vector<VkSparseMemoryBind>& opaque_binds, bool* reused = nullptr);
+                  std::vector<VkSparseMemoryBind>& opaque_binds, bool* reused = nullptr,
+                  bool allow_alloc = true);
     /// The guest address of tile `id`'s 64 KiB, when one physical run maps all of it.
     bool TileSource(Context::Impl& impl, const Storage& s, u32 id, u64& source) const;
-    /// The alias key of host block `slot` of a tile whose bytes are at `source`.
-    [[nodiscard]] SparseAliasKey KeyOf(u64 source, u32 slot) const {
-        return {source, shape_ ^ (static_cast<u64>(slot + 1) * 0xC2B2AE3D27D4EB4FULL)};
+    /// The alias key of host block `slot` of valid extent (`width`, `height`) whose bytes are at
+    /// `source`.
+    [[nodiscard]] SparseAliasKey KeyOf(u64 source, u32 slot, u32 width, u32 height) const {
+        u64 key_shape = shape_ ^ (static_cast<u64>(slot + 1) * 0xC2B2AE3D27D4EB4FULL);
+        key_shape ^= ((static_cast<u64>(width) << 32) | height) * 0x9E3779B97F4A7C15ULL;
+        return {source, key_shape};
     }
+    void SetTilePagesStale(u32 id, bool stale);
     /// Whether the bound pages of tile `id` still hold the bytes its guest mapping points at.
     bool TilePagesCurrent(Context::Impl& impl, const Storage& s, u32 id);
 

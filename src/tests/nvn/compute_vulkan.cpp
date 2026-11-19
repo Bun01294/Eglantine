@@ -4839,3 +4839,63 @@ TEST_CASE("NVN inline uniform: early submit does not split pending updates outsi
     CHECK(rig.context.Stats().ops_failed == 0);
     CHECK(rig.context.Stats().ops_unsupported == 0);
 }
+
+TEST_CASE("NVN inline uniform: misaligned DeviceLocal UBO preserves GPU writes plus inline update",
+          "[nvn][compute][inline]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    constexpr u64 UBO_OFFSET = 0x5040;
+    constexpr u64 UBO_VA = VERTEX_POOL_VA + UBO_OFFSET;
+    VertexMirrorRig rig(*vulkan, false, false, 0, std::nullopt, 1 /* POOL_CPU_NO_ACCESS */, false);
+
+    // ClearBuffer writes F32_FIVE (off-screen) to +0x00 on the GPU while guest RAM stays 0.0f.
+    // Losing GPU bytes to stale guest RAM would draw on-screen (1 sample) instead of clipping (0).
+    {
+        std::vector<u64> list;
+        VertexMirrorRig::PushTargetSetup(list, PROGRAM_UNIFORM_XY, UBO_OFFSET, 256);
+        Push(list, VC::Op::ClearBuffer,
+             VC::ClearBufferPayload{.address = UBO_VA + 0x00, .size = 256, .value = F32_FIVE});
+        Push(list, VC::Op::ResetCounter, VC::ResetCounterPayload{.counter_type = SAMPLES_PASSED});
+        VertexMirrorRig::PushInlineU32(list, UBO_VA + 0x10, F32_ONE_64TH);
+        Push(list, VC::Op::Draw,
+             VC::DrawPayload{.mode = 0, .first = 0, .count = 1, .instance_count = 1});
+        CHECK(rig.SubmitAndCount(list) == 0);
+    }
+
+    // Outside a pass: GPU ClearBuffer sets +0x00 to 1/64, inline update sets +0x10 to 1/64.
+    {
+        std::vector<u64> list;
+        VertexMirrorRig::PushTargetSetup(list, PROGRAM_UNIFORM_XY, UBO_OFFSET, 256);
+        Push(list, VC::Op::ClearBuffer,
+             VC::ClearBufferPayload{.address = UBO_VA + 0x00, .size = 256, .value = F32_FIVE});
+        Push(list, VC::Op::ClearBuffer,
+             VC::ClearBufferPayload{.address = UBO_VA + 0x00, .size = 4, .value = F32_ONE_64TH});
+        Push(list, VC::Op::ResetCounter, VC::ResetCounterPayload{.counter_type = SAMPLES_PASSED});
+        VertexMirrorRig::PushInlineU32(list, UBO_VA + 0x10, F32_ONE_64TH);
+        Push(list, VC::Op::Draw,
+             VC::DrawPayload{.mode = 0, .first = 0, .count = 1, .instance_count = 1});
+        CHECK(rig.SubmitAndCount(list) == 1);
+    }
+
+    // Inside an open pass: pass ends, inline updates flush, and GPU copy preserves both.
+    {
+        std::vector<u64> list;
+        VertexMirrorRig::PushTargetSetup(list, PROGRAM_UNIFORM_XY, UBO_OFFSET, 256);
+        Push(list, VC::Op::ClearBuffer,
+             VC::ClearBufferPayload{.address = UBO_VA + 0x00, .size = 256, .value = F32_FIVE});
+        Push(list, VC::Op::ClearBuffer,
+             VC::ClearBufferPayload{.address = UBO_VA + 0x00, .size = 4, .value = F32_ONE_64TH});
+        Push(list, VC::Op::ResetCounter, VC::ResetCounterPayload{.counter_type = SAMPLES_PASSED});
+        Push(list, VC::Op::Draw,
+             VC::DrawPayload{.mode = 0, .first = 0, .count = 1, .instance_count = 1});
+        VertexMirrorRig::PushInlineU32(list, UBO_VA + 0x10, F32_ONE_64TH);
+        Push(list, VC::Op::Draw,
+             VC::DrawPayload{.mode = 0, .first = 0, .count = 1, .instance_count = 1});
+        CHECK(rig.SubmitAndCount(list) == 1);
+    }
+
+    CHECK(rig.context.Stats().ops_failed == 0);
+    CHECK(rig.context.Stats().ops_unsupported == 0);
+}

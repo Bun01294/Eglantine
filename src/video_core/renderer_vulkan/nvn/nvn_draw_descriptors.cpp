@@ -384,8 +384,28 @@ constexpr u64 FROZEN_CHUNK = 4096;
 class FrozenOracle final : public TextureOracle {
 public:
     struct Uniform {
-        std::vector<u8> bytes;          ///< the bound range (inline updates applied)
-        std::vector<u8> readable;       ///< per FROZEN_CHUNK: guest memory could be read
+        std::vector<u8> bytes;    ///< the bound range (inline updates applied)
+        std::vector<u8> readable; ///< per FROZEN_CHUNK: guest memory could be read
+        std::vector<std::pair<u64, u64>> inline_written; ///< byte spans written by inline updates
+
+        [[nodiscard]] bool WordReadable(u64 offset) const noexcept {
+            for (u64 byte = offset; byte < offset + sizeof(u32); ++byte) {
+                if (readable[byte / FROZEN_CHUNK] != 0) {
+                    continue;
+                }
+                bool covered = false;
+                for (const auto& [lo, hi] : inline_written) {
+                    if (lo <= byte && byte < hi) {
+                        covered = true;
+                        break;
+                    }
+                }
+                if (!covered) {
+                    return false;
+                }
+            }
+            return true;
+        }
     };
     struct Stage {
         std::array<u32, 64> combined{};
@@ -449,11 +469,8 @@ private:
             if (u64{offset} + sizeof(u32) > uniform.bytes.size()) {
                 return std::nullopt;
             }
-            for (u64 at = offset / FROZEN_CHUNK; at <= (offset + sizeof(u32) - 1) / FROZEN_CHUNK;
-                 ++at) {
-                if (!uniform.readable[at]) {
-                    return std::nullopt;
-                }
+            if (!uniform.WordReadable(offset)) {
+                return std::nullopt;
             }
             u32 value;
             std::memcpy(&value, uniform.bytes.data() + offset, sizeof(value));
@@ -525,11 +542,15 @@ std::unique_ptr<TextureOracle> DrawContext::FreezeOracle(
             }
             uniform.bytes.resize(size);
             uniform.readable.assign((size + FROZEN_CHUNK - 1) / FROZEN_CHUNK, 0);
+            uniform.inline_written.clear();
+            bool all_readable = false;
             if (ReadSnapshotBytes(binding.address, uniform.bytes.data(), size)) {
                 std::fill(uniform.readable.begin(), uniform.readable.end(), u8{1});
+                all_readable = true;
             } else {
                 if (memory->Read(binding.address, uniform.bytes.data(), size)) {
                     std::fill(uniform.readable.begin(), uniform.readable.end(), u8{1});
+                    all_readable = true;
                 } else {
                     for (u64 chunk = 0; chunk < uniform.readable.size(); ++chunk) {
                         const u64 begin = chunk * FROZEN_CHUNK;
@@ -542,8 +563,9 @@ std::unique_ptr<TextureOracle> DrawContext::FreezeOracle(
                     }
                 }
                 if (host != nullptr) {
-                    impl.ApplyPendingInlineWrites(binding.address, uniform.bytes.data(), size,
-                                                  host->HostFlight().seq);
+                    impl.ApplyPendingInlineWrites(
+                        binding.address, uniform.bytes.data(), size, host->HostFlight().seq,
+                        all_readable ? nullptr : &uniform.inline_written);
                 }
             }
             // Inline updates of this submission are newer than guest memory; the last one wins.
@@ -553,9 +575,9 @@ std::unique_ptr<TextureOracle> DrawContext::FreezeOracle(
                 if (lo < hi) {
                     std::memcpy(uniform.bytes.data() + (lo - binding.address),
                                 update.data + (lo - update.address), hi - lo);
-                    for (u64 chunk = (lo - binding.address) / FROZEN_CHUNK;
-                         chunk <= (hi - 1 - binding.address) / FROZEN_CHUNK; ++chunk) {
-                        uniform.readable[chunk] = 1;
+                    if (!all_readable) {
+                        uniform.inline_written.emplace_back(lo - binding.address,
+                                                            hi - binding.address);
                     }
                 }
             }
@@ -1046,12 +1068,31 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
         }
         const bool misaligned = resolved && uniform && (ref.offset % 256) != 0;
         const u64 current_seq = host->HostFlight().seq;
+        const bool needs_gpu_source =
+            resolved && !write && snapshot_range == UniformSnapshotView::npos &&
+            (ref.pool->backing == Pool::Backing::DeviceLocal ||
+             HasOverlappingShadow(*ref.pool, ref.pool_offset, ref.pool_offset + size) ||
+             impl.NeedsGpuFlushForUniform(binding.address, binding.address + size, current_seq));
+        if (misaligned && needs_gpu_source) {
+            const BufferRef copy = AllocArena(size, 256, nullptr);
+            if (copy.buffer) {
+                if (overlaps) {
+                    plan.flush_inline = true;
+                }
+                plan.UseRange(ref.pool, ref.pool_offset, size, false, DrawPlan::RangeUse::NO_INFO,
+                              false, false);
+                plan.uniform_copies.push_back(
+                    {ref.buffer, ref.offset, copy.buffer, copy.offset, size});
+                if (cs_mode != CostSplit::Mode::Count) [[unlikely]] {
+                    CostSplitNote(CostSplit::Data::Uniform, ref, size, true);
+                }
+                return VkDescriptorBufferInfo{copy.buffer, copy.offset, size};
+            }
+        }
         bool flush_inline_to_pool = false;
         if (overlaps && !misaligned && resolved && !write &&
             snapshot_range == UniformSnapshotView::npos) {
-            if (!pass_open || ref.pool->backing == Pool::Backing::DeviceLocal ||
-                HasOverlappingShadow(*ref.pool, ref.pool_offset, ref.pool_offset + size) ||
-                impl.NeedsGpuFlushForUniform(binding.address, binding.address + size, current_seq)) {
+            if (!pass_open || needs_gpu_source) {
                 flush_inline_to_pool = true;
                 plan.flush_inline = true;
             }
@@ -1783,7 +1824,7 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
             need = true;
         }
     }
-    if (plan.flush_inline && !inline_updates.empty()) {
+    if ((plan.flush_inline && !inline_updates.empty()) || !plan.uniform_copies.empty()) {
         if (!need) {
             cause = BreakCause::InlineUpdate;
         }
@@ -1855,6 +1896,18 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
         }
         if (shadow.any) {
             ApplyShadows(plan, true);
+        }
+        if (!plan.uniform_copies.empty()) {
+            host->HostFlushBarrier();
+            for (const DrawPlan::UniformCopy& copy : plan.uniform_copies) {
+                const VkBufferCopy region{
+                    .srcOffset = copy.src_offset,
+                    .dstOffset = copy.dst_offset,
+                    .size = copy.size,
+                };
+                host->HostCmd().CopyBuffer(copy.src, copy.dst, region);
+            }
+            host->HostMarkWritten();
         }
         // A dispatch orders after earlier dispatches only as NVN does (behind a game barrier);
         // the replay's own commands above flushed for themselves.
