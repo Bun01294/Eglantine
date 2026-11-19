@@ -532,8 +532,12 @@ void nvnCommandBufferBindTransformFeedbackBuffers(Call& c) {
     const s32 first = c.args.NextS32();
     const s32 count = c.args.NextS32();
     const u64 ranges = c.args.NextPointer();
-    // NVN has 4 transform feedback buffers; a larger count is a bad argument, not a loop.
-    for (s32 i = 0; i < count && i < 16; ++i) {
+    // NVN has 4 transform feedback buffers; a range outside them is a bad argument: bind nothing.
+    constexpr s64 TransformFeedbackSlots = 4;
+    if (first < 0 || count < 0 || s64{first} + s64{count} > TransformFeedbackSlots) {
+        return;
+    }
+    for (s32 i = 0; i < count; ++i) {
         const auto range = c.Load<VC::BufferRange>(ranges + static_cast<u64>(i) * sizeof(VC::BufferRange));
         c.rec.BindTransformFeedbackBuffer(cmd, first + i, range.address, range.size);
     }

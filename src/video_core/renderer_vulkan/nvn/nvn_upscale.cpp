@@ -431,8 +431,13 @@ bool DrawContext::UpscaleNetwork(const VideoCore::Upscaler::Rect& input_rect,
             depth = texture->second;
         }
     }
+    // As EvaluateDlss: the output's other texels survive unless the rectangle covers the level.
+    const bool covers_output = output_rect.x == 0 && output_rect.y == 0 &&
+                               output->storage->levels == 1 && output->storage->layers == 1 &&
+                               output_rect.width == output->desc.width &&
+                               output_rect.height == output->desc.height;
     if (!host->HostEnsureContents(*colour->storage, false) ||
-        !host->HostEnsureContents(*output->storage, true) ||
+        !host->HostEnsureContents(*output->storage, covers_output) ||
         (depth && !host->HostEnsureContents(*depth->storage, false))) {
         return false;
     }

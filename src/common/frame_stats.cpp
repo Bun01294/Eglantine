@@ -217,6 +217,11 @@ void DumpNow(const std::filesystem::path& directory) {
     const std::filesystem::path path = directory / "frame-stats.txt";
     std::ofstream out{path, std::ios::trunc};
     out << text;
+    out.close();
+    if (!out) {
+        LOG_ERROR(Core, "[diag] cannot write stats to {}", path.string());
+        return;
+    }
     LOG_INFO(Core, "[diag] stats written to {}", path.string());
 }
 

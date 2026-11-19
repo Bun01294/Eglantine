@@ -182,7 +182,8 @@ struct GraphicsPipelineParams {
 };
 
 /// A VkGraphicsPipelineCreateInfo and the state structures it points to (not copyable: `ci`
-/// points into the object).
+/// points into the object). `ci.pStages` borrows GraphicsPipelineParams::stages and what it
+/// references: the caller keeps those alive until the pipeline creation call returns.
 struct GraphicsPipelineDescription {
     GraphicsPipelineDescription() = default;
     GraphicsPipelineDescription(const GraphicsPipelineDescription&) = delete;

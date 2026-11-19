@@ -326,6 +326,29 @@ void DrawContext::AppendBindingDump(std::string& text, const PipelineBase& pipe)
             }
             break;
         }
+        case VC::DescriptorKind::UniformTexelBuffer:
+            // BuildDescriptors binds a copy of the texture buffer's bytes (TexelBufferView).
+            for (u32 i = 0; i < binding.count; ++i) {
+                VC::HandleRef texture_ref = binding.texture;
+                texture_ref.slot += i;
+                texture_ref.byte_offset += i * VC::HandleStride;
+                const u32 texture_word =
+                    ReadBindingHandleWord(layout, binding, texture_ref, VC::HandleWordKind::Texture)
+                        .value_or(0);
+                text += fmt::format("{} texel buffer slot {} handle {:#x}", head, texture_ref.slot,
+                                    texture_word);
+                const std::shared_ptr<Texture>& texture = TextureOfId(VC::TextureIdOf(texture_word));
+                if (texture) {
+                    const VC::TextureDesc& desc = texture->desc;
+                    text += fmt::format(" -> t{:x} width {} format {} target {} (pool {:x} + "
+                                        "{:#x})\n",
+                                        texture->serial, desc.width, desc.format, desc.target,
+                                        desc.pool_serial, desc.pool_offset);
+                } else {
+                    text += " -> no texture: zeros bound\n";
+                }
+            }
+            break;
         default:
             text += fmt::format("{} texel buffer slot {}: not supported, not bound\n", head,
                                 binding.slot);
@@ -489,16 +512,29 @@ bool DrawContext::ProbeDraw(const PipelineBase& pipe, u32 mode, u32 element_coun
                             index->bytes, index->type, info.index_staged);
         const u8* data = impl.GuestPointer(index->address, index->bytes);
         if (data != nullptr && index->bytes >= size) {
+            // The restart marker (all ones in the index type, as the host binds it) is no vertex.
+            const bool restart = fixed.primitive_restart != 0;
+            const u32 marker = size == 4 ? ~0u : (1u << (size * 8)) - 1;
             u32 lo = ~0u;
             u32 hi = 0;
+            bool any = false;
             for (u64 i = 0; i + size <= index->bytes; i += size) {
                 u32 value = 0;
                 std::memcpy(&value, data + i, size);
+                if (restart && value == marker) {
+                    continue;
+                }
+                any = true;
                 lo = (std::min)(lo, value);
                 hi = (std::max)(hi, value);
             }
-            text += fmt::format(" min {} max {} (bytes needed per stream at max stride {}: {})\n",
-                                lo, hi, max_stride, u64{hi + 1} * max_stride);
+            if (any) {
+                text += fmt::format(
+                    " min {} max {} (bytes needed per stream at max stride {}: {})\n", lo, hi,
+                    max_stride, (u64{hi} + 1) * max_stride);
+            } else {
+                text += " (no vertex indices)\n";
+            }
         } else {
             text += " (not CPU-readable)\n";
         }

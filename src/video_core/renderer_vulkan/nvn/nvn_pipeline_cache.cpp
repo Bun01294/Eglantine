@@ -609,6 +609,13 @@ PipelineCache::Impl::~Impl() {
     }
     workers.reset();
     async_workers.reset();
+    // Jobs the stopped workers dropped unrun: balance their MarkShaderBuilding (AsyncQueued).
+    if (options.shader_notify != nullptr) {
+        std::scoped_lock lock{async_mutex};
+        for (; async_outstanding != 0; --async_outstanding) {
+            options.shader_notify->MarkShaderComplete();
+        }
+    }
     // Optimize jobs hold pipelines and shader sets of the maps: joined before those go.
     part_workers.reset();
     optimize_workers.reset();
@@ -1730,8 +1737,14 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::GetCompute(const ComputeRe
         job->had_variants = had_variants;
         job->pending = std::move(claim);
         AsyncQueued();
+        try {
+            async_workers->QueueWork([this, job] { RunAsyncCompute(*job); });
+        } catch (...) {
+            AsyncDone();
+            ReleasePending(pending_compute, key, job->pending);
+            throw;
+        }
         ++stat_async_queued;
-        async_workers->QueueWork([this, job] { RunAsyncCompute(*job); });
         *not_ready = true;
         NoteNotReady("dispatch", hashes);
         return nullptr;

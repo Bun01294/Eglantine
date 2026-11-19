@@ -327,7 +327,7 @@ TEST_CASE("nvn hle texture: TextureInitialize produces the expected TextureDesc"
         CHECK((rig.Call("nvnTextureCompare", {I(TEXTURE), I(TEXTURE2)}) & 0xFF) == 0);
         // The mapping set explicitly to the identity equals no mapping at all.
         std::vector<u8> plain = Bytes(rig, BUILDER, 0x60);
-        plain[0x58] = 0;
+        plain[0x58] &= static_cast<u8>(~1u); // clear set_swizzle only; keep the stencil mode
         Put<u16>(plain, 0x5A, 0);
         REQUIRE(rig.memory.Write(BUILDER2, plain.data(), plain.size()));
         REQUIRE((rig.Call("nvnTextureInitialize", {I(Rig::Obj(12)), I(BUILDER2)}) & 0xFF) == 1);
@@ -655,6 +655,15 @@ TEST_CASE("nvn hle texture: view setters write the nxnative view_t bytes", "[nvn
     }
 
     SECTION("Compare ignores values of parameters that are not set") {
+        // Two default views, one holding a base level whose flag is not set: equal.
+        constexpr u64 VIEW3 = Rig::Obj(20);
+        rig.Call("nvnTextureViewSetDefaults", {I(VIEW2)});
+        rig.Call("nvnTextureViewSetDefaults", {I(VIEW3)});
+        auto unset = rig.memory.Get<VideoCommon::Nvn::GuestTextureView>(VIEW3);
+        unset.base_level = 4;
+        rig.memory.Put(VIEW3, unset);
+        CHECK((rig.Call("nvnTextureViewCompare", {I(VIEW2), I(VIEW3)}) & 0xFF) == 1);
+
         rig.Call("nvnTextureViewSetDefaults", {I(VIEW2)});
         CHECK((rig.Call("nvnTextureViewCompare", {I(VIEW), I(VIEW2)}) & 0xFF) == 0);
         rig.Call("nvnTextureViewSetLevels", {I(VIEW2), I(1), I(3)});

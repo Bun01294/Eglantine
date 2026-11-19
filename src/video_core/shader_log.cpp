@@ -207,14 +207,16 @@ private:
                                                       [this] { return !queue.empty() || stopping; });
                 }
                 if (queue.empty()) {
-                    if (stopping || final_defer) {
+                    // Read under queue_mutex; a Stop during the drain is seen next iteration.
+                    const bool stop_now = stopping;
+                    if (stop_now || final_defer) {
                         // Nothing more is coming (or the wait ran out): write what is deferred.
                         lock.unlock();
                         while (!deferred.empty()) {
                             WritePipeline(deferred.front());
                             deferred.pop_front();
                         }
-                        if (stopping) {
+                        if (stop_now) {
                             break;
                         }
                         continue;
@@ -251,7 +253,10 @@ private:
         WriteSessionJson(true);
         // The session is over: release the file (the session object outlives the game, and an open
         // handle keeps the session folder from being moved or removed until the next session).
-        jsonl.close();
+        // jsonl is opened by EnsureDirectory (possibly on another thread) before dir_ready is set.
+        if (dir_ready.load(std::memory_order_acquire)) {
+            jsonl.close();
+        }
     }
 
     bool MissingProgram(const PipelineJob& pipeline) const {
@@ -264,7 +269,8 @@ private:
     }
 
     void FlushStreams() {
-        if (jsonl.is_open()) {
+        // Until dir_ready, EnsureDirectory may be opening jsonl on another thread.
+        if (dir_ready.load(std::memory_order_acquire) && jsonl.is_open()) {
             jsonl.flush();
         }
     }
@@ -346,6 +352,7 @@ private:
         std::ofstream out(directory / name, std::ios::binary | std::ios::trunc);
         if (out) {
             out.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
+            out.close();
         }
         if (!out) {
             if (!write_failed) {

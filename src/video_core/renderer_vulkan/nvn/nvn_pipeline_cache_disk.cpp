@@ -116,6 +116,8 @@ void PipelineCache::Impl::WriteVkCache() {
     if (vk_cache_path.empty()) {
         return; // use_vulkan_driver_pipeline_cache is off: nothing is saved
     }
+    // Pipelines created from here on may be missing from the blob: they stay counted.
+    const u64 claimed = new_since_vk_write.load();
     size_t size = 0;
     if (vk_cache.Read(&size, nullptr) != VK_SUCCESS || size == 0) {
         return;
@@ -141,7 +143,7 @@ void PipelineCache::Impl::WriteVkCache() {
     put(&crc, sizeof(crc));
     put(data.data(), data.size());
     if (Disk::WriteFileAtomic(vk_cache_path, file)) {
-        new_since_vk_write = 0;
+        new_since_vk_write.fetch_sub(claimed);
         LOG_INFO(Render_Vulkan, "[nvn] driver pipeline cache written: {} bytes", data.size());
     } else {
         LOG_ERROR(Render_Vulkan, "[nvn] driver pipeline cache {} could not be written",
@@ -322,6 +324,7 @@ void PipelineCache::Impl::RunLoader(std::stop_token stop) {
         }
         loader_cv.notify_all();
     };
+    bool complete_reported = false;
     try {
         Disk::Contents contents;
         const Disk::LoadResult result = Disk::LoadFile(disk_path, disk_header, contents);
@@ -437,6 +440,7 @@ void PipelineCache::Impl::RunLoader(std::stop_token stop) {
         if (preload_reporting) {
             // Whatever ended the preload (finished, stopped), the screen moves on.
             options.load_progress->Report(VideoCore::LoadCallbackStage::Complete, 0, 0);
+            complete_reported = true;
         }
         if (!stop.stop_requested()) {
             if (result.status == Disk::LoadStatus::Loaded) {
@@ -453,6 +457,9 @@ void PipelineCache::Impl::RunLoader(std::stop_token stop) {
     } catch (const std::exception& e) {
         LOG_ERROR(Render_Vulkan, "[nvn] pipeline cache load failed: {}", e.what());
         writer.SetState(DiskWriter::State::Disabled);
+        if (preload_reporting && !complete_reported) {
+            options.load_progress->Report(VideoCore::LoadCallbackStage::Complete, 0, 0);
+        }
     }
     finish();
 }

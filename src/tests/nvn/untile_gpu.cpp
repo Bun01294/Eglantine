@@ -198,6 +198,13 @@ TEST_CASE("NVN untile GPU: the shader's linear bytes equal the CPU untile's", "[
         std::vector<u8> expected;
         u64 input_base;
         u64 output_base;
+        std::vector<u64> gpu_offsets; ///< per plan piece: where the shader writes it
+    };
+    // As the replay does (nvn_exec.cpp): each piece's output at an offset the shader can bind,
+    // compared with the CPU untile's bytes at its own staging offset.
+    const u64 alignment = (std::max)(std::max<u64>(device.GetStorageBufferAlignment(), 16), u64{64});
+    const auto align = [alignment](u64 value) {
+        return (value + alignment - 1) / alignment * alignment;
     };
     std::mt19937 random(4321);
     std::vector<Case> cases;
@@ -224,10 +231,13 @@ TEST_CASE("NVN untile GPU: the shader's linear bytes equal the CPU untile's", "[
         c.output_base = (output_size + 4095) / 4096 * 4096;
         const Nvn::BlockInfo block = Nvn::FormatBlockInfo(shape.format);
         u64 input_end = c.input_base + guest.size();
+        u64 gpu_end = c.output_base;
         for (const Nvn::UploadPiece& piece : c.plan.pieces) {
+            gpu_end = align(gpu_end);
+            c.gpu_offsets.push_back(gpu_end);
             UntileGpu::Piece gpu{
                 .input_offset = c.input_base + piece.guest_offset,
-                .output_offset = c.output_base + piece.staging_offset,
+                .output_offset = gpu_end,
                 .columns = piece.cols,
                 .rows = piece.rows,
                 .slices = piece.slices,
@@ -236,12 +246,13 @@ TEST_CASE("NVN untile GPU: the shader's linear bytes equal the CPU untile's", "[
                 .tile_depth = piece.tile_d,
             };
             input_end = (std::max)(input_end, gpu.input_offset + UntileGpu::InputSize(gpu));
+            gpu_end += piece.staging_size;
             c.pieces.push_back(gpu);
         }
         input_bytes.resize(static_cast<size_t>(input_end), 0);
         std::memcpy(input_bytes.data() + c.input_base, guest.data(), guest.size());
         // Whole 32-bit words: the shader's u32 view of the last piece's range.
-        output_size = (c.output_base + c.plan.staging_size + 3) & ~u64{3};
+        output_size = (gpu_end + 3) & ~u64{3};
         cases.push_back(std::move(c));
     }
 
@@ -329,8 +340,9 @@ TEST_CASE("NVN untile GPU: the shader's linear bytes equal the CPU untile's", "[
         for (const Case& c : cases) {
             INFO(c.shape->name);
             size_t wrong = 0;
-            for (const Nvn::UploadPiece& piece : c.plan.pieces) {
-                const u8* got = actual + c.output_base + piece.staging_offset;
+            for (size_t p = 0; p < c.plan.pieces.size(); ++p) {
+                const Nvn::UploadPiece& piece = c.plan.pieces[p];
+                const u8* got = actual + c.gpu_offsets[p];
                 const u8* want = c.expected.data() + piece.staging_offset;
                 for (u64 i = 0; i < piece.staging_size; ++i) {
                     if (got[i] != want[i]) {

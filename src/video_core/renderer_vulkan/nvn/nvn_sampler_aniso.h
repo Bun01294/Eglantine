@@ -74,7 +74,9 @@ namespace Vulkan::Nvn {
     if (steps <= 0 || (guest < 2.0f && !accepts_added)) {
         return guest;
     }
-    const u32 base = std::bit_floor(static_cast<u32>((std::max)(guest, 1.0f)));
+    // A NaN or huge guest value must not reach the u32 conversion.
+    const f32 normalized = std::isfinite(guest) ? std::clamp(guest, 1.0f, 65536.0f) : 1.0f;
+    const u32 base = std::bit_floor(static_cast<u32>(normalized));
     return std::ldexp(static_cast<f32>(base), steps);
 }
 

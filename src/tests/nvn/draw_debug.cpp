@@ -42,12 +42,13 @@ TEST_CASE("nvn draw debug: every descriptor fallback reason has a name", "[nvn]"
 TEST_CASE("nvn draw debug: a dump converts to a top-down TGA with statistics", "[nvn]") {
     const Tests::TempDir temp{"nvn-draw-debug-test"};
     const auto path = (temp.Path() / "dump.tga").string();
-    // 2x1 RGBA8: red, and half-transparent green.
-    const std::array<u8, 8> pixels{255, 0, 0, 255, 0, 255, 0, 128};
+    // 2x2 RGBA8: red and half-transparent green, then blue and white.
+    const std::array<u8, 16> pixels{255, 0,   0, 255, 0,   255, 0,   128,
+                                    0,   0, 255, 255, 255, 255, 255, 255};
     Debug::PendingDump dump;
     dump.path = path;
     dump.width = 2;
-    dump.height = 1;
+    dump.height = 2;
     dump.format = VK_FORMAT_R8G8B8A8_UNORM;
     dump.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     const std::string summary = Debug::WriteTga(dump, pixels);
@@ -55,16 +56,19 @@ TEST_CASE("nvn draw debug: a dump converts to a top-down TGA with statistics", "
 
     const std::vector<u8> file = ReadFile(path);
     std::filesystem::remove(path);
-    REQUIRE(file.size() == 18 + 2 * 4);
+    REQUIRE(file.size() == 18 + 4 * 4);
     REQUIRE(file[2] == 2);   // uncompressed true color
     REQUIRE(file[12] == 2);  // width
-    REQUIRE(file[14] == 1);  // height
+    REQUIRE(file[14] == 2);  // height
     REQUIRE(file[16] == 32); // bits per pixel
     REQUIRE((file[17] & 0x20) != 0); // top-down
-    // BGRA order: red pixel first.
+    // BGRA order, top row first: red pixel first, the blue one starts the second row.
     REQUIRE(file[18] == 0);
     REQUIRE(file[19] == 0);
     REQUIRE(file[20] == 255);
+    REQUIRE(file[26] == 255);
+    REQUIRE(file[27] == 0);
+    REQUIRE(file[28] == 0);
     // 8-bit colour is exact in the TGA: no .raw next to it.
     REQUIRE(!std::filesystem::exists(path + ".raw"));
 }
@@ -139,33 +143,38 @@ TEST_CASE("nvn draw debug: a thumbnail dump is box-downscaled, statistics cover 
           "[nvn]") {
     const Tests::TempDir temp{"nvn-draw-debug-test"};
     const auto path = (temp.Path() / "dump.tga").string();
-    // 5x2 RGBA8 with a width cap of 2: factor ceil(5/2) = 3, so the TGA is 1x1 (the height
-    // 2/3 clamps to 1) and holds the average of the 3x2 top-left box.
-    std::array<u8, 5 * 2 * 4> pixels{};
-    for (u32 i = 0; i < 10; ++i) {
-        pixels[i * 4 + 0] = i % 5 < 3 ? 255 : 0; // red in columns 0..2 of both rows
+    // 6x2 RGBA8 with a width cap of 2: factor ceil(6/2) = 3, so the TGA is 2x1 (the height
+    // 2/3 clamps to 1) and holds the averages of the two 3x2 boxes.
+    std::array<u8, 6 * 2 * 4> pixels{};
+    // Red in 4 of the left box's 6 pixels and 2 of the right box's: averages 170 and 85, which
+    // no single sample of either box gives.
+    for (const u32 i : {0u, 1u, 2u, 6u, 5u, 11u}) {
+        pixels[i * 4 + 0] = 255;
+    }
+    for (u32 i = 0; i < 12; ++i) {
         pixels[i * 4 + 3] = 255;
     }
     Debug::PendingDump dump;
     dump.path = path;
-    dump.width = 5;
+    dump.width = 6;
     dump.height = 2;
     dump.format = VK_FORMAT_R8G8B8A8_UNORM;
     dump.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     dump.thumb_width = 2;
     const std::string summary = Debug::WriteTga(dump, pixels);
-    REQUIRE(summary.find("mean=(0.6,0,0,1)") != std::string::npos); // 6 of 10 pixels
-    REQUIRE(summary.find("nonzero=60.00%") != std::string::npos);
+    REQUIRE(summary.find("mean=(0.5,0,0,1)") != std::string::npos); // 6 of 12 pixels
+    REQUIRE(summary.find("nonzero=50.00%") != std::string::npos);
     const std::vector<u8> file = ReadFile(path);
-    REQUIRE(file.size() == 18 + 1 * 4);
-    REQUIRE(file[12] == 1);
+    REQUIRE(file.size() == 18 + 2 * 4);
+    REQUIRE(file[12] == 2);
     REQUIRE(file[14] == 1);
-    REQUIRE(file[20] == 255); // the box average of the three red pixels
+    REQUIRE(file[20] == 170); // the left box's average red (BGRA)
+    REQUIRE(file[24] == 85);  // the right box's
 
     // Depth thumbnails keep no .raw file.
     const float depth = 0.25f;
-    std::array<u8, 5 * 2 * 4> depth_pixels{};
-    for (u32 i = 0; i < 10; ++i) {
+    std::array<u8, 6 * 2 * 4> depth_pixels{};
+    for (u32 i = 0; i < 12; ++i) {
         std::memcpy(depth_pixels.data() + i * 4, &depth, sizeof(depth));
     }
     dump.format = VK_FORMAT_D32_SFLOAT;

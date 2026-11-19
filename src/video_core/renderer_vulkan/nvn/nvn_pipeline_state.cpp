@@ -766,10 +766,11 @@ void BuildVertexInput(const Device& device, const GraphicsFixedState& layout, u3
                                          nvn_format));
         }
         const u32 stream = VCN::VertexAttribState::StreamIndex(word);
-        if (stream >= max_bindings || out.attribute_count >= max_attributes) {
-            issues.push_back(fmt::format("vertex attribute: stream {} or attribute count beyond "
-                                         "the device limit",
-                                         stream));
+        if (stream >= max_bindings || location >= max_attributes ||
+            out.attribute_count >= max_attributes) {
+            issues.push_back(fmt::format("vertex attribute: stream {}, location {} or attribute "
+                                         "count beyond the device limit",
+                                         stream, location));
             continue;
         }
         out.attributes[out.attribute_count++] = {

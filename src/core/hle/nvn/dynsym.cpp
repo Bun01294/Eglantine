@@ -67,7 +67,27 @@ std::vector<DynsymHit> FindDynsymHits(std::span<const u8> image, bool (*wanted)(
     if (!ProbeDynsym(image, layout)) {
         return hits;
     }
-    for (const auto& [name, location] : Core::Symbols::GetSymbols(image)) {
+    // Same result as Core::Symbols::GetSymbols (name-sorted, last entry wins for a repeated name),
+    // but every symbol and string read stays inside the image the probe accepted.
+    std::map<std::string, std::pair<u64, u64>, std::less<>> symbols;
+    for (u64 entry = layout.symtab; entry + SymSize <= layout.strtab; entry += layout.entry_size) {
+        Common::ELF::Elf64_Sym symbol{};
+        if (!ReadAt(image, entry, symbol)) {
+            break;
+        }
+        const u64 name_offset = layout.strtab + symbol.st_name;
+        if (name_offset >= image.size()) {
+            continue;
+        }
+        const char* begin = reinterpret_cast<const char*>(image.data() + name_offset);
+        const size_t max_length = image.size() - name_offset;
+        const size_t length = strnlen(begin, max_length);
+        if (length == max_length) {
+            continue; // Unterminated name.
+        }
+        symbols[std::string{begin, length}] = {symbol.st_value, symbol.st_size};
+    }
+    for (const auto& [name, location] : symbols) {
         if (location.first != 0 && wanted(name)) {
             hits.push_back({name, location.first, location.second});
         }

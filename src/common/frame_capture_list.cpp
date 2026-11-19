@@ -6,6 +6,7 @@
 #include <cstdlib>
 
 #include "common/frame_capture_list.h"
+#include "common/logging.h"
 
 namespace Common::FrameCapture {
 
@@ -50,9 +51,15 @@ bool Listed(u64 present) {
 }
 
 bool Periodic() {
-    static const bool periodic = List().empty() ||
-                                 std::getenv("EDEN_NX2_FRAME_CAPTURE_EVERY") != nullptr ||
-                                 std::getenv("EDEN_NX2_FRAME_CAPTURE_RANGE") != nullptr;
+    static const bool periodic = [] {
+        const char* at = std::getenv("EDEN_NX2_FRAME_CAPTURE_AT");
+        const bool at_supplied = at != nullptr && at[0] != '\0';
+        if (at_supplied && List().empty()) {
+            LOG_WARNING(Core, "EDEN_NX2_FRAME_CAPTURE_AT=\"{}\" has no valid present numbers", at);
+        }
+        return !at_supplied || std::getenv("EDEN_NX2_FRAME_CAPTURE_EVERY") != nullptr ||
+               std::getenv("EDEN_NX2_FRAME_CAPTURE_RANGE") != nullptr;
+    }();
     return periodic;
 }
 

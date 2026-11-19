@@ -8,6 +8,7 @@
 
 #include "common/host_memory.h"
 #include "common/literals.h"
+#include "common/scope_exit.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -240,7 +241,15 @@ TEST_CASE("HostMemory: backing is views of BackingViewSize back to back; ranges 
             backing[View - 32 + i] = static_cast<u8>(i + 1);
         }
         mem.Map(0x100000, View - 64_KiB, 128_KiB, PERMS, HEAP);
-        mem.HintCold(View - 64_KiB, 128_KiB, 0x100000);
+        {
+            const Settings::ColdHintMode previous = Common::ColdHintModeInEffect();
+            Common::OverrideColdHintMode(Settings::ColdHintMode::Always);
+            SCOPE_EXIT {
+                Common::OverrideColdHintMode(previous);
+            };
+            REQUIRE(mem.HintCold(View - 64_KiB, 128_KiB, 0x100000) ==
+                    Common::ColdHintAction::PagedOut);
+        }
         volatile u8* const guest = mem.VirtualBasePointer() + 0x100000 + 64_KiB - 32;
         for (size_t i = 0; i < 64; ++i) {
             REQUIRE(guest[i] == static_cast<u8>(i + 1));

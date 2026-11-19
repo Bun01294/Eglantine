@@ -26,6 +26,7 @@
 #include "core/hle/kernel/kernel.h"
 #include "core/memory.h"
 #include "tests/core/system_test_context.h"
+#include "tests/temp_path.h"
 #include "video_core/nvn_draw_probe.h"
 #include "video_core/nx2_debug_control.h"
 
@@ -517,12 +518,8 @@ TEST_CASE("NVN draw probe skips by stage hash and takes a census per full frame"
     REQUIRE(census.rows[0].elements == 12);
     REQUIRE_FALSE(Probe::Active());
 
-    const std::filesystem::path directory =
-        std::filesystem::temp_directory_path() / "eden-nvn-draw-probe-test";
-    std::filesystem::create_directories(directory);
-    SCOPE_EXIT {
-        std::filesystem::remove_all(directory);
-    };
+    const Tests::TempDir temp_dir{"eden-nvn-draw-probe-test"};
+    const std::filesystem::path& directory = temp_dir.Path();
     const std::string dir = Common::FS::ToUTF8String(directory.generic_u8string());
     Probe::ArmDump(0xb0, dir);
     REQUIRE_FALSE(Probe::DumpRequested(a).has_value());
@@ -542,12 +539,10 @@ TEST_CASE("NVN draw probe dumps the next dispatches of a compute program into on
           "[core][nx2_debug_server]") {
     namespace Probe = VideoCommon::NvnDrawProbe;
     Probe::Reset();
-    const std::filesystem::path directory =
-        std::filesystem::temp_directory_path() / "eden-nvn-dispatch-probe-test";
-    std::filesystem::create_directories(directory);
+    const Tests::TempDir temp_dir{"eden-nvn-dispatch-probe-test"};
+    const std::filesystem::path& directory = temp_dir.Path();
     SCOPE_EXIT {
         Probe::Reset();
-        std::filesystem::remove_all(directory);
     };
     const std::string dir = Common::FS::ToUTF8String(directory.generic_u8string());
     const Probe::DispatchInfo sky{.hash = 0xfd1176a6c7fe62ce, .groups = {1, 1, 1}};

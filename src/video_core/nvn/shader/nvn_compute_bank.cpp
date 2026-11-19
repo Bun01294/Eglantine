@@ -20,7 +20,8 @@ static_assert(sizeof(BufferEntry) == StorageBufferStride);
 } // namespace
 
 u32 ComputeBankSize(const ComputeDriverLayout& layout) noexcept {
-    return (std::max)(layout.end_offset, layout.push_constant_offset);
+    return (std::max)(layout.end_offset,
+                      layout.push_constant_offset + layout.push_constant_words * 4);
 }
 
 void FillComputeDriverBank(const ComputeDriverLayout& layout, const ComputeBankInputs& inputs,

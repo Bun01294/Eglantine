@@ -92,6 +92,10 @@ void nvnBufferInitialize(Call& c) {
         c.ret.SetBool(false);
         return;
     }
+    if (!pool_info) {
+        // Cleared first, as the SDK does before any check.
+        c.Zero(buffer, BufferObjectBytes);
+    }
     if (!pool_info || !c.rec.BufferInitialize(buffer, pool, offset, size)) {
         static Common::BootCounter logged;
         if (logged.First()) {

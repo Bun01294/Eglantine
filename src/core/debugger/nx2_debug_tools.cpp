@@ -838,10 +838,10 @@ json NvnDrawDump(ToolState& state, const json& params) {
         throw std::runtime_error{"hash 0 matches every unused stage"};
     }
     const u32 count = Param<u32>(params, "count", 1, 1, Probe::MaxDumpCount);
+    const int wait_ms = Param<int>(params, "wait_ms", 3000, 0, 10000);
     std::filesystem::create_directories(state.dump_directory);
     const std::string directory = PathText(state.dump_directory);
     Probe::ArmDump(hash, directory, count);
-    const int wait_ms = Param<int>(params, "wait_ms", 3000, 0, 10000);
     Probe::DumpState dump = Probe::GetDump();
     PollFor(state, std::chrono::milliseconds{wait_ms}, [&] {
         dump = Probe::GetDump();

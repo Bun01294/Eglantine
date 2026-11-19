@@ -101,11 +101,18 @@ constexpr bool IsStr32ZeroOffset(u32 w) {
 
 /// The value a 32-bit `mov wd, #imm` (movz, movn or the bitmask form of orr) writes to wd.
 std::optional<std::pair<u32, u32>> DecodeMoveImmediate32(u32 w) {
+    // The 32-bit forms only allow hw 0 or 1 (shift 0 or 16); hw 2 and 3 are reserved.
     if ((w & 0xFF800000) == 0x52800000) { // movz
-        return std::pair{Rd(w), ((w >> 5) & 0xFFFF) << (((w >> 21) & 3) * 16)};
+        if (((w >> 21) & 3) > 1) {
+            return std::nullopt;
+        }
+        return std::pair{Rd(w), ((w >> 5) & 0xFFFF) << (((w >> 21) & 1) * 16)};
     }
     if ((w & 0xFF800000) == 0x12800000) { // movn
-        return std::pair{Rd(w), ~(((w >> 5) & 0xFFFF) << (((w >> 21) & 3) * 16))};
+        if (((w >> 21) & 3) > 1) {
+            return std::nullopt;
+        }
+        return std::pair{Rd(w), ~(((w >> 5) & 0xFFFF) << (((w >> 21) & 1) * 16))};
     }
     if ((w & 0xFF800000) == 0x32000000 && Rn(w) == 31 && ((w >> 22) & 1) == 0) { // orr wd, wzr, #imm
         const u32 immr = (w >> 16) & 63;
@@ -144,7 +151,7 @@ public:
     explicit Words(std::span<const u8> image_) : image{image_} {}
 
     [[nodiscard]] std::optional<u32> At(u64 address) const {
-        if ((address & 3) != 0 || address + 4 > image.size()) {
+        if ((address & 3) != 0 || image.size() < 4 || address > image.size() - 4) {
             return std::nullopt;
         }
         u32 word;

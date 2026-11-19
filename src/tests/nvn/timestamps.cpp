@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <string_view>
 #include <thread>
 
 #include <catch2/catch_test_macros.hpp>
@@ -343,6 +344,10 @@ TEST_CASE("NVN timestamps: GpuClockMap forgets a window nothing was read in", "[
 }
 
 TEST_CASE("NVN timestamps: the mapping policy comes from EDEN_NX2_NVN_TS_OFFSET", "[nvn][timestamps]") {
-    // Read once per process; the unset default is the sliding window.
-    CHECK(GpuClockMap::PolicyFromEnvironment() == GpuClockMap::Policy::Window);
+    // Read once per process; the unset default is the sliding window, "global" the whole run.
+    const char* const value = std::getenv("EDEN_NX2_NVN_TS_OFFSET");
+    const auto expected = value != nullptr && std::string_view{value} == "global"
+                              ? GpuClockMap::Policy::Global
+                              : GpuClockMap::Policy::Window;
+    CHECK(GpuClockMap::PolicyFromEnvironment() == expected);
 }

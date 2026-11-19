@@ -502,6 +502,8 @@ void Runtime::ResetForNewProcess() {
     presents = 0;
     blocking_waits = 0;
     blocking_wait_ns = 0;
+    acquire_wait_ns = 0;
+    sync_wait_ns = 0;
     wait_timeouts = 0;
     sync_wait_n = 0;
     sync_after_fence_sum = 0;

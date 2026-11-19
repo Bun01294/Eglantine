@@ -80,6 +80,10 @@ constexpr u32 Br(u32 rn) {
 constexpr u32 Ldur32(u32 rt, u32 rn, s32 offset) {
     return 0xB8400000 | ((static_cast<u32>(offset) & 0x1FF) << 12) | (rn << 5) | rt;
 }
+/// stur wt, [xn, #offset]
+constexpr u32 Stur32(u32 rt, u32 rn, s32 offset) {
+    return 0xB8000000 | ((static_cast<u32>(offset) & 0x1FF) << 12) | (rn << 5) | rt;
+}
 /// ldr wt, [xn, #offset] (unsigned offset)
 constexpr u32 Ldr32(u32 rt, u32 rn, u32 offset) {
     return 0xB9400000 | ((offset / 4) << 10) | (rn << 5) | rt;
@@ -153,7 +157,7 @@ Image MakeImage() {
     // Outer (item, device).
     image.Word(0x400, SubImm64(1, 29, 4));
     image.Word(0x404, MovReg32(20, 0));
-    image.Word(0x408, Nop); // stur wzr, [x29, #-4]
+    image.Word(0x408, Stur32(31, 29, -4)); // stur wzr, [x29, #-4]: the slot starts at zero
     image.Word(0x40C, Bl(0x40C, InnerEntry));
     image.Word(0x410, CmpImm32(20, OuterBound));
     image.Word(0x414, Bhi(0x414, OuterDefault));

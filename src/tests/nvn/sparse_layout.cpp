@@ -102,6 +102,8 @@ TEST_CASE("nvn sparse: row batching preserves every block mapping", "[nvn][spars
         using Mapping = std::tuple<VkDeviceMemory, u64, u32, u32, u32>;
         std::map<Position, Mapping> blocks;
         for (const auto& bind : records) {
+            // The map below has no depth: every record covers one slice.
+            REQUIRE(bind.extent.depth == 1);
             for (u32 x = 0; x < bind.extent.width; x += GRANULE) {
                 const Position pos{bind.subresource.aspectMask,
                                    bind.subresource.arrayLayer,

@@ -171,7 +171,8 @@ void DrawContext::Dispatch(const VC::DispatchPayload& p) {
         // The compute chain behind a game's upscaling network: kept only while one may be replaced.
         NoteComputeChain();
     }
-    if (std::getenv("EDEN_NX2_DLSS_TRACE") != nullptr) {
+    static const bool dlss_trace = std::getenv("EDEN_NX2_DLSS_TRACE") != nullptr;
+    if (dlss_trace) {
         static Common::BootCounter boot;
         static std::unordered_set<u64> traced_programs;
         if (boot.First()) {

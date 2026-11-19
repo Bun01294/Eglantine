@@ -5653,16 +5653,6 @@ bool Recorder::RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>
     impl.compute_chain_count = 0;
     impl.compute_chain_next = 0;
     impl.pass_depth_of_color.clear();
-    // For the status bar: the stage that actually wrote the frame and its real input/output sizes.
-    const Rescale::Factor setting = impl.RescaleFactor();
-    VideoCore::GameFrameSize::Publish({
-        .render_width = own_upscaled ? impl.upscaled_input_width : 0,
-        .render_height = own_upscaled ? impl.upscaled_input_height : 0,
-        .frame_width = own_upscaled ? impl.upscaled_output_width : texture.desc.width,
-        .frame_height = own_upscaled ? impl.upscaled_output_height : texture.desc.height,
-        .scale_percent = static_cast<u32>(setting.UpFactor() * 100.0f + 0.5f),
-        .stage = own_upscaled ? own_stage : VideoCore::GameFrameSize::Stage::Game,
-    });
     GpuProf::Scope prof{flight.gpu_prof.get(), Cmd(),
                         flight.gpu_prof ? ProfStorage(GpuProf::Kind::Present, guest)
                                         : GpuProf::Tag{}};
@@ -5689,6 +5679,17 @@ bool Recorder::RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>
         Unsupported("Present", "the source image has no contents");
         return false;
     }
+    // For the status bar: the stage that actually wrote the frame and its real input/output sizes
+    // (a rejected frame leaves the last published ones).
+    const Rescale::Factor setting = impl.RescaleFactor();
+    VideoCore::GameFrameSize::Publish({
+        .render_width = own_upscaled ? impl.upscaled_input_width : 0,
+        .render_height = own_upscaled ? impl.upscaled_input_height : 0,
+        .frame_width = own_upscaled ? impl.upscaled_output_width : texture.desc.width,
+        .frame_height = own_upscaled ? impl.upscaled_output_height : texture.desc.height,
+        .scale_percent = static_cast<u32>(setting.UpFactor() * 100.0f + 0.5f),
+        .stage = own_upscaled ? own_stage : VideoCore::GameFrameSize::Stage::Game,
+    });
     const VkImageMemoryBarrier frame_in{
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .pNext = nullptr,

@@ -10,6 +10,7 @@
 #include <array>
 #include <cstdlib>
 #include <cstring>
+#include <numeric>
 #include <optional>
 #include <unordered_set>
 #include <vector>
@@ -254,7 +255,7 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
     constexpr u64 SMALL_STORAGE = u64{16} << 20;
     const auto schedule_unchanged = [&] {
         ++s.unchanged_checks;
-        u64 backoff = CheckBackoff(s.unchanged_checks);
+        u64 backoff = CheckBackoff((std::min)(s.unchanged_checks, 13u)); // 13+: the 30 cap
         if (size <= SMALL_STORAGE) {
             backoff = (std::min)(backoff, u64{3}); // a new glyph shows within a few frames
         }
@@ -1192,6 +1193,9 @@ void Context::Impl::NotifyHostWriteNow(u64 address, u64 size) {
     // Buffer fills need 4-byte aligned ranges; the extra bytes are the guest's own.
     const u64 begin = (address - pool.address) & ~u64{3};
     const u64 end = (std::min)((address - pool.address + size + 3) & ~u64{3}, pool.size);
+    // The bytes the host wrote, for the texture containment below.
+    const u64 exact_begin = address - pool.address;
+    const u64 exact_end = (std::min)(exact_begin + size, pool.size);
     // A GPU-only pool's buffer is the GPU's copy of the memory (an imported one is the memory
     // itself, a mirror compares its pages at their next use): it takes the new bytes now. A pool
     // still waiting for its first upload reads them then.
@@ -1209,9 +1213,10 @@ void Context::Impl::NotifyHostWriteNow(u64 address, u64 size) {
         return;
     }
     const PoolIndex& index = index_it->second;
-    for (auto it = index.spans.lower_bound(begin); it != index.spans.end() && it->first < end; ++it) {
+    for (auto it = index.spans.lower_bound(exact_begin);
+         it != index.spans.end() && it->first < exact_end; ++it) {
         Storage& storage = *it->second;
-        if (storage.sparse || it->first + storage.layout.size > end) {
+        if (storage.sparse || it->first + storage.layout.size > exact_end) {
             continue;
         }
         storage.force_upload = true;
@@ -1842,6 +1847,8 @@ void Context::Impl::FlushTextureNow(CmdFlushTexture& command) {
     u64 total = 0;
     const u32 layer_count = linear ? 1 : s.layers;
     const u32 level_count = linear ? 1 : s.levels;
+    // Region offsets: a multiple of the texel block size too (12-byte formats).
+    const u64 region_alignment = std::lcm(u64{64}, u64{block.bytes});
     for (u32 layer = 0; layer < layer_count; ++layer) {
         for (u32 level = 0; level < level_count; ++level) {
             Piece piece{};
@@ -1855,7 +1862,7 @@ void Context::Impl::FlushTextureNow(CmdFlushTexture& command) {
             piece.guest_offset = static_cast<u64>(layer) * s.layout.layer_size +
                                  (linear ? 0 : TextureLevelOffset(s.desc, level));
             TextureLevelTiles(s.desc, level, piece.tile_h, piece.tile_d);
-            total = (total + 63) / 64 * 64;
+            total = (total + region_alignment - 1) / region_alignment * region_alignment;
             piece.buffer_offset = total;
             total += static_cast<u64>(piece.cols) * piece.rows * piece.slices * block.bytes;
             pieces.push_back(piece);
@@ -1953,6 +1960,7 @@ void Context::Impl::FlushTextureNow(CmdFlushTexture& command) {
         }
         storage_bytes = scratch.data();
     }
+    download.Invalidate();
     const std::span<const u8> mapped = download.Mapped();
     for (const Piece& piece : pieces) {
         const u64 linear_size = static_cast<u64>(piece.cols) * piece.rows * piece.slices * block.bytes;
@@ -1993,8 +2001,10 @@ void Context::Impl::FlushTextureNow(CmdFlushTexture& command) {
             }
         }
     }
-    if (!scratch.empty() && memory) {
-        memory->Write(pool.address + s.pool_offset, scratch.data(), scratch.size());
+    if (!scratch.empty() && memory &&
+        !memory->Write(pool.address + s.pool_offset, scratch.data(), scratch.size())) {
+        finish(false);
+        return;
     }
     // An untracked write: a mirror pool hashes these pages again at their next use.
     if (!pool.mirror_pages.empty()) {

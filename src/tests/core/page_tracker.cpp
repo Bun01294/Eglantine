@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <set>
@@ -498,20 +499,26 @@ TEST_CASE("PageTracker: a host writer's WriteBlockUnsafe and NotifyHostWrite are
 TEST_CASE("PageTracker: a host service's write lands after the access trap's write-back, the HLE's "
           "own write-back does not call it",
           "[core][page_tracker]") {
-    WithProcessMemory(2, [](Core::Memory::Memory& memory, Common::PageTable&, u8*) {
+    WithProcessMemory(2, [](Core::Memory::Memory& memory, Common::PageTable&, u8* host) {
         auto& tracker = memory.PageTracker();
         const u64 id = tracker.Register(RIG_BASE, 2 * PAGE, false);
         SCOPE_EXIT {
             tracker.Unregister(id);
         };
         int calls = 0;
-        tracker.SetAccessCallback(id, [&](u64, u64) { ++calls; });
+        // The callback stands in for the write-back: it writes the old contents over the range.
+        tracker.SetAccessCallback(id, [&](u64, u64) {
+            ++calls;
+            std::memcpy(host, "wxyz", 4);
+        });
 
         tracker.ArmAccessTrap(id, RIG_BASE, PAGE);
         REQUIRE(memory.WriteBlockUntracked(RIG_BASE, "abcd", 4));
         CHECK(calls == 0);
-        REQUIRE(memory.WriteBlockUnsafe(RIG_BASE, "abcd", 4));
+        CHECK(std::memcmp(host, "abcd", 4) == 0);
+        REQUIRE(memory.WriteBlockUnsafe(RIG_BASE, "efgh", 4));
         CHECK(calls == 1);
+        CHECK(std::memcmp(host, "efgh", 4) == 0);
     });
 }
 
@@ -800,10 +807,12 @@ namespace {
 
 /// What the line-mode write-back merge does to one unit of 8 guest words (nvn_wb_merge.comp): it
 /// reads the unit, then stores it whole with the GPU's words in it. The window between the two is
-/// about a microsecond on the GPU; here it is 60 ms long, so a store that lands in it is lost for
-/// certain unless the guard holds the store back.
+/// about a microsecond on the GPU; here it lasts until may_store says the guest's store is in it
+/// (or 5 s pass), so a store that lands in it is lost for certain unless the guard holds the store
+/// back.
 struct SimulatedLineMerge {
     u32* unit;
+    std::function<bool()> may_store;
     std::atomic<bool> read_done{false};
     std::jthread thread;
 
@@ -814,7 +823,10 @@ struct SimulatedLineMerge {
                 words[i] = std::atomic_ref<u32>(unit[i]).load();
             }
             read_done = true;
-            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+            while (!may_store() && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::yield();
+            }
             words[0] = 0x600d; // the words the GPU changed
             words[1] = 0x600d;
             for (u32 i = 0; i < 8; ++i) {
@@ -854,7 +866,13 @@ TEST_CASE("PageTracker + NVN line guard: a CPU write during a line merge survive
                 }
             }
             u32* const unit = reinterpret_cast<u32*>(host) + 8; // words 8..15 of page 0
-            SimulatedLineMerge merge{.unit = unit};
+            // Control: the merge stores after the guest's store completed. Guarded: after the
+            // guest's store reached the guard (the page went hot) and waits for the merge.
+            std::atomic<bool> guest_stored{false};
+            SimulatedLineMerge merge{.unit = unit, .may_store = [&] {
+                                         return guarded ? guard->HotPage(0)
+                                                        : guest_stored.load();
+                                     }};
             merge.Start(std::move(plan.token));
             while (!merge.read_done.load()) {
                 std::this_thread::yield();
@@ -862,6 +880,7 @@ TEST_CASE("PageTracker + NVN line guard: a CPU write during a line merge survive
             // The guest stores to an unchanged word of the unit while the merge sits between its
             // read and its store.
             memory.Write32(RIG_BASE + (8 + 4) * 4, 0xc0de);
+            guest_stored = true;
             merge.thread.join();
             if (guarded) {
                 CHECK(std::atomic_ref<u32>(unit[4]).load() == 0xc0de);

@@ -96,10 +96,13 @@ void Context::Impl::RecordScaleBlit(vk::CommandBuffer cmd, Storage& native, bool
     Storage& twin = *native.scaled;
     Storage& source = to_scaled ? native : twin;
     Storage& destination = to_scaled ? twin : native;
-    // Colour is filtered (as the emulated GPU's BlitScale); depth, stencil and integer formats
-    // may only be blitted nearest.
+    // Colour is filtered (as the emulated GPU's BlitScale); depth, stencil, integer formats and
+    // formats without linear filtering may only be blitted nearest.
     const bool filtered = native.aspect == VK_IMAGE_ASPECT_COLOR_BIT &&
-                          !VideoCore::Surface::IsPixelFormatInteger(native.host.pixel_format);
+                          !VideoCore::Surface::IsPixelFormatInteger(native.host.pixel_format) &&
+                          device.IsFormatSupported(native.host.format,
+                                                   VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT,
+                                                   FormatType::Optimal);
     const VkImageSubresourceLayers layers{
         .aspectMask = native.aspect,
         .mipLevel = 0,

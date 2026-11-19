@@ -2087,16 +2087,29 @@ static const std::array<BlockModeInfo, 2048>& BlockModeInfos() {
 // The colour endpoint modes of a block's partitions, bit n for mode n. `extra_bits` is set to the
 // number of mode bits that sit just below the weights (DecompressBlock); reading them needs a
 // `weight_bits` of 24 to 96.
+// `endpoint_values` (optional): the colour endpoint integers all partitions need together (a
+// mode m endpoint pair takes (m / 4 + 1) * 2 of them).
 static u32 PartitionModes(std::span<const u8> block, u32 low, u32 partitions, u32 weight_bits,
-                          u32& extra_bits) {
+                          u32& extra_bits, u32* endpoint_values = nullptr) {
+    const auto values_of = [](u32 mode) { return ((mode >> 2) + 1) * 2; };
     extra_bits = 0;
+    if (endpoint_values != nullptr) {
+        *endpoint_values = 0;
+    }
     if (partitions == 1) {
-        return 1U << ((low >> 13) & 0xF);
+        const u32 mode = (low >> 13) & 0xF;
+        if (endpoint_values != nullptr) {
+            *endpoint_values = values_of(mode);
+        }
+        return 1U << mode;
     }
     // Bits 13-22 are the partition index.
     const u32 base_cem = (low >> 23) & 0x3F;
     const u32 base_mode = base_cem & 3;
     if (base_mode == 0) {
+        if (endpoint_values != nullptr) {
+            *endpoint_values = partitions * values_of(base_cem >> 2);
+        }
         return 1U << (base_cem >> 2);
     }
     extra_bits = partitions == 2 ? 2 : partitions == 3 ? 5 : 8;
@@ -2114,6 +2127,9 @@ static u32 PartitionModes(std::span<const u8> block, u32 low, u32 partitions, u3
         const u32 mode = ((base_mode - (((classes >> i) & 1) != 0 ? 0 : 1)) << 2) |
                          ((cem >> (2 * i)) & 3);
         modes |= 1U << mode;
+        if (endpoint_values != nullptr) {
+            *endpoint_values += values_of(mode);
+        }
     }
     return modes;
 }
@@ -2218,12 +2234,20 @@ Channels ClassifyChannels(std::span<const uint8_t> data, uint32_t block_width,
                 return Channels::Rgba;
             }
             u32 extra_bits;
-            const u32 modes = PartitionModes(block, low, partitions, weight_bits, extra_bits);
+            u32 endpoint_values;
+            const u32 modes =
+                PartitionModes(block, low, partitions, weight_bits, extra_bits, &endpoint_values);
             // Mode, partition count and CEM fields, then the colour data below the weights.
             const u32 header_bits = partitions == 1 ? 17 : 29;
             const u32 selector_bits = info.dual_plane ? 2 : 0;
-            if ((modes & HdrModes) != 0 ||
+            if ((modes & HdrModes) != 0 || endpoint_values > 18 ||
                 header_bits + extra_bits + selector_bits + weight_bits > 128) {
+                return Channels::Rgba;
+            }
+            // Error blocks: the colour bits cannot hold the endpoints even at the smallest
+            // endpoint range (6 levels, 13 bits per 5 values).
+            const u32 colour_bits = 128 - header_bits - extra_bits - selector_bits - weight_bits;
+            if (colour_bits < (13 * endpoint_values + 4) / 5) {
                 return Channels::Rgba;
             }
             if ((modes & ColourModes) != 0) {

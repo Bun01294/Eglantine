@@ -218,14 +218,19 @@ void PipelineCache::Impl::PrepareProgram(const std::array<StageProgram, STAGE_CO
         ++gpl_outstanding;
     }
     prepare_workers->QueueWork([this, stages, owner = std::move(owner)] {
-        for (u32 stage = 0; stage < STAGE_COUNT && !stopping.load(); ++stage) {
-            const StageProgram& program = stages[stage];
-            if (program.hash == 0 || program.control == nullptr || program.code == nullptr) {
-                continue;
+        try {
+            for (u32 stage = 0; stage < STAGE_COUNT && !stopping.load(); ++stage) {
+                const StageProgram& program = stages[stage];
+                if (program.hash == 0 || program.control == nullptr || program.code == nullptr) {
+                    continue;
+                }
+                // Cached by stage hash: the first draw of the program finds it (GetLowered).
+                (void)GetLowered(program, stage);
+                ++stat_prepared;
             }
-            // Cached by stage hash: the first draw of the program finds it (GetLowered).
-            (void)GetLowered(program, stage);
-            ++stat_prepared;
+        } catch (const std::exception& e) {
+            // The first draw of the program lowers it again and reports.
+            LOG_ERROR(Render_Vulkan, "[nvn] background shader preparation failed: {}", e.what());
         }
         {
             std::scoped_lock lock{gpl_mutex};

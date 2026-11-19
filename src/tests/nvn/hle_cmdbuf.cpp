@@ -818,8 +818,8 @@ TEST_CASE("nvn hle cmdbuf: UpdateUniformBuffer copies its data at record time", 
     f.Call("nvnCommandBufferUpdateUniformBuffer",
            {Rig::I(CMD), Rig::I(Rig::STORAGE + 0x2000), Rig::I(0x1000), Rig::I(0x1'0000'0010),
             Rig::I(26), Rig::I(Rig::SCRATCH)});
-    const u64 handle = f.End();
     f.memory.Put(Rig::SCRATCH, std::array<u8, 24>{}); // the game reuses its memory
+    const u64 handle = f.End();
 
     const std::vector<u64> list = f.Submit(handle);
     const auto* update = Payload<UpdateUniformBufferPayload>(list, Op::UpdateUniformBuffer);

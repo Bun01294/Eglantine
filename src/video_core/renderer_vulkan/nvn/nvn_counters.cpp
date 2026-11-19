@@ -490,7 +490,8 @@ void CounterEngine::ResolveBatch(vk::CommandBuffer cmd, CounterFlight& flight, C
     }
     Sync(cmd);
     // The report values, in guest order. Reports to one buffer share a copy until one overlaps an
-    // earlier region of it (the later report must win: copied after a barrier).
+    // earlier region written since the last barrier, of any buffer copied so far (the later
+    // report must win: copied after a barrier).
     report_regions.clear();
     region_offsets.clear();
     VkBuffer region_buffer = VK_NULL_HANDLE;
@@ -499,28 +500,31 @@ void CounterEngine::ResolveBatch(vk::CommandBuffer cmd, CounterFlight& flight, C
             cmd.CopyBuffer(*scratch, region_buffer,
                            vk::Span<VkBufferCopy>(report_regions.data(), report_regions.size()));
             report_regions.clear();
-            region_offsets.clear();
         }
+    };
+    // A collision of two buffers' keys only costs an extra barrier.
+    const auto region_key = [](VkBuffer buffer, u64 offset) {
+        return static_cast<u64>(std::hash<VkBuffer>{}(buffer)) * 0x9E3779B97F4A7C15ULL + offset;
     };
     for (size_t r = 0; r < batch.reports.size(); ++r) {
         const CounterBatch::Report& report = batch.reports[r];
         // Report offsets are 4-byte aligned (ReportCounter): two 8-byte values overlap when
         // their offsets are at most 4 apart.
-        const bool overlaps = report.buffer == region_buffer &&
-                              (region_offsets.contains(report.offset) ||
-                               region_offsets.contains(report.offset + 4) ||
-                               (report.offset >= 4 && region_offsets.contains(report.offset - 4)));
+        const u64 key = region_key(report.buffer, report.offset);
+        const bool overlaps = region_offsets.contains(key) || region_offsets.contains(key + 4) ||
+                              (report.offset >= 4 && region_offsets.contains(key - 4));
         if (report.buffer != region_buffer || overlaps) {
             flush();
             if (overlaps) {
                 Sync(cmd);
+                region_offsets.clear();
             }
             region_buffer = report.buffer;
         }
         report_regions.push_back(VkBufferCopy{.srcOffset = reports_area + r * sizeof(u64),
                                               .dstOffset = report.offset,
                                               .size = sizeof(u64)});
-        region_offsets.insert(report.offset);
+        region_offsets.insert(key);
     }
     flush();
     Sync(cmd);
@@ -536,9 +540,12 @@ void CounterEngine::WriteTimestamp(vk::CommandBuffer cmd, CounterFlight& flight,
     if (!host_reset) {
         cmd.ResetQueryPool(*block.timestamp, slot, 1);
     }
-    cmd.WriteTimestamp(top_of_pipe ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
-                                   : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                       *block.timestamp, slot);
+    if (timestamp_mask != 0) {
+        // A family without timestamp bits leaves the query unavailable: Complete stamps it with now.
+        cmd.WriteTimestamp(top_of_pipe ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                                       : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                           *block.timestamp, slot);
+    }
     report.query = {index, slot};
     flight.timestamps.push_back(std::move(report));
 }

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 
@@ -251,7 +252,8 @@ bool Context::Impl::ResolveBuffer(u64 address, u64 size, Pool*& pool, u64& offse
         size > candidate.size - (address - candidate.address)) {
         return false;
     }
-    if (candidate.IsVirtual()) {
+    // The immutable flag, not `backing`: the backing thread may be writing that for other pools.
+    if ((candidate.flags & PoolFlag::Virtual) != 0) {
         if (!ResolveVirtualRange(candidate, address - candidate.address, size, pool, offset)) {
             return false;
         }
@@ -326,8 +328,10 @@ std::optional<Context::Impl::ChunkWindow> Context::Impl::ImportWindow(u64 addres
     const u64 window_end = pool_end + ChunkSize / 2;
     u8* const base = host - (address - pool_begin);
     const auto mapped_like_base = [&](u64 page) {
-        return memory->Pointer(page) == base + (page - pool_begin) &&
-               memory->Pointer(page + align - 1) == base + (page - pool_begin) + align - 1;
+        // Signed: pages below the pool lie before `base`.
+        const auto delta = static_cast<std::ptrdiff_t>(page - pool_begin);
+        return memory->Pointer(page) == base + delta &&
+               memory->Pointer(page + align - 1) == base + delta + align - 1;
     };
     u64 low = pool_begin;
     while (low > window_begin && mapped_like_base(low - align)) {
@@ -337,7 +341,7 @@ std::optional<Context::Impl::ChunkWindow> Context::Impl::ImportWindow(u64 addres
     while (high < window_end && mapped_like_base(high)) {
         high += align;
     }
-    return ChunkWindow{base + (low - pool_begin), low, high - low};
+    return ChunkWindow{base - static_cast<std::ptrdiff_t>(pool_begin - low), low, high - low};
 }
 
 VkResult Context::Impl::ImportPoolBuffer(Pool& pool, u8* host, std::string& error) {
@@ -430,8 +434,8 @@ void Context::Impl::EnsureBacking(Pool& pool) {
     // Called for every buffer range an op touches: the common case (backed long ago) must not
     // even start the stall timer.
     const bool was_pending = pool.pending.load(std::memory_order_acquire);
-    const bool was_upload = pool.upload_pending;
-    if (!was_pending && !was_upload) {
+    // upload_pending is only read once `pending` is false (the backing thread writes it before).
+    if (!was_pending && !pool.upload_pending) {
         return;
     }
     const Common::FrameStats::Scope stall{Common::FrameStats::Cause::PoolBacking};
@@ -441,7 +445,8 @@ void Context::Impl::EnsureBacking(Pool& pool) {
         std::scoped_lock lock{backing_mutex};
         BackPoolLocked(pool);
     }
-    if (pool.upload_pending) {
+    const bool was_upload = pool.upload_pending;
+    if (was_upload) {
         Pool* const one[] = {&pool};
         UploadWholePools(one);
     }
@@ -1043,7 +1048,8 @@ std::shared_ptr<Texture> Context::Impl::BuildTexture(const VC::TextureDesc& d) {
     // A large sparse texture in a virtual pool is bound and uploaded tile by tile (nvn_sparse.h);
     // the tiles the pool maps by now are marked, later remaps mark theirs (MapVirtualNow).
     if (const auto pool_it = pools.find(d.pool_serial);
-        pool_it != pools.end() && pool_it->second->IsVirtual()) {
+        pool_it != pools.end() && (pool_it->second->flags & PoolFlag::Virtual) != 0 &&
+        pool_it->second->size != 0) {
         const Pool& virtual_pool = *pool_it->second;
         const char* reason = "";
         if (std::shared_ptr<SparseBacking> sparse =

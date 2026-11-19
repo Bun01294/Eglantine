@@ -580,6 +580,16 @@ TEST_CASE("NVN write-back merge: bench", "[.write-back-bench]") {
             staging.Flush();
             run([&](vk::CommandBuffer cmd) {
                 cmd.CopyBuffer(*staging, *destination, VkBufferCopy{0, 0, SIZE});
+                // The fence only makes the copy available to the host: make it visible to the
+                // merge's compute reads in the later submissions.
+                const VkMemoryBarrier copied{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                };
+                cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, copied);
             });
         };
         constexpr VkBufferUsageFlags STORAGE =

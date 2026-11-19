@@ -21,6 +21,8 @@ struct Config {
     bool hle{};
     /// EDEN_NX2_NVN_THREADS: the heartbeat also dumps every guest thread and the per-window NVN
     /// call counts (needs the per-slot call counters, which are otherwise only kept for census).
+    /// It does not start the bridge by itself: it only produces output when census or the HLE
+    /// path is on (AnyEnabled).
     bool thread_dump{};
     /// Output directory for the census / unimplemented / unsupported TSV files. Empty: the
     /// directory `OutputDirectory()` resolves.

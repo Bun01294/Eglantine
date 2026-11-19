@@ -401,13 +401,14 @@ struct GPU::Impl {
     // previous members has been destroyed
     VideoCommon::GPUThread::ThreadManager gpu_thread;
 
+    /// Declared before the renderer so it outlives the renderer's workers that report to it.
+    VideoCore::LoadProgressSink load_progress;
     std::unique_ptr<VideoCore::RendererBase> renderer;
     const bool use_nvdec;
 
     s32 new_channel_id{1};
     /// Shader build notifier
     VideoCore::ShaderNotify shader_notify;
-    VideoCore::LoadProgressSink load_progress;
     /// When true, we are about to shut down emulation session, so terminate outstanding tasks
     std::atomic_bool shutting_down{};
 

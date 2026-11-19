@@ -99,6 +99,7 @@ TEST_CASE("NVN compute shader census", "[.compute-census]") {
     }
     const char* suffix = std::getenv("EDEN_NVN_CENSUS_SUFFIX");
     std::ofstream out(ResultsRoot / (std::string{"compute-census"} + (suffix ? suffix : "") + ".tsv"));
+    REQUIRE(out.is_open());
     out << "index\tsource\tgroup\tpush_words\tuniform\tstorage\ttexture\timage\tshared\toutcome\t"
            "storage_desc(bank:offset:w)\tcbuf_desc(index:size)\ttex_desc\timg_desc\tuses_global\t"
            "nvn_used\tlayout_unsupported\tlayout_issues\tspv_words\n";
@@ -186,5 +187,7 @@ TEST_CASE("NVN compute shader census", "[.compute-census]") {
         pools.ReleaseContents();
     }
     out << fmt::format("# compute shaders: {}\n", compute_count);
+    out.flush();
+    CHECK(out.good());
     CHECK(compute_count > 0);
 }

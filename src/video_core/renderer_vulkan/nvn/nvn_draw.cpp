@@ -2907,8 +2907,11 @@ bool DrawContext::GenerateIndices(const PreparedDraw& prepared, const IndexRange
         }
         out_indices[n++] = fetch(0);
     } else {
+        // u8 widening keeps the restart marker the UINT8_EXT path would honour.
+        const bool restart_u8 = indices && index_type == 0 && fixed.primitive_restart != 0;
         for (u32 i = 0; i < count; ++i) {
-            out_indices[n++] = fetch(i);
+            const u32 value = fetch(i);
+            out_indices[n++] = restart_u8 && value == 0xFFu ? 0xFFFFFFFFu : value;
         }
     }
     out.buffer = ref.buffer;

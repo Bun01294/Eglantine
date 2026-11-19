@@ -256,7 +256,8 @@ void DrawResources::OpenCache(u64 title_id) {
     const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
     const auto title_dir = shader_dir / fmt::format("{:016x}", title_id);
     const auto transition =
-        title_id != 0 && !isolated_cache
+        title_id != 0 && !isolated_cache && !shader_refresh &&
+                Settings::values.use_disk_shader_cache.GetValue()
             ? VideoCommon::ClearShaderCachesForNvn(title_dir, impl.mario_kart_world)
             : VideoCommon::NvnCacheTransition::Unchanged;
     if (transition == VideoCommon::NvnCacheTransition::Cleared) {
@@ -423,6 +424,19 @@ void DrawResources::RefreshSamplerSetting() {
     }
 }
 
+namespace {
+
+/// The border colour of a sampler without custom border colours: the nearest built-in one.
+VkBorderColor BuiltinBorderColor(const VC::SamplerDesc& d) {
+    const bool opaque = d.border[3] > 0.5f;
+    const bool white = d.border[0] > 0.5f;
+    return !opaque ? VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK
+           : white ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE
+                   : VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+}
+
+} // namespace
+
 VkSampler DrawResources::GetSampler(u64 serial, bool boosted) {
     const auto desc_it = impl.samplers.find(serial);
     if (desc_it == impl.samplers.end()) {
@@ -461,7 +475,9 @@ VkSampler DrawResources::GetSampler(u64 serial, bool boosted) {
                          : d.reduction == 2 ? VK_SAMPLER_REDUCTION_MODE_MAX
                                             : VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE,
     };
-    if (d.reduction != 0 && impl.device.IsExtSamplerFilterMinmaxSupported()) {
+    // A compare sampler must use WEIGHTED_AVERAGE (VUID-VkSamplerCreateInfo-compareEnable-01423).
+    if (d.reduction != 0 && info.compareEnable == VK_FALSE &&
+        impl.device.IsExtSamplerFilterMinmaxSupported()) {
         info.pNext = &reduction;
     }
     VkSamplerCustomBorderColorCreateInfoEXT custom_border{
@@ -478,11 +494,7 @@ VkSampler DrawResources::GetSampler(u64 serial, bool boosted) {
             info.borderColor = VK_BORDER_COLOR_FLOAT_CUSTOM_EXT;
             info.pNext = &custom_border;
         } else {
-            const bool opaque = d.border[3] > 0.5f;
-            const bool white = d.border[0] > 0.5f;
-            info.borderColor = !opaque ? VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK
-                               : white ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE
-                                       : VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+            info.borderColor = BuiltinBorderColor(d);
         }
     }
     try {
@@ -526,7 +538,7 @@ std::optional<VideoCommon::PathDiff::Sampler> DrawResources::DescribeSampler(u64
         .border_color = static_cast<u32>(!border_used ? VkBorderColor{}
                                          : impl.device.IsCustomBorderColorUsable()
                                              ? VK_BORDER_COLOR_FLOAT_CUSTOM_EXT
-                                             : info.borderColor),
+                                             : BuiltinBorderColor(d)),
         .border = {d.border[0], d.border[1], d.border[2], d.border[3]},
         .reduction =
             static_cast<u32>(d.reduction == 1   ? VK_SAMPLER_REDUCTION_MODE_MIN
@@ -664,12 +676,14 @@ DrawResources::Scratch* DrawResources::FindScratch(const Storage& storage) {
 }
 
 DrawResources::Scratch* DrawResources::GetScratch(const Storage& source, u32 slot) {
+    const VkImageCreateFlags cube_flag = source.create_flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     for (Scratch& scratch : scratch_images) {
         const Storage& s = *scratch.storage;
         if (scratch.slot == slot && s.host.format == source.host.format && s.type == source.type &&
             s.extent.width == source.extent.width && s.extent.height == source.extent.height &&
             s.extent.depth == source.extent.depth && s.levels == source.levels &&
-            s.layers == source.layers && s.aspect == source.aspect) {
+            s.layers == source.layers && s.aspect == source.aspect &&
+            (s.create_flags & cube_flag) == cube_flag) {
             return &scratch;
         }
     }
@@ -686,7 +700,7 @@ DrawResources::Scratch* DrawResources::GetScratch(const Storage& source, u32 slo
         (source.type == VK_IMAGE_TYPE_3D
              ? static_cast<VkImageCreateFlags>(VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT)
              : 0u);
-    storage->create_flags |= source.create_flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    storage->create_flags |= cube_flag;
     storage->usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                      VK_IMAGE_USAGE_SAMPLED_BIT;
     try {

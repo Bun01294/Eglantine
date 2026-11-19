@@ -700,7 +700,7 @@ namespace {
 template <typename Prefix>
 void EmitArray(Recorder::Impl& impl, CommandBufferObject& cb, Op op, s32 first, s32 count,
                u64 values_va, size_t element_size, s32 limit) {
-    if (first < 0 || count < 0 || first + count > limit) {
+    if (first < 0 || count < 0 || first > limit || count > limit - first) {
         NVN_BAD_ARGUMENT(impl.stats, "range first {} count {} (limit {})", first, count, limit);
         ++impl.stats.records_dropped;
         return;
@@ -868,7 +868,7 @@ namespace {
 
 void BindBuffers(Recorder::Impl& impl, CommandBufferObject& cb, Op op, u32 stage, s32 first,
                  s32 count, u64 ranges_va, bool deferred) {
-    if (stage >= 8 || first < 0 || count < 0 || first + count > 32) {
+    if (stage >= 8 || first < 0 || count < 0 || first > 32 || count > 32 - first) {
         NVN_BAD_ARGUMENT(impl.stats, "stage {} first {} count {} (limit 32)", stage, first, count);
         ++impl.stats.records_dropped;
         return;

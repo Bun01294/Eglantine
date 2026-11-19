@@ -349,6 +349,10 @@ private:
         Tag biggest;
     };
     std::vector<FlightLine> frame_flights;
+    /// The frame's busy time and first timestamp from lines trimmed off frame_flights.
+    double frame_busy_carry_ns{0.0};
+    u64 frame_first_begin{0};
+    bool have_frame_first{false};
     void ReportFrame();
 };
 

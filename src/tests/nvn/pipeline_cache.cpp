@@ -30,6 +30,7 @@
 
 #include "common/diag_request.h"
 #include "common/dynamic_library.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/frontend/emu_window.h"
 #include "tests/temp_path.h"
@@ -85,6 +86,7 @@ VC::DescriptorLayout MakeLayout() {
     layout.uses_raw_global_memory = true;
     layout.stores_raw_global_memory = true;
     layout.raw_stores_written_through = true;
+    layout.requires_guest_warp = true;
     layout.unsupported_count = 1;
 
     VC::DescriptorBinding a;
@@ -126,6 +128,8 @@ VC::DescriptorLayout MakeLayout() {
     b.image_format = Shader::ImageFormat::R32G32B32A32_UINT;
     b.is_multisample = true;
     b.is_written = true;
+    b.is_atomic_target = true;
+    b.is_raw_global_table = true;
     b.supported = false;
     b.issue = "uniform-buffer word pair not supported";
     b.storage_index = 3;
@@ -150,6 +154,7 @@ void RequireSameLayout(const VC::DescriptorLayout& x, const VC::DescriptorLayout
     REQUIRE(x.uses_raw_global_memory == y.uses_raw_global_memory);
     REQUIRE(x.stores_raw_global_memory == y.stores_raw_global_memory);
     REQUIRE(x.raw_stores_written_through == y.raw_stores_written_through);
+    REQUIRE(x.requires_guest_warp == y.requires_guest_warp);
     REQUIRE(x.unsupported_count == y.unsupported_count);
     REQUIRE(x.bindings.size() == y.bindings.size());
     for (size_t i = 0; i < x.bindings.size(); ++i) {
@@ -177,6 +182,8 @@ void RequireSameLayout(const VC::DescriptorLayout& x, const VC::DescriptorLayout
         REQUIRE(p.is_written == q.is_written);
         REQUIRE(p.is_read == q.is_read);
         REQUIRE(p.supported == q.supported);
+        REQUIRE(p.is_atomic_target == q.is_atomic_target);
+        REQUIRE(p.is_raw_global_table == q.is_raw_global_table);
         REQUIRE(p.issue == q.issue);
     }
 }
@@ -1788,6 +1795,15 @@ TEST_CASE("The translation key ignores presentation and resolution settings", "[
     const auto filter = Settings::values.scaling_filter.GetValue();
     const auto resolution = Settings::values.resolution_setup.GetValue();
     const auto scaling = Settings::values.resolution_info;
+    const bool loop_safety = Settings::values.disable_shader_loop_safety_checks.GetValue();
+    // Restored even when an assertion ends the test early.
+    SCOPE_EXIT {
+        Settings::values.anti_aliasing.SetValue(anti_aliasing);
+        Settings::values.scaling_filter.SetValue(filter);
+        Settings::values.resolution_setup.SetValue(resolution);
+        Settings::values.resolution_info = scaling;
+        Settings::values.disable_shader_loop_safety_checks.SetValue(loop_safety);
+    };
     const auto key_now = [] {
         return Disk::MakeTranslationKey({
             .epoch = "e",
@@ -1826,7 +1842,6 @@ TEST_CASE("The translation key ignores presentation and resolution settings", "[
     REQUIRE(key_now() == key);
 
     // A switch the recompiler reads changes the file.
-    const bool loop_safety = Settings::values.disable_shader_loop_safety_checks.GetValue();
     Settings::values.disable_shader_loop_safety_checks.SetValue(!loop_safety);
     const std::string loop_key = key_now();
     Settings::values.disable_shader_loop_safety_checks.SetValue(loop_safety);
@@ -1838,6 +1853,9 @@ TEST_CASE("The NVN host info runs the rescaling pass only while the setting scal
     // The replay pushes the rescaling words (DrawContext::PushPlan): at 1X the pass is skipped,
     // otherwise it runs. MakeHostInfo needs a device, the reference info does not.
     const auto saved = Settings::values.resolution_info;
+    SCOPE_EXIT {
+        Settings::values.resolution_info = saved;
+    };
     Settings::TranslateResolutionInfo(Settings::ResolutionSetup::Res1X,
                                       Settings::values.resolution_info);
     REQUIRE(VideoCommon::Nvn::MakeReferenceHostInfo().skip_rescaling_pass);
@@ -1852,6 +1870,9 @@ TEST_CASE("Runtime TRY switch changes the translation cache key", "[nvn]") {
     using Vulkan::Nvn::CurrentTranslationSwitches;
     using Vulkan::Nvn::HashTranslationSwitches;
     const bool initial = D::TrySwitchEnabled("TRY_RAWGLOBAL_FAST");
+    SCOPE_EXIT {
+        (void)D::SetTrySwitch("TRY_RAWGLOBAL_FAST", initial);
+    };
     const u64 base = HashTranslationSwitches(CurrentTranslationSwitches());
     REQUIRE(D::SetTrySwitch("TRY_RAWGLOBAL_FAST", !initial));
     const u64 changed = HashTranslationSwitches(CurrentTranslationSwitches());

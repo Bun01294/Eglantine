@@ -11,6 +11,7 @@
 #include <exception>
 #include <fstream>
 #include <memory>
+#include <stdexcept>
 #include <string_view>
 #include <system_error>
 
@@ -272,11 +273,15 @@ bool Unzstd(Bytes in, std::vector<u8>& out, std::string& why) {
         ZSTD_inBuffer input{frame, remaining, 0};
         for (;;) {
             if (out.size() == used) {
-                const size_t grow = std::max<size_t>(ZSTD_DStreamOutSize(), out.size());
-                if (used + grow > MaxDecompressed + ZSTD_DStreamOutSize()) {
+                // Double, but never past the cap plus one block of room: an output that fits is
+                // not rejected for the size of the step towards it.
+                const size_t cap = MaxDecompressed + ZSTD_DStreamOutSize();
+                if (used >= cap) {
                     why = "container:zstd-too-large";
                     return false;
                 }
+                const size_t grow =
+                    std::min(std::max<size_t>(ZSTD_DStreamOutSize(), out.size()), cap - used);
                 out.resize(used + grow);
             }
             ZSTD_outBuffer output{out.data(), out.size(), used};
@@ -1133,19 +1138,34 @@ std::vector<u8> MakeSeadPrimitiveDrawer(const BahsEntry& vertex, const BahsEntry
 
 std::vector<u8> ZstdCompress(std::span<const u8> data, bool record_content_size) {
     std::unique_ptr<ZSTD_CCtx, CCtxDeleter> cctx(ZSTD_createCCtx());
-    ZSTD_CCtx_setParameter(cctx.get(), ZSTD_c_contentSizeFlag, record_content_size ? 1 : 0);
-    ZSTD_CCtx_setParameter(cctx.get(), ZSTD_c_compressionLevel, 3);
+    if (!cctx) {
+        throw std::runtime_error("ZSTD_createCCtx failed");
+    }
+    // An error code is nonzero too: tell it from "more output to flush".
+    const auto check = [](size_t ret) {
+        if (ZSTD_isError(ret)) {
+            throw std::runtime_error(std::string("zstd: ") + ZSTD_getErrorName(ret));
+        }
+        return ret;
+    };
+    check(ZSTD_CCtx_setParameter(cctx.get(), ZSTD_c_contentSizeFlag, record_content_size ? 1 : 0));
+    check(ZSTD_CCtx_setParameter(cctx.get(), ZSTD_c_compressionLevel, 3));
     std::vector<u8> out(ZSTD_compressBound(data.size()));
     ZSTD_inBuffer input{data.data(), data.size(), 0};
     ZSTD_outBuffer output{out.data(), out.size(), 0};
     if (record_content_size) {
-        ZSTD_CCtx_setPledgedSrcSize(cctx.get(), data.size());
-        ZSTD_compressStream2(cctx.get(), &output, &input, ZSTD_e_end);
+        check(ZSTD_CCtx_setPledgedSrcSize(cctx.get(), data.size()));
+        if (check(ZSTD_compressStream2(cctx.get(), &output, &input, ZSTD_e_end)) != 0) {
+            throw std::runtime_error("zstd frame incomplete");
+        }
     } else {
         // Feed the data first and end the frame afterwards so the size is not known at the start.
-        ZSTD_compressStream2(cctx.get(), &output, &input, ZSTD_e_continue);
+        check(ZSTD_compressStream2(cctx.get(), &output, &input, ZSTD_e_continue));
         ZSTD_inBuffer none{nullptr, 0, 0};
-        while (ZSTD_compressStream2(cctx.get(), &output, &none, ZSTD_e_end) != 0) {
+        while (check(ZSTD_compressStream2(cctx.get(), &output, &none, ZSTD_e_end)) != 0) {
+            if (output.pos == output.size) {
+                throw std::runtime_error("zstd frame incomplete");
+            }
         }
     }
     out.resize(output.pos);

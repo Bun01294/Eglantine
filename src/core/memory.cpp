@@ -96,8 +96,9 @@ struct Memory::Impl final : PageClaimSink {
             host_buffer->Map(GetInteger(base), GetInteger(target) - DramMemoryMap::Base, size, perms, separate_heap);
         }
         // Tracked contents changed with the mapping; their claims go back on the new pages, after
-        // the host mapping that reset their protection.
-        if (!page_tracker_state.Empty()) [[unlikely]] {
+        // the host mapping that reset their protection. Only remaps of the tracked (current)
+        // table move its claims.
+        if (&page_table == current_page_table && !page_tracker_state.Empty()) [[unlikely]] {
             std::scoped_lock lk{read_trap_mutex};
             page_tracker_state.OnRemap(GetInteger(base) >> YUZU_PAGEBITS,
                                        (GetInteger(base) + size) >> YUZU_PAGEBITS, true);
@@ -108,7 +109,7 @@ struct Memory::Impl final : PageClaimSink {
                      bool separate_heap) {
         ASSERT_MSG((size & YUZU_PAGEMASK) == 0, "non-page aligned size: {:016X}", size);
         ASSERT_MSG((base & YUZU_PAGEMASK) == 0, "non-page aligned base: {:016X}", GetInteger(base));
-        if (!page_tracker_state.Empty()) [[unlikely]] {
+        if (&page_table == current_page_table && !page_tracker_state.Empty()) [[unlikely]] {
             std::scoped_lock lk{read_trap_mutex};
             page_tracker_state.OnRemap(GetInteger(base) >> YUZU_PAGEBITS,
                                        (GetInteger(base) + size) >> YUZU_PAGEBITS, false);
@@ -1029,7 +1030,9 @@ struct Memory::Impl final : PageClaimSink {
         }
         std::scoped_lock lk{read_trap_mutex};
         page_tracker_state.FinishAccess(hits);
-        return device_path;
+        // The callbacks ran without the lock and may have changed the tracking (untracked or
+        // device-cached pages): decide on the state the access lands in.
+        return page_tracker_state.NeedsDevicePath(page_begin, page_end);
     }
 
     /// A cached page is about to be written: access traps there call back first.

@@ -89,8 +89,9 @@ inline constexpr size_t ASTC_STANDIN_COUNT = 6;
 
 /// Smart BC stand-ins: with the BC3 stand-in kind (the default), each ASTC texture is held in the
 /// BC format its channels need (Tegra::Texture::ASTC::ClassifyChannels): luminance as BC4,
-/// luminance+alpha as BC5 (L, A), opaque colour as BC1 and the rest as BC3, and the BC1/BC3
-/// colour endpoints are refined. Each part has a switch of its own, to bisect a visual bug.
+/// luminance+alpha as BC5 (L, A), opaque colour as BC1 and the rest as BC3. Refining the BC1/BC3
+/// colour endpoints is opt-in: off unless EDEN_NX2_NVN_BC_REFINE is set (to anything but 0).
+/// Each part has a switch of its own, to bisect a visual bug.
 struct SmartBc {
     bool enabled{};  ///< per-texture formats (EDEN_NX2_NVN_SMART_BC, default on with BC3)
     bool bc1{};      ///< opaque textures as BC1 (EDEN_NX2_NVN_SMART_BC1)

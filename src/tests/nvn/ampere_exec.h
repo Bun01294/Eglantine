@@ -219,6 +219,16 @@ public:
             result.error = "case count out of range";
             return result;
         }
+        if (sampled_texture) {
+            // The handle word's uniform range must stay clear of the inputs and inside the pool.
+            const u64 storage_end = kStorageOffset + inputs.size() * SlotBytes;
+            const u64 uniform_begin = sampled_texture->uniform_offset;
+            if (uniform_begin > kPoolSize - 0x40 ||
+                (uniform_begin < storage_end && uniform_begin + 0x40 > kStorageOffset)) {
+                result.error = "uniform range overlaps the inputs or leaves the pool";
+                return result;
+            }
+        }
         std::vector<Inst> program;
         // R0 = group id; R2:R3 = storage base + R0 * SlotBytes; R8..R15 = inputs.
         program.push_back(S2R(0, SR_CTAID_X));

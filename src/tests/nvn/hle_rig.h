@@ -4,7 +4,9 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <initializer_list>
@@ -85,7 +87,8 @@ private:
     };
     u8* Find(u64 va, size_t size) {
         for (Region& region : regions) {
-            if (va >= region.base && va + size <= region.base + region.bytes.size()) {
+            if (va >= region.base && va - region.base <= region.bytes.size() &&
+                size <= region.bytes.size() - (va - region.base)) {
                 return region.bytes.data() + (va - region.base);
             }
         }
@@ -280,6 +283,54 @@ public:
     VideoCommon::Nvn::Recorder recorder{memory, sink};
     Core::NvnHle::Hle::Runtime runtime;
     Core::NvnHle::Hle::Registry registry{nullptr};
+};
+
+/// The rig's polling wait hook, plus what the tests need to synchronise with a guest call on a
+/// helper thread: how many waits found their condition false, and a way to release them (a
+/// released wait returns false, as a stopped emulator does). Declare it before the Rig.
+struct WaitProbe {
+    std::atomic<u32> waiting{0};
+    std::atomic<bool> cancel{false};
+    /// Whether a wait asked for no timeout.
+    std::atomic<bool> saw_infinite{false};
+    /// When not negative, a wait with no timeout gives up after this long (set before Install).
+    std::chrono::nanoseconds infinite_limit{-1};
+
+    void Install(Rig& rig) {
+        rig.runtime.SetWaitHook(
+            [this](const std::function<bool()>& ready, std::chrono::nanoseconds timeout) {
+                if (timeout.count() < 0) {
+                    saw_infinite = true;
+                    timeout = infinite_limit;
+                }
+                const auto deadline = std::chrono::steady_clock::now() + timeout;
+                bool counted = false;
+                while (!ready()) {
+                    if (!counted) {
+                        counted = true;
+                        waiting.fetch_add(1);
+                    }
+                    if (cancel.load() || (timeout.count() >= 0 &&
+                                          std::chrono::steady_clock::now() >= deadline)) {
+                        return false;
+                    }
+                    std::this_thread::sleep_for(std::chrono::microseconds{50});
+                }
+                return true;
+            });
+    }
+
+    /// Whether at least `count` waits found their condition false within 5 s.
+    bool AwaitWaiting(u32 count = 1) const {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+        while (waiting.load() < count) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds{50});
+        }
+        return true;
+    }
 };
 
 } // namespace NvnHleTest

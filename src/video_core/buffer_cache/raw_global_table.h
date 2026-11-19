@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
@@ -260,7 +261,8 @@ struct RawHostSpan {
                 ranges.push_back({run.guest + offset, chunk.device + chunk_offset, length});
             } else {
                 if (next != chunks.end()) {
-                    length = (std::min)(length, static_cast<u64>(next->host - host));
+                    length = (std::min)(length, static_cast<u64>(reinterpret_cast<std::uintptr_t>(next->host) -
+                                                               reinterpret_cast<std::uintptr_t>(host)));
                 }
                 missing.push_back({host, length});
             }

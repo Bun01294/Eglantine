@@ -198,15 +198,17 @@ std::optional<DumpTicket> DumpRequested(const DispatchInfo& info) {
 }
 
 void WriteDump(const DumpTicket& ticket, std::string_view text) {
-    const size_t written =
-        ticket.index == 0
-            ? Common::FS::WriteStringToFile(ticket.path, Common::FS::FileType::BinaryFile, text)
-            : Common::FS::AppendStringToFile(ticket.path, Common::FS::FileType::BinaryFile, text);
     State& s = S();
+    // The file is written under the lock so that a reset or re-arm cannot race a stale ticket
+    // into the new dump's file (dumps are rare, one-shot diagnostics).
     std::scoped_lock lock{s.mutex};
     if (ticket.generation != s.dump_generation) {
         return; // re-armed meanwhile
     }
+    const size_t written =
+        ticket.index == 0
+            ? Common::FS::WriteStringToFile(ticket.path, Common::FS::FileType::BinaryFile, text)
+            : Common::FS::AppendStringToFile(ticket.path, Common::FS::FileType::BinaryFile, text);
     if (written != text.size()) {
         s.dump.error = "cannot write " + ticket.path;
     } else {

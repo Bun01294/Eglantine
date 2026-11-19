@@ -194,7 +194,8 @@ struct StoredShader {
     std::vector<u8> code;
 };
 
-void WriteStore(const std::vector<Containers::ExtractedShader>& shaders, const fs::path& store,
+/// False when either file could not be written in full.
+bool WriteStore(const std::vector<Containers::ExtractedShader>& shaders, const fs::path& store,
                 const fs::path& index) {
     std::ofstream out(store, std::ios::binary);
     std::vector<u64> offsets;
@@ -220,9 +221,15 @@ void WriteStore(const std::vector<Containers::ExtractedShader>& shaders, const f
         put(shader.control.data(), shader.control.size());
         put(shader.code.data(), shader.code.size());
     }
+    out.close();
+    if (!out) {
+        return false;
+    }
     std::ofstream idx(index, std::ios::binary);
     idx.write(reinterpret_cast<const char*>(offsets.data()),
               static_cast<std::streamsize>(offsets.size() * sizeof(u64)));
+    idx.close();
+    return static_cast<bool>(idx);
 }
 
 bool ReadStored(std::ifstream& store, u64 offset, StoredShader& shader) {
@@ -1176,7 +1183,9 @@ TEST_CASE("NVN shader coverage", "[.coverage]") {
 
     // Output lives under the results tree only (the default work dir, or an F: results dir).
     const std::string work_dir = fs::weakly_canonical(WorkDir).generic_string();
-    REQUIRE((work_dir.rfind("C:/eg/results/nvn", 0) == 0 || work_dir.rfind("F:/eg/results/", 0) == 0));
+    // The root itself or a directory below it, not a sibling such as nvn-backup.
+    REQUIRE((work_dir == "C:/eg/results/nvn" || work_dir.rfind("C:/eg/results/nvn/", 0) == 0 ||
+             work_dir.rfind("F:/eg/results/", 0) == 0));
     fs::create_directories(WorkDir);
     for (const auto& entry : fs::directory_iterator(WorkDir)) {
         const auto name = entry.path().filename().string();
@@ -1224,7 +1233,7 @@ TEST_CASE("NVN shader coverage", "[.coverage]") {
             }
         }
         sampled = scan.shaders.size();
-        WriteStore(scan.shaders, WorkDir / "store.bin", WorkDir / "store.idx");
+        REQUIRE(WriteStore(scan.shaders, WorkDir / "store.bin", WorkDir / "store.idx"));
         {
             std::vector<Containers::ExtractedShader> release;
             scan.shaders.swap(release);
@@ -1276,9 +1285,14 @@ TEST_CASE("NVN shader coverage", "[.coverage]") {
                 now - worker.last_progress > std::chrono::seconds(WatchdogSeconds) &&
                 InFlight(path).has_value()) {
                 TerminateProcess(worker.process, 1); // our own worker
-                WaitForSingleObject(worker.process, 10000);
-                append(worker.id, *InFlight(path), "timeout",
-                       fmt::format("no progress for {} s", WatchdogSeconds));
+                if (WaitForSingleObject(worker.process, 10000) != WAIT_OBJECT_0) {
+                    continue; // not gone yet: decide once it has exited
+                }
+                // The worker may have committed the shader before the termination took effect.
+                if (const auto pending = InFlight(path)) {
+                    append(worker.id, *pending, "timeout",
+                           fmt::format("no progress for {} s", WatchdogSeconds));
+                }
                 wait = WAIT_OBJECT_0;
             } else if (wait == WAIT_OBJECT_0) {
                 if (const auto in_flight = InFlight(path)) {
@@ -1383,7 +1397,10 @@ TEST_CASE("NVN shader coverage", "[.coverage]") {
                    "uses_workgroup_id\tcontrol_hex\n";
         for (const auto& worker : workers) {
             std::ifstream in(WorkDir / fmt::format("compute-{}.tsv", worker.id));
-            compute << in.rdbuf();
+            // An empty or missing shard would leave `compute` failed for the rest.
+            if (in && in.peek() != std::ifstream::traits_type::eof()) {
+                compute << in.rdbuf();
+            }
         }
     }
     WriteReport(rows, scan, roots, spirv_val, extracted, sampled);

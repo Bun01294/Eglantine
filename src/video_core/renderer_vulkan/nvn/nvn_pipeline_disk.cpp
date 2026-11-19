@@ -915,8 +915,10 @@ void PruneCacheFiles(const std::filesystem::path& directory,
     for (fs::directory_iterator it{directory, error}, end; !error && it != end;
          it.increment(error)) {
         const std::string name = it->path().filename().string();
+        // `<stem>.bin` (legacy) or `<stem>.k<key>.bin`; not `<stem>_backup.bin` and the like.
         const bool is_cache = name.size() >= stem.size() + 4 && name.starts_with(stem) &&
-                              name.ends_with(".bin") && it->path() != keep_path;
+                              name[stem.size()] == '.' && name.ends_with(".bin") &&
+                              it->path() != keep_path;
         if (!is_cache || !it->is_regular_file(error)) {
             continue;
         }

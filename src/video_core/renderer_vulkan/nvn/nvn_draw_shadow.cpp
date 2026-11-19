@@ -310,8 +310,15 @@ void DrawContext::ApplyMirrors(DrawPlan& plan, bool allow_create) {
         }
         if (shadows.size() >= MAX_LIVE_SHADOWS) {
             // The oldest entry goes back first (merged; its mirror pages stay valid), unless this
-            // plan made it.
-            if (shadows.front().snapshot_pending) {
+            // plan made it or already binds it (its writes would land after the merge).
+            const Shadow& front = shadows.front();
+            const bool served =
+                std::ranges::any_of(plan.ranges, [&](const DrawPlan::RangeUse& other) {
+                    return other.redirected && other.pool == front.pool &&
+                           Overlaps(other.offset, other.offset + other.size, front.begin,
+                                    front.end);
+                });
+            if (front.snapshot_pending || served) {
                 ++counters.shadow_skipped_no_room;
                 continue;
             }

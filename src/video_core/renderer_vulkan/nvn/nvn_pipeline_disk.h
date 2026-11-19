@@ -195,7 +195,8 @@ struct LoadResult {
 [[nodiscard]] std::vector<u8> EncodeGraphicsPipeline(const GraphicsPipelineRecord& record);
 [[nodiscard]] std::vector<u8> EncodeComputePipeline(const ComputePipelineRecord& record);
 
-/// Parses a whole file image. Never throws, never reads out of bounds.
+/// Parses a whole file image. Never reads out of bounds; malformed input is reported in the
+/// result, but allocation failures (std::bad_alloc) propagate.
 [[nodiscard]] LoadResult Parse(std::span<const u8> bytes, const Header& expected,
                                Contents& contents);
 

@@ -231,8 +231,16 @@ TEST_CASE("nvn lifecycle: Detach waits for a running completion callback", "[nvn
         }
     });
     std::thread completion{[&] { sink.Complete(1); }};
-    while (!inside) {
+    const auto inside_deadline = std::chrono::steady_clock::now() + 5s;
+    while (!inside && std::chrono::steady_clock::now() < inside_deadline) {
         std::this_thread::sleep_for(1ms);
+    }
+    if (!inside) {
+        // The observer never ran: let a late one return and stop the completion thread first.
+        release = true;
+        completion.join();
+        recorder.SetCompletionObserver({});
+        FAIL("the completion observer never started");
     }
     std::atomic<bool> detached{false};
     std::thread detacher{[&] {
@@ -280,10 +288,12 @@ TEST_CASE("nvn lifecycle: two boots in one process, the renderer dying under a g
         runtime.guest_request_producer = 0x1234;
 
         std::atomic<bool> finish{false};
+        std::atomic<u64> guest_calls{0};
         // The guest thread keeps calling the Recorder past the renderer's death.
         std::thread guest{[&] {
             while (!finish) {
                 recorder->QueueFenceSync(QUEUE, SYNC, 0, 0);
+                ++guest_calls;
                 std::this_thread::yield();
             }
         }};
@@ -299,13 +309,21 @@ TEST_CASE("nvn lifecycle: two boots in one process, the renderer dying under a g
         // System shutdown: the runtime stops first, the renderer dies, and only after the CPU
         // threads are gone is the Recorder released.
         runtime.Shutdown();
-        REQUIRE(runtime.IsStopped());
+        const bool stopped = runtime.IsStopped();
         CHECK_FALSE(boot.sink->HasCallback());
         boot.sink->Kill();
-        std::this_thread::sleep_for(30ms);
+        // Two more finished calls: at least one started after the sink died.
+        const u64 calls_at_death = guest_calls.load();
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        while (guest_calls.load() < calls_at_death + 2 &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(1ms);
+        }
         finish = true;
         guest.join();
         completion.join();
+        REQUIRE(stopped);
+        CHECK(guest_calls.load() >= calls_at_death + 2);
         CHECK(boot.life->calls_after_death.load() == 0);
         CHECK(boot.life->callbacks_after_death.load() == 0);
         CHECK_FALSE(boot.memory_destroyed->load()); // still alive for a thread inside a call

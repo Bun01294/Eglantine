@@ -34,6 +34,9 @@ f32 HalfToFloat(const u8* bytes) {
 }
 
 u8 QuantizeUnorm8(f32 value) {
+    if (std::isnan(value)) {
+        return 0;
+    }
     return static_cast<u8>(std::lround(std::clamp(value, 0.0f, 1.0f) * 255.0f));
 }
 

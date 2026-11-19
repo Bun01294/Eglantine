@@ -156,8 +156,10 @@ public:
         const auto raw = reinterpret_cast<uintptr_t>(region.raw.data());
         region.data = reinterpret_cast<u8*>((raw + alignment - 1) / alignment * alignment);
         std::memset(region.data, 0, size);
+        u8* const data = region.data;
+        std::scoped_lock lock{regions_mutex};
         regions.push_back(std::move(region));
-        return regions.back().data;
+        return data;
     }
 
     bool Read(u64 va, void* dst, size_t size) override {
@@ -191,6 +193,8 @@ private:
     };
 
     u8* Find(u64 va, size_t size) {
+        // A test may add a region while the replay reads the map.
+        std::scoped_lock lock{regions_mutex};
         for (Region& region : regions) {
             if (va >= region.base && va - region.base <= region.size &&
                 size <= region.size - (va - region.base)) {
@@ -203,6 +207,7 @@ private:
     // Regions never move: the vector holds them by value but `data` points into `raw`'s heap
     // block, which survives a vector reallocation (std::vector<u8> moves keep their buffer).
     std::vector<Region> regions;
+    std::mutex regions_mutex;
 };
 
 template <typename T>
@@ -1157,10 +1162,14 @@ TEST_CASE("nvn memory: overlapping textures of other layouts exchange contents t
     std::vector<u64> list;
     Push(list, VC::Op::ClearTexture, ClearColor(10, 64, 64, 1, 1, 1, 1), 0xF);
     Run(rig.context, rig.seq, std::move(list));
-    rig.Read(11, 32, 64);
+    const std::vector<u8> seen = rig.Read(11, 32, 64);
     const Nvn::ContextStats stats = rig.context.Stats();
     REQUIRE(stats.alias_unsupported == (can_transfer ? 0u : 1u));
     REQUIRE(stats.alias_byte_transfers == (can_transfer ? 1u : 0u));
+    if (can_transfer) {
+        // Every byte of the smaller texture lies in the white one's bytes, whatever the layouts.
+        CHECK(std::ranges::all_of(seen, [](u8 byte) { return byte == 0xFF; }));
+    }
     // Reading again is not another event for the same pair.
     rig.Read(11, 32, 64);
     REQUIRE(rig.context.Stats().alias_unsupported == (can_transfer ? 0u : 1u));

@@ -161,20 +161,22 @@ void Push(std::vector<u64>& list, VC::Op op, const T& payload, u16 flags = 0) {
     constexpr size_t words = 1 + (sizeof(T) + 7) / 8;
     const size_t at = list.size();
     list.resize(at + words, 0);
-    auto* header = reinterpret_cast<VC::RecordHeader*>(&list[at]);
-    header->op = static_cast<u16>(op);
-    header->flags = flags;
-    header->size = static_cast<u32>(words * 8);
+    VC::RecordHeader header{};
+    header.op = static_cast<u16>(op);
+    header.flags = flags;
+    header.size = static_cast<u32>(words * 8);
+    std::memcpy(&list[at], &header, sizeof(header));
     std::memcpy(&list[at + 1], &payload, sizeof(T));
 }
 
 void PushEnd(std::vector<u64>& list) {
     const size_t at = list.size();
     list.resize(at + 1, 0);
-    auto* header = reinterpret_cast<VC::RecordHeader*>(&list[at]);
-    header->op = static_cast<u16>(VC::Op::End);
-    header->flags = 0;
-    header->size = 8;
+    VC::RecordHeader header{};
+    header.op = static_cast<u16>(VC::Op::End);
+    header.flags = 0;
+    header.size = 8;
+    std::memcpy(&list[at], &header, sizeof(header));
 }
 
 VC::Submission MakeSubmission(u64 seq, u32 queue, std::vector<u64> list,
@@ -269,9 +271,10 @@ void RunClearAndCopy(HeadlessVulkan& vulkan, bool allow_import, const char* labe
     u8* readback = memory.Add(BUFFER_POOL_VA, 64_KiB);
     std::memset(readback, 0xCD, 64_KiB);
 
+    // Declared before the Context: its workers stop before the callback state goes.
+    CompletionLog log;
     Vulkan::Nvn::Context context(*vulkan.device, vulkan.submit_mutex, nullptr,
                                  {.allow_host_import = allow_import});
-    CompletionLog log;
     context.SetCompletionCallback([&log](u64 seq) {
         std::scoped_lock lock{log.mutex};
         log.seqs.push_back(seq);
@@ -352,9 +355,10 @@ void RunCrossQueueCopy(HeadlessVulkan& vulkan, bool allow_import, bool consumer_
     for (u32 i = 0; i < BYTES; ++i) {
         data[i] = static_cast<u8>(i * 7 + 3);
     }
+    // Declared before the Context: its workers stop before the callback state goes.
+    CompletionLog log;
     Vulkan::Nvn::Context context(*vulkan.device, vulkan.submit_mutex, nullptr,
                                  {.allow_host_import = allow_import});
-    CompletionLog log;
     context.SetCompletionCallback([&log](u64 seq) {
         std::scoped_lock lock{log.mutex};
         log.seqs.push_back(seq);
@@ -557,9 +561,10 @@ void RunEventPingPong(HeadlessVulkan& vulkan, bool allow_import, bool q1_first) 
     u8* events = memory.Add(EVENT_VA, 4_KiB);
     std::memset(events, 0xFF, 64);
 
+    // Declared before the Context: its workers stop before the callback state goes.
+    CompletionLog log;
     Vulkan::Nvn::Context context(*vulkan.device, vulkan.submit_mutex, nullptr,
                                  {.allow_host_import = allow_import});
-    CompletionLog log;
     context.SetCompletionCallback([&log](u64 seq) {
         std::scoped_lock lock{log.mutex};
         log.seqs.push_back(seq);
@@ -640,9 +645,10 @@ void RunEventNeverSignalled(HeadlessVulkan& vulkan) {
     u8* data = memory.Add(POOL_VA, 64_KiB);
     memory.Add(EVENT_VA, 4_KiB); // the word is 0 and nobody ever writes 5 there
 
+    // Declared before the Context: its workers stop before the callback state goes.
+    CompletionLog log;
     Vulkan::Nvn::Context context(*vulkan.device, vulkan.submit_mutex, nullptr,
                                  {.parked_timeout = TIMEOUT});
-    CompletionLog log;
     context.SetCompletionCallback([&log](u64 seq) {
         std::scoped_lock lock{log.mutex};
         log.seqs.push_back(seq);
@@ -1258,15 +1264,16 @@ TEST_CASE("NVN Vulkan: a lost device completes the work without running it and t
     std::memset(data, 0, 64_KiB);
     // The third submission reports VK_ERROR_DEVICE_LOST from its queue submit (the test hook); no
     // 15 s wait for Aftermath.
+    // Declared before the Context: its workers stop before the callback state goes.
+    CompletionLog log;
+    std::mutex failure_mutex;
+    std::vector<std::string> failures;
     Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr,
                                  {.simulate_device_loss_from_seq = 3, .report_device_loss = false});
-    CompletionLog log;
     context.SetCompletionCallback([&log](u64 seq) {
         std::scoped_lock lock{log.mutex};
         log.seqs.push_back(seq);
     });
-    std::mutex failure_mutex;
-    std::vector<std::string> failures;
     context.SetFailureCallback([&](std::string reason) {
         std::scoped_lock lock{failure_mutex};
         failures.push_back(std::move(reason));
@@ -1373,9 +1380,10 @@ void RunLinearTextureWriteback(HeadlessVulkan& vulkan, bool allow_import) {
     }
     std::memset(readback, 0xCD, 64_KiB);
 
+    // Declared before the Context: its workers stop before the callback state goes.
+    CompletionLog log;
     Vulkan::Nvn::Context context(*vulkan.device, vulkan.submit_mutex, nullptr,
                                  {.allow_host_import = allow_import});
-    CompletionLog log;
     context.SetCompletionCallback([&log](u64 seq) {
         std::scoped_lock lock{log.mutex};
         log.seqs.push_back(seq);
@@ -1596,10 +1604,13 @@ void RunLinearTextureWriteback(HeadlessVulkan& vulkan, bool allow_import) {
         PushWaitEvent(list, EVENT_VA, VC::EVENT_WAIT_EQUAL, 1);
         PushEnd(list);
         context.Submit(MakeSubmission(5, 0, std::move(list), {TEX_LINEAR_RT}));
-        REQUIRE(context.Wait(5, 20s));
+        const bool done = context.Wait(5, 20s);
+        // Off the hook before it can go out of scope, also when the wait failed (the replay
+        // reads the guest memory through the Context's current pointer).
+        context.SetGuestMemory(&memory);
+        REQUIRE(done);
         CHECK(gap_hook.injected.load());
         CHECK(tex_mem[RT_OFFSET + ROW_BYTES + 4] == 0x77);
-        context.SetGuestMemory(&memory);
         for (u32 y = 0; y < HEIGHT; ++y) {
             const u8* row = tex_mem + RT_OFFSET + y * STRIDE;
             for (u32 x = 0; x < WIDTH; ++x) {

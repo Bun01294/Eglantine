@@ -341,7 +341,8 @@ VkResult HostImporter::CreateBufferInChunk(const ImportedChunk& chunk, VkDeviceS
     vk::Buffer buffer{raw_buffer, logical, allocator, VK_NULL_HANDLE, {}, false, {}, dld};
     const VkMemoryRequirements requirements =
         device.GetLogical().GetBufferMemoryRequirements(raw_buffer);
-    if (!(requirements.memoryTypeBits & (1u << chunk.type_index)) || offset + size > chunk.size ||
+    if (!(requirements.memoryTypeBits & (1u << chunk.type_index)) || offset >= chunk.size ||
+        (std::max)(size, requirements.size) > chunk.size - offset ||
         (requirements.alignment != 0 && offset % requirements.alignment != 0)) {
         error = fmt::format("pool at chunk offset {:#x} (+{:#x}) does not fit the chunk's memory "
                             "type/alignment {:#x}",

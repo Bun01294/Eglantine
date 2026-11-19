@@ -42,9 +42,12 @@ struct SnapshotRig {
     static constexpr u64 CMD = Rig::Obj(2);
     static constexpr u64 GPU_POOL = Rig::Obj(3);
 
-    explicit SnapshotRig(bool enabled) {
-        rig.recorder.SetUniformSnapshot(enabled ? UniformSnapshotMode::Strict
-                                                : UniformSnapshotMode::Off);
+    /// `set_mode` false leaves the Recorder's default mode.
+    explicit SnapshotRig(bool enabled, bool set_mode = true) {
+        if (set_mode) {
+            rig.recorder.SetUniformSnapshot(enabled ? UniformSnapshotMode::Strict
+                                                    : UniformSnapshotMode::Off);
+        }
         REQUIRE(rig.recorder.MemoryPoolInitialize(POOL, Rig::STORAGE, 0x80000, 0));
         REQUIRE(rig.recorder.MemoryPoolInitialize(GPU_POOL, GPU_ONLY, 0x80000, CPU_NO_ACCESS));
         REQUIRE(rig.recorder.QueueInitialize(QUEUE));
@@ -101,6 +104,8 @@ TEST_CASE("nvn uniform snapshot: the bytes of the submit call, merged per pool",
     CHECK(snapshot.ranges[1].begin == FAR_UBO);
     CHECK(snapshot.ranges[1].end == FAR_UBO + 0x100);
     REQUIRE(snapshot.bytes.size() == 0x500);
+    REQUIRE(snapshot.ranges[0].offset <= snapshot.bytes.size() - 0x400);
+    REQUIRE(snapshot.ranges[1].offset <= snapshot.bytes.size() - 0x100);
     for (size_t i = 0; i < 0x400; ++i) {
         CHECK(snapshot.bytes[snapshot.ranges[0].offset + i] == static_cast<u8>(1 + i * 7));
     }
@@ -111,7 +116,7 @@ TEST_CASE("nvn uniform snapshot: the bytes of the submit call, merged per pool",
 
 TEST_CASE("nvn uniform snapshot: off by default, and nothing to copy", "[nvn]") {
     SECTION("switch off") {
-        SnapshotRig f{false};
+        SnapshotRig f{false, false}; // the default, not set
         f.Bind(0, UBO, 0x100);
         CHECK(f.Submit().uniform_snapshot == nullptr);
     }

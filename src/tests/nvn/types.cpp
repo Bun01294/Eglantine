@@ -106,8 +106,12 @@ TEST_CASE("NVN layout status table", "[nvn]") {
     CHECK(texture->size == 0xC0);
     CHECK(texture->min_known_size == 0x80);
     CHECK(texture->status == LayoutStatus::ContradictedByNewerSdk);
-    CHECK(VN::FindLayout("NVNtextureView")->min_known_size == 0x10);
-    CHECK(VN::FindLayout("NVNprogram")->min_known_size == 0x70);
+    const VN::LayoutEntry* view = VN::FindLayout("NVNtextureView");
+    REQUIRE(view != nullptr);
+    CHECK(view->min_known_size == 0x10);
+    const VN::LayoutEntry* program = VN::FindLayout("NVNprogram");
+    REQUIRE(program != nullptr);
+    CHECK(program->min_known_size == 0x70);
     CHECK(VN::FindLayout("NoSuchObject") == nullptr);
 }
 
@@ -191,8 +195,15 @@ TEST_CASE("NVN function table signatures", "[nvn]") {
 }
 
 TEST_CASE("NVN function table matches names.txt", "[nvn]") {
+    // Only the implicit fixture may be missing: a file named by EDEN_NVN_NAMES must be read.
+    const char* const env = std::getenv("EDEN_NVN_NAMES");
+    const bool explicit_file = env != nullptr;
+    if (explicit_file) {
+        INFO("EDEN_NVN_NAMES=" << env);
+        REQUIRE(std::ifstream(env).is_open());
+    }
     const std::vector<std::string> lines = LoadNamesFile();
-    if (lines.empty()) {
+    if (lines.empty() && !explicit_file) {
         SKIP("names.txt not found (set EDEN_NVN_NAMES or place it in C:\\eg\\results\\nvn\\src)");
     }
     REQUIRE(lines.size() == VN::NumFunctions);

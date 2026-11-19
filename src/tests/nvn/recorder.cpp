@@ -153,6 +153,14 @@ const RecordHeader* FindRecord(const std::vector<u64>& list, Op op, size_t nth =
     return nullptr;
 }
 
+/// The payload of the nth `op` record, which the list must hold.
+template <typename T>
+const T* RequiredPayload(const std::vector<u64>& list, Op op, size_t nth = 0) {
+    const RecordHeader* header = FindRecord(list, op, nth);
+    REQUIRE(header != nullptr);
+    return RecordPayload<T>(header);
+}
+
 TextureDesc MakeTextureDesc(u32 width = 64, u32 height = 64) {
     TextureDesc desc{};
     desc.target = 1;
@@ -206,8 +214,22 @@ TEST_CASE("MKW command-list batching preserves large repeated submissions", "[nv
             const u64 seq = f.recorder.QueueSubmitCommands(Fixture::QUEUE, std::array{handle});
             REQUIRE(seq != 0);
             REQUIRE(f.sink.submissions.size() == 1);
+            REQUIRE(f.sink.submissions[0].lists.size() == 1);
             const std::vector<u64>& words = f.sink.submissions[0].lists[0];
             if (expected.empty()) {
+                // The reference list holds every draw, in order.
+                u32 draws = 0;
+                RecordReader reader{words.data(), words.size()};
+                while (const RecordHeader* header = reader.Next()) {
+                    if (RecordOp(header) != Op::Draw) {
+                        continue;
+                    }
+                    const auto* draw = RecordPayload<DrawPayload>(header);
+                    REQUIRE(draw->first == static_cast<s32>(draws));
+                    REQUIRE(draw->count == 3 + draws % 20);
+                    ++draws;
+                }
+                REQUIRE(draws == 2048);
                 expected = words;
             }
             REQUIRE(words == expected);
@@ -419,20 +441,19 @@ TEST_CASE("nvn recorder: full recording sequence", "[nvn]") {
     // The list ends with an End record.
     CHECK(reinterpret_cast<const RecordHeader*>(&list.back())->op == static_cast<u16>(Op::End));
 
-    const auto* targets = RecordPayload<SetRenderTargetsPayload>(
-        FindRecord(list, Op::SetRenderTargets));
+    const auto* targets = RequiredPayload<SetRenderTargetsPayload>(list, Op::SetRenderTargets);
     CHECK(targets->color_count == 1);
     CHECK(targets->has_depth == 0);
     CHECK(TrailingArray<RenderTargetRef>(targets)[0].texture.serial == f.sink.textures[0].serial);
-    const auto* clear = RecordPayload<ClearColorPayload>(FindRecord(list, Op::ClearColor));
+    const auto* clear = RequiredPayload<ClearColorPayload>(list, Op::ClearColor);
     CHECK(clear->mask == 0xF);
     float clear_color[4];
     std::memcpy(clear_color, clear->color, sizeof(clear_color));
     CHECK(clear_color[1] == 0.5f);
-    const auto* bind = RecordPayload<BindProgramPayload>(FindRecord(list, Op::BindProgram));
+    const auto* bind = RequiredPayload<BindProgramPayload>(list, Op::BindProgram);
     CHECK(bind->program_serial == f.sink.programs[0].serial);
     CHECK(bind->stages == 2);
-    const auto* draw = RecordPayload<DrawPayload>(FindRecord(list, Op::Draw));
+    const auto* draw = RequiredPayload<DrawPayload>(list, Op::Draw);
     CHECK(draw->mode == 4);
     CHECK(draw->count == 3);
     CHECK(draw->max_draws == 1);

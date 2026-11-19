@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later AND MIT
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <optional>
@@ -279,7 +281,9 @@ TEST_CASE("nvn hle queue: initialize refuses the builders the SDK refuses", "[nv
 }
 
 TEST_CASE("nvn hle queue: finish sleeps until the GPU completed the submission", "[nvn]") {
+    WaitProbe probe;
     Rig rig;
+    probe.Install(rig);
     REQUIRE(rig.recorder.MemoryPoolInitialize(POOL, Rig::STORAGE, Rig::STORAGE_SIZE, 0));
     REQUIRE(rig.Call("nvnQueueInitialize", {Rig::I(QUEUE), Rig::I(BUILDER)}) == 1);
     REQUIRE(rig.recorder.SyncInitialize(SYNC));
@@ -293,7 +297,8 @@ TEST_CASE("nvn hle queue: finish sleeps until the GPU completed the submission",
         rig.Call("nvnQueueFinish", {Rig::I(QUEUE)});
         finished = true;
     }};
-    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    // The worker reaches the completion wait while the submission is unfinished.
+    CHECK(probe.AwaitWaiting());
     CHECK_FALSE(finished.load());
     rig.sink.Complete(seq);
     waiter.join();
@@ -349,7 +354,13 @@ TEST_CASE("nvn hle pool: an invalidate waits for the GPU's writes of the submiss
             invalidate();
             finished = true;
         }};
-        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        // The 4th poll makes the writer known; from then on the worker waits for its completion.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+        while (polls.load() < 4 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::microseconds{50});
+        }
+        CHECK(polls.load() >= 4);
+        std::this_thread::sleep_for(std::chrono::milliseconds{20});
         CHECK_FALSE(finished.load());
         CHECK(rig.recorder.CompletedSeq() < seq);
         rig.sink.Complete(seq);
@@ -404,7 +415,9 @@ TEST_CASE("nvn hle queue: wait sync ignores a sync nobody fenced", "[nvn]") {
 
 TEST_CASE("nvn hle window: acquire hands out free slots, present frees them on completion",
           "[nvn]") {
+    WaitProbe probe;
     Rig rig;
+    probe.Install(rig);
     MakeWindow(rig, 3);
     const u64 index = Rig::SCRATCH + 0x100;
     CHECK(rig.Call("nvnWindowGetNumTextures", {Rig::I(WINDOW)}) == 3);
@@ -427,11 +440,16 @@ TEST_CASE("nvn hle window: acquire hands out free slots, present frees them on c
         rig.Call("nvnWindowAcquireTexture", {Rig::I(WINDOW), Rig::I(0), Rig::I(index + 0x10)});
         acquired = rig.memory.Peek<s32>(index + 0x10);
     }};
-    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    CHECK(probe.AwaitWaiting());
     CHECK(acquired.load() == -1);
     rig.Call("nvnQueuePresentTexture", {Rig::I(QUEUE), Rig::I(WINDOW), Rig::I(0)});
     rig.Call("nvnQueuePresentTexture", {Rig::I(QUEUE), Rig::I(WINDOW), Rig::I(1)});
-    REQUIRE(rig.sink.presents.size() == 2);
+    if (rig.sink.presents.size() != 2) {
+        // Nothing would free a slot: release the acquirer before failing.
+        probe.cancel = true;
+        acquirer.join();
+        FAIL("expected 2 presents, got " << rig.sink.presents.size());
+    }
     CHECK(rig.sink.presents[0].window_slot == 0);
     std::this_thread::sleep_for(std::chrono::milliseconds{100});
     CHECK(acquired.load() == -1); // presented and shown, but the presents have not completed on the GPU
@@ -444,7 +462,9 @@ TEST_CASE("nvn hle window: the default frame queue limit waits for the previous 
           "[nvn]") {
     ScopedEnv legacy{"EDEN_NX2_TRY_MAX_FRAMES_IN_FLIGHT", nullptr};
     ScopedEnv configured{"EDEN_NX2_MAX_FRAMES_IN_FLIGHT", nullptr};
+    WaitProbe probe;
     Rig rig;
+    probe.Install(rig);
     MakeWindow(rig, 3);
     const u64 index = Rig::SCRATCH + 0x100;
     for (int i = 0; i < 2; ++i) {
@@ -452,16 +472,21 @@ TEST_CASE("nvn hle window: the default frame queue limit waits for the previous 
     }
     rig.Call("nvnQueuePresentTexture", {Rig::I(QUEUE), Rig::I(WINDOW), Rig::I(0)});
     REQUIRE(rig.sink.presents.size() == 1);
+    const u64 first_seq = rig.sink.presents[0].seq;
 
     std::atomic<bool> returned{false};
     std::thread presenter{[&] {
         rig.Call("nvnQueuePresentTexture", {Rig::I(QUEUE), Rig::I(WINDOW), Rig::I(1)});
         returned = true;
     }};
-    std::this_thread::sleep_for(std::chrono::milliseconds{100});
-    CHECK(rig.sink.presents.size() == 2);
+    // The presenter published its request and waits for the depth limit.
+    const bool waiting = probe.AwaitWaiting();
+    CHECK(waiting);
     CHECK_FALSE(returned.load());
-    rig.sink.Complete(rig.sink.presents[0].seq);
+    if (waiting) {
+        CHECK(rig.sink.presents.size() == 2);
+    }
+    rig.sink.Complete(first_seq);
     presenter.join();
     CHECK(returned.load());
 }
@@ -471,7 +496,9 @@ TEST_CASE("nvn hle window: EDEN_NX2_MAX_FRAMES_IN_FLIGHT=2 allows two presents t
           "[nvn]") {
     ScopedEnv legacy{"EDEN_NX2_TRY_MAX_FRAMES_IN_FLIGHT", nullptr};
     ScopedEnv configured{"EDEN_NX2_MAX_FRAMES_IN_FLIGHT", "2"};
+    WaitProbe probe;
     Rig rig;
+    probe.Install(rig);
     MakeWindow(rig, 3);
     const u64 index = Rig::SCRATCH + 0x100;
     for (int slot = 0; slot < 3; ++slot) {
@@ -480,16 +507,21 @@ TEST_CASE("nvn hle window: EDEN_NX2_MAX_FRAMES_IN_FLIGHT=2 allows two presents t
     rig.Call("nvnQueuePresentTexture", {Rig::I(QUEUE), Rig::I(WINDOW), Rig::I(0)});
     rig.Call("nvnQueuePresentTexture", {Rig::I(QUEUE), Rig::I(WINDOW), Rig::I(1)});
     REQUIRE(rig.sink.presents.size() == 2);
+    const u64 first_seq = rig.sink.presents[0].seq;
 
     std::atomic<bool> returned{false};
     std::thread presenter{[&] {
         rig.Call("nvnQueuePresentTexture", {Rig::I(QUEUE), Rig::I(WINDOW), Rig::I(2)});
         returned = true;
     }};
-    std::this_thread::sleep_for(std::chrono::milliseconds{100});
-    CHECK(rig.sink.presents.size() == 3);
+    // The presenter published its request and waits for the depth limit.
+    const bool waiting = probe.AwaitWaiting();
+    CHECK(waiting);
     CHECK_FALSE(returned.load());
-    rig.sink.Complete(rig.sink.presents[0].seq);
+    if (waiting) {
+        CHECK(rig.sink.presents.size() == 3);
+    }
+    rig.sink.Complete(first_seq);
     presenter.join();
     CHECK(returned.load());
 }

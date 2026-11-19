@@ -129,12 +129,11 @@ struct Rect {
     return setting;
 }
 
-/// The upscaler setting as the emulation uses it: `ResolveRequested` with whether NVIDIA's files
-/// were found, looked up once per session (the first query after `ResetSession`, which is game
-/// start) and logged once when DLSS/DLAA were replaced. The saved setting is never changed.
+/// The upscaler setting as the emulation uses it. Eglantine has no upscaler setting and no NVIDIA
+/// DLSS runtime, so this always returns Auto.
 [[nodiscard]] Settings::Upscaler Effective();
 
-/// Forgets the session's file lookup (the renderer is going away).
+/// Called when the renderer is going away; currently does nothing (Effective keeps no state).
 void ResetSession() noexcept;
 
 
@@ -210,6 +209,17 @@ namespace Detail {
     std::uint32_t input_image_height, std::uint32_t output_image_width,
     std::uint32_t output_image_height) noexcept {
     if (input.width <= 0 || input.height <= 0 || output.width <= 0 || output.height <= 0) {
+        return std::nullopt;
+    }
+    // ClipUpscaleAxis's products stay in range for 32-bit origins and sizes (what the SDK
+    // passes); anything wider is not a real rectangle.
+    const auto fits_32 = [](const GameRect& rect) {
+        constexpr std::int64_t min = INT32_MIN;
+        constexpr std::int64_t max = INT32_MAX;
+        return rect.x >= min && rect.x <= max && rect.y >= min && rect.y <= max &&
+               rect.width <= max && rect.height <= max;
+    };
+    if (!fits_32(input) || !fits_32(output)) {
         return std::nullopt;
     }
     ClippedUpscaleRects result{};

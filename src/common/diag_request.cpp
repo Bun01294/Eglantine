@@ -168,9 +168,13 @@ u32 Request::NumberArg(size_t index, u32 fallback) const {
     if (index >= args.size()) {
         return fallback;
     }
+    const std::string& token = args[index];
+    if (token.empty() || token[0] == '-' || token[0] == '+') {
+        return fallback;
+    }
     char* end = nullptr;
-    const unsigned long long value = std::strtoull(args[index].c_str(), &end, 0);
-    if (end == args[index].c_str()) {
+    const unsigned long long value = std::strtoull(token.c_str(), &end, 0);
+    if (end == token.c_str() || *end != '\0') {
         return fallback;
     }
     return static_cast<u32>(std::min<unsigned long long>(value, MaxCount));
@@ -284,11 +288,23 @@ void Detail::PollSlow(s64 now_ns) {
         return; // the writer still holds it; try again at the next poll
     }
     std::string text;
+    bool read_ok = false;
     {
         std::ifstream in{taken, std::ios::binary};
-        std::stringstream buffer;
-        buffer << in.rdbuf();
-        text = buffer.str();
+        if (in) {
+            std::stringstream buffer;
+            buffer << in.rdbuf();
+            read_ok = !in.bad();
+            text = buffer.str();
+        }
+    }
+    if (!read_ok) {
+        LOG_ERROR(Core, "[diag] cannot read {}", taken.string());
+        // Put the request back so the next poll retries it, unless a newer one replaced it.
+        if (!std::filesystem::exists(file, error)) {
+            std::filesystem::rename(taken, file, error);
+        }
+        return;
     }
     std::filesystem::remove(taken, error);
     if (text.size() >= 3 && text.compare(0, 3, "\xEF\xBB\xBF") == 0) {

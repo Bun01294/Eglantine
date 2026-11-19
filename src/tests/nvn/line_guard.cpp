@@ -98,8 +98,15 @@ TEST_CASE("NVN line guard: a touch waits for the line merges in flight on its pa
         finished_in_time = guard->Touched(2 * PAGE + 4, 2 * PAGE + 8);
         returned = true;
     }};
-    while (!guard->HotPage(2)) {
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (!guard->HotPage(2) && !returned.load() &&
+           std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(1ms);
+    }
+    if (!guard->HotPage(2)) {
+        token.reset();
+        guest.join();
+        FAIL("page 2 never became hot");
     }
     std::this_thread::sleep_for(50ms);
     CHECK_FALSE(returned.load());

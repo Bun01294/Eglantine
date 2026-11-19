@@ -79,8 +79,15 @@ public:
             // presentation to finish. The image comes from the context's own thread-safe
             // allocator: the renderer's one is externally synchronized and other renderer threads
             // may still create images with it.
-            present_manager.RecreateFrame(frame, layout.width, layout.height, format, format,
-                                          *render_pass, storage, allocator);
+            try {
+                present_manager.RecreateFrame(frame, layout.width, layout.height, format, format,
+                                              *render_pass, storage, allocator);
+            } catch (...) {
+                // Give the frame back (the caller never sees it) and force a rebuild next time.
+                frame->width = 0;
+                present_manager.ReturnFrame(frame);
+                throw;
+            }
             if (allocator != nullptr &&
                 std::ranges::find(owned_frames, frame) == owned_frames.end()) {
                 owned_frames.push_back(frame);

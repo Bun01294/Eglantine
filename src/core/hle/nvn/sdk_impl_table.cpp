@@ -13,7 +13,7 @@ constexpr u32 Ret = 0xd65f03c0;
 
 /// The two words of a function at module offset `address` are `first; ret`.
 bool IsAccessor(std::span<const u8> image, u64 address, u32 first) {
-    return address % 4 == 0 && address + 8 <= image.size() &&
+    return address % 4 == 0 && image.size() >= 8 && address <= image.size() - 8 &&
            SdkImageWord(image, address) == first && SdkImageWord(image, address + 4) == Ret;
 }
 
@@ -88,7 +88,8 @@ std::optional<u64> SdkImplOffset(std::span<const u8> image,
             return std::nullopt;
         }
         const u64 address = SdkImageU64(image, slot);
-        if (address % 4 != 0 || address + 4 > image.size() || (found && *found != address)) {
+        if (address % 4 != 0 || image.size() < 4 || address > image.size() - 4 ||
+            (found && *found != address)) {
             return std::nullopt;
         }
         found = address;
@@ -112,8 +113,8 @@ bool SdkTextureHandleNullForTextureZero(std::span<const u8> image, u64 address) 
         if (w == CmpW1Zero) {
             compared = true;
         }
-        // csel x0, xzr, xM, eq  /  csel x0, xN, xzr, ne
-        if ((w & 0xffe0ffff) == 0x9a8003e0 || (w & 0xfffffc1f) == 0x9a9f1000) {
+        // csel x0, xzr, xM, eq  /  csel x0, xN, xzr, ne, consuming the flags of that compare
+        if (compared && ((w & 0xffe0ffff) == 0x9a8003e0 || (w & 0xfffffc1f) == 0x9a9f1000)) {
             selects_null = true;
         }
     }

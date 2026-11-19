@@ -284,9 +284,9 @@ VkImageView FSR3::Record(const Device& device, vk::CommandBuffer cmdbuf, size_t 
         CreateWriteDescriptorSet(infos, *m_sampler, *images.image_views[Easu], sets.sets[Rcas], 0),
     };
     device.GetLogical().UpdateDescriptorSets(writes, {});
-    const VkImageLayout old_layout = m_images_ready || m_record_images_ready
+    const VkImageLayout old_layout = m_images_ready || images.record_ready
                                          ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
-    m_record_images_ready = true;
+    images.record_ready = true;
 
     {
         // ΓöÇΓöÇ Pass 1: EASU (edge-adaptive spatial upsampling) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ

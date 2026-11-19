@@ -441,14 +441,24 @@ std::filesystem::path Write(const Capture& capture) {
     const std::vector<u8> blob = Blob(capture);
     const std::string json = ToJson(capture, blob_name);
     const std::filesystem::path json_path = directory / (base + ".json");
-    {
-        std::ofstream file(directory / blob_name, std::ios::binary | std::ios::trunc);
-        file.write(reinterpret_cast<const char*>(blob.data()),
-                   static_cast<std::streamsize>(blob.size()));
-    }
-    {
-        std::ofstream file(json_path, std::ios::binary | std::ios::trunc);
-        file.write(json.data(), static_cast<std::streamsize>(json.size()));
+    // The blob first and the JSON (which names it) only after it: a JSON file means a complete
+    // capture.
+    const auto write_file = [](const std::filesystem::path& path, const char* data, size_t size) {
+        std::ofstream file(path, std::ios::binary | std::ios::trunc);
+        file.write(data, static_cast<std::streamsize>(size));
+        file.close();
+        if (!file) {
+            std::error_code error;
+            std::filesystem::remove(path, error);
+            LOG_ERROR(HW_GPU, "[pathdiff] cannot write {}", path.string());
+            return false;
+        }
+        return true;
+    };
+    if (!write_file(directory / blob_name, reinterpret_cast<const char*>(blob.data()),
+                    blob.size()) ||
+        !write_file(json_path, json.data(), json.size())) {
+        return {};
     }
     LOG_INFO(HW_GPU,
              "[pathdiff] {} capture {}: prog {:016x} (code {:016x}) {} present {} ordinal {}: {} "

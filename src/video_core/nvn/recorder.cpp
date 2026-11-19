@@ -1591,13 +1591,17 @@ bool Recorder::BufferInitialize(u64 buffer_va, u64 memory_pool_va, u64 offset, u
         return false;
     }
     buffer->pool_serial = pool->serial;
+    const u64 fields[2] = {offset, size};
+    if (!impl->GuestWrite(buffer_va + GUEST_BUFFER_OFFSET_OFFSET, fields, sizeof(fields))) {
+        impl->Release(ObjectKind::Buffer, buffer_va, buffer->serial);
+        return false;
+    }
     {
         const std::scoped_lock lock{impl->buffer_spans_mutex};
         const u64 begin = pool->address + offset;
         impl->buffer_spans.push_back({begin, begin + size, buffer->serial});
     }
-    const u64 fields[2] = {offset, size};
-    return impl->GuestWrite(buffer_va + GUEST_BUFFER_OFFSET_OFFSET, fields, sizeof(fields));
+    return true;
 }
 
 void Recorder::BufferFinalize(u64 buffer_va) {

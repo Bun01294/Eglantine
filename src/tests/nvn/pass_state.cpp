@@ -239,7 +239,11 @@ TEST_CASE("NVN pass state: a mip chain copies the freshly rendered mip, repeat d
     REQUIRE(draw(texture, &context_b));
     REQUIRE_FALSE(scratch.Serves(texture, &context_b, epoch.value, {0, 6, 0, 1}));
     // A source that was destroyed and replaced does not match an expired snapshot.
-    scratch.Record(texture, &context_a, epoch.value, all_mips);
+    {
+        const auto destroyed = std::make_shared<int>(2);
+        scratch.Record(destroyed, &context_a, epoch.value, all_mips);
+    }
+    REQUIRE(scratch.from.expired());
     const auto replacement = std::make_shared<int>(0);
     REQUIRE_FALSE(scratch.Serves(replacement, &context_a, epoch.value, all_mips));
 }

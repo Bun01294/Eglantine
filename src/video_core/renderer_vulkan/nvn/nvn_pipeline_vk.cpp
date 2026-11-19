@@ -401,12 +401,19 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
             return pipeline->pipeline ? pipeline : nullptr;
         }
         if (gpl_set) {
-            pipeline->pipeline = library_cache->Link(description.ci, *vk_cache, gpl_set, true);
-            if (pipeline->pipeline) {
-                ++stat_gpl_cached_links;
-            } else {
-                pipeline->pipeline = library_cache->Link(description.ci, *vk_cache, gpl_set, false,
-                                                         part_workers.get());
+            try {
+                pipeline->pipeline = library_cache->Link(description.ci, *vk_cache, gpl_set, true);
+                if (pipeline->pipeline) {
+                    ++stat_gpl_cached_links;
+                } else {
+                    pipeline->pipeline = library_cache->Link(description.ci, *vk_cache, gpl_set,
+                                                             false, part_workers.get());
+                }
+            } catch (const vk::Exception& e) {
+                // A part or the link failed: compiled whole below.
+                NoteIssue(fmt::format("pipeline: library link failed, compiling whole: {}",
+                                      FirstLine(e.what())));
+                pipeline->pipeline = vk::Pipeline{};
             }
             pipeline->fast_linked = static_cast<bool>(pipeline->pipeline);
             if (pipeline->fast_linked) {

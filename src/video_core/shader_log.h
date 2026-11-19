@@ -34,9 +34,11 @@
 /// Hooks are cheap when off: `Enabled()` is one relaxed load of a flag. When on, the call sites
 /// build their records on the thread that already did the work (a compile worker, the GPU
 /// thread) and hand them to `Submit*`; one background thread formats and writes. Bounded: the
-/// total size of the written files is capped (`EDEN_NX2_SHADER_LOG_MAX_MB`, default 1024); once
-/// reached a log line says so, `shaders.jsonl` lines keep coming (marked `files_skipped`) and no
-/// further files are written.
+/// total size of the per-hash and per-pipeline files (`.bin`, `.ctl`, `.ir.txt`, `.spv`,
+/// `.inputs.json`) is capped (`EDEN_NX2_SHADER_LOG_MAX_MB`, default 1024); once reached a log line
+/// says so and no further such files are written. `shaders.jsonl` and `session.json` do not count
+/// toward that cap: `shaders.jsonl` lines keep coming after it (marked `files_skipped`) up to its
+/// own bound of 256 MiB.
 namespace VideoCommon::ShaderLog {
 
 enum class Path { Emulated, Hle };
@@ -54,9 +56,8 @@ extern std::atomic<bool> g_enabled;
     return detail::g_enabled.load(std::memory_order_relaxed);
 }
 
-/// Called at every game start (CreateGPU): decides from `Settings::values.gpu_log_shaders` (Debug
-/// tab or per game) and `EDEN_NX2_SHADER_LOG` whether this game session is logged; when it is,
-/// starts a new session and its writer thread. The session directory is created on the first
+/// Called at every game start (CreateGPU): decides from `EDEN_NX2_SHADER_LOG` whether this game
+/// session is logged; when it is, starts a new session and its writer thread. The session directory is created on the first
 /// write. A call while a session runs is ignored. `title_id` / `build_id` may still be unknown
 /// here: see SetTitle.
 void Start();

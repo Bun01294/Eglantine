@@ -797,6 +797,9 @@ TEST_CASE("NVN draw: rendering through a block view writes the compressed textur
     if (!vulkan) {
         SKIP("no Vulkan device");
     }
+    if (!vulkan->device->IsOptimalBcnSupported()) {
+        SKIP("the device has no native BC4 images to read the blocks of");
+    }
     constexpr s32 BC4 = 0x49;
     constexpr s32 RGBA16_UINT = 0x2C;
     Rig rig{*vulkan};
@@ -855,6 +858,9 @@ TEST_CASE("NVN draw: rendering through a block view of a 3D texture writes its s
     auto vulkan = MakeHeadlessVulkan();
     if (!vulkan) {
         SKIP("no Vulkan device");
+    }
+    if (!vulkan->device->IsOptimalBcnSupported()) {
+        SKIP("the device has no native BC4 images to read the blocks of");
     }
     constexpr s32 BC4 = 0x49;
     constexpr s32 RGBA16_UINT = 0x2C;

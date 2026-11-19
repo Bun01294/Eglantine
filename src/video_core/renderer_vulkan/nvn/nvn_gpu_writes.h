@@ -48,6 +48,9 @@ public:
     /// The newest submission <= `max_seq` and > `completed_seq` that writes a byte of
     /// [begin, end); 0 when there is none.
     [[nodiscard]] u64 Latest(u64 begin, u64 end, u64 max_seq, u64 completed_seq) const {
+        if (end <= begin) {
+            return 0;
+        }
         u64 result = 0;
         std::scoped_lock lock{mutex};
         for (const Entry& entry : entries) {

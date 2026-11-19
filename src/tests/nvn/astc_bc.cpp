@@ -27,6 +27,7 @@
 #include <fmt/format.h>
 
 #include "common/common_types.h"
+#include "common/scope_exit.h"
 #include "video_core/renderer_vulkan/nvn/nvn_astc_gpu.h"
 #include "video_core/renderer_vulkan/nvn/nvn_bc_encode.h"
 #include "video_core/renderer_vulkan/nvn/nvn_format.h"
@@ -209,6 +210,9 @@ GpuEncodeResult EncodeOnGpu(const Vulkan::Device& device, std::span<const Rgba8L
     const u32 level_count = static_cast<u32>(levels.size());
     GpuEncodeResult result;
     VmaAllocator vma = device.CreateThreadSafeAllocator();
+    SCOPE_EXIT {
+        vmaDestroyAllocator(vma);
+    };
     {
         MemoryAllocator allocator(device, vma);
         const BcGpuEncoder encoder(device, bc7, smart.spirv);
@@ -290,6 +294,12 @@ GpuEncodeResult EncodeOnGpu(const Vulkan::Device& device, std::span<const Rgba8L
             MemoryUsage::Download);
 
         const vk::Device& logical = device.GetLogical();
+        // Timing is only taken when the queue has timestamps; encoding and readback run anyway.
+        const auto families = device.GetPhysical().GetQueueFamilyProperties();
+        const u32 valid_bits = device.GetGraphicsFamily() < families.size()
+                                   ? families[device.GetGraphicsFamily()].timestampValidBits
+                                   : 0;
+        const bool timing = valid_bits != 0;
         vk::QueryPool queries = logical.CreateQueryPool({
             .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
             .pNext = nullptr,
@@ -313,7 +323,9 @@ GpuEncodeResult EncodeOnGpu(const Vulkan::Device& device, std::span<const Rgba8L
             .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
             .pInheritanceInfo = nullptr,
         });
-        cmd.ResetQueryPool(*queries, 0, 2);
+        if (timing) {
+            cmd.ResetQueryPool(*queries, 0, 2);
+        }
         VkImageMemoryBarrier to_dst{
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .pNext = nullptr,
@@ -329,7 +341,9 @@ GpuEncodeResult EncodeOnGpu(const Vulkan::Device& device, std::span<const Rgba8L
         };
         cmd.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
                             to_dst);
-        cmd.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *queries, 0);
+        if (timing) {
+            cmd.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *queries, 0);
+        }
         for (u32 level = 0; level < level_count; ++level) {
             const Rgba8Level& texels = levels[level];
             for (const BcChunk& chunk :
@@ -406,7 +420,9 @@ GpuEncodeResult EncodeOnGpu(const Vulkan::Device& device, std::span<const Rgba8L
                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
             }
         }
-        cmd.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *queries, 1);
+        if (timing) {
+            cmd.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *queries, 1);
+        }
         VkImageMemoryBarrier to_src = to_dst;
         to_src.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -434,12 +450,16 @@ GpuEncodeResult EncodeOnGpu(const Vulkan::Device& device, std::span<const Rgba8L
         };
         REQUIRE(device.GetGraphicsQueue().Submit(submit, *fence) == VK_SUCCESS);
         REQUIRE(fence.Wait() == VK_SUCCESS);
-        std::array<u64, 2> ticks{};
-        REQUIRE(logical.GetQueryResults(*queries, 0, 2, sizeof(ticks), ticks.data(), sizeof(u64),
-                                        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) ==
-                VK_SUCCESS);
-        const double period = device.GetPhysical().GetProperties().limits.timestampPeriod;
-        result.gpu_ms = static_cast<double>(ticks[1] - ticks[0]) * period / 1e6;
+        if (timing) {
+            std::array<u64, 2> ticks{};
+            REQUIRE(logical.GetQueryResults(*queries, 0, 2, sizeof(ticks), ticks.data(),
+                                            sizeof(u64),
+                                            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) ==
+                    VK_SUCCESS);
+            const u64 mask = valid_bits >= 64 ? ~u64{0} : (u64{1} << valid_bits) - 1;
+            const double period = device.GetPhysical().GetProperties().limits.timestampPeriod;
+            result.gpu_ms = static_cast<double>((ticks[1] - ticks[0]) & mask) * period / 1e6;
+        }
 
         if (decode || smart.keep_blocks) {
             download.Invalidate();
@@ -484,7 +504,6 @@ GpuEncodeResult EncodeOnGpu(const Vulkan::Device& device, std::span<const Rgba8L
             }
         }
     }
-    vmaDestroyAllocator(vma);
     return result;
 }
 
@@ -815,6 +834,9 @@ TEST_CASE("NVN ASTC stand-in: block-linear ASTC decodes and re-encodes into a BC
         INFO((bc3 ? "BC3" : "BC1"));
         const u32 block_bytes = bc3 ? 16 : 8;
         VmaAllocator vma = device.CreateThreadSafeAllocator();
+        SCOPE_EXIT {
+            vmaDestroyAllocator(vma);
+        };
         {
             MemoryAllocator allocator(device, vma);
             const AstcGpuDecoder decoder(device);
@@ -1044,7 +1066,6 @@ TEST_CASE("NVN ASTC stand-in: block-linear ASTC decodes and re-encodes into a BC
             }
             REQUIRE(wrong == 0);
         }
-        vmaDestroyAllocator(vma);
     }
 }
 

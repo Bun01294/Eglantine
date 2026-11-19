@@ -19,9 +19,12 @@
 
 // Guest-visible NVN types. Nothing here is behaviour: it is the layout contract the HLE reads and writes.
 //
-// Objects the game allocates are opaque blobs of the SDK's size. The HLE never reinterprets them as host
-// records; it stores a 16-byte tag at offset 0 of non-builder objects (see the NVN2 HLE contract) and keeps
-// host state elsewhere. Builders are the exception and are used in place.
+// Objects the game allocates are opaque blobs of the SDK's size. For objects the recorder manages (device,
+// queue, memory pool, buffer, texture, sampler, command buffer, ...) the HLE never reinterprets them as host
+// records; it stores a 16-byte tag at offset 0 (see the NVN2 HLE contract) and keeps host state elsewhere.
+// Builders, the state objects (NVNblendState, NVNcolorState, NVNchannelMaskState, NVNmultisampleState,
+// NVNpolygonState, NVNdepthStencilState, NVNvertexAttribState, NVNvertexStreamState) and texture views
+// carry no tag: they are used in place in their packed layouts.
 //
 // Layout status of every type is in `LayoutTable` below. "Verified" means a documented layout that shipping
 // games read or write directly and that nxnative's tests exercise; it does NOT mean it was measured on

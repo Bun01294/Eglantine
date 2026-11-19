@@ -393,7 +393,8 @@ public:
     struct Uniform {
         std::vector<u8> bytes;    ///< the bound range (inline updates applied)
         std::vector<u8> readable; ///< per FROZEN_CHUNK: guest memory could be read
-        std::vector<std::pair<u64, u64>> inline_written; ///< byte spans written by inline updates
+        /// Byte spans written by inline updates, or read on their own in an unreadable chunk.
+        std::vector<std::pair<u64, u64>> inline_written;
 
         [[nodiscard]] bool WordReadable(u64 offset) const noexcept {
             for (u64 byte = offset; byte < offset + sizeof(u32); ++byte) {
@@ -567,6 +568,24 @@ std::unique_ptr<TextureOracle> DrawContext::FreezeOracle(
                                          length)
                                 ? 1
                                 : 0;
+                        if (uniform.readable[chunk] != 0) {
+                            continue;
+                        }
+                        // An unaligned chunk spans two guest pages: keep the half that reads
+                        // (WordReadable counts the spans of inline_written as readable).
+                        constexpr u64 GUEST_PAGE = 4096;
+                        const u64 split =
+                            (((binding.address + begin) | (GUEST_PAGE - 1)) + 1) - binding.address;
+                        if (split >= begin + length) {
+                            continue;
+                        }
+                        for (const auto& [lo, hi] :
+                             {std::pair{begin, split}, std::pair{split, begin + length}}) {
+                            if (memory->Read(binding.address + lo, uniform.bytes.data() + lo,
+                                             hi - lo)) {
+                                uniform.inline_written.emplace_back(lo, hi);
+                            }
+                        }
                     }
                 }
                 if (host != nullptr) {
@@ -1484,8 +1503,23 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                             const auto target = row    ? DrawResources::RetypeTarget::Row
                                                 : cube ? DrawResources::RetypeTarget::Cube
                                                        : DrawResources::RetypeTarget::Volume;
+                            // Distinct sources of one draw get distinct scratch images: the slot
+                            // counts the distinct copy sources before this one's first copy.
+                            u32 prior_sources = 0;
+                            for (size_t e = 0; e < plan.feedback.size(); ++e) {
+                                const auto& entry_source = plan.feedback[e].source;
+                                if (entry_source == texture->storage) {
+                                    break;
+                                }
+                                bool seen = false;
+                                for (size_t f = 0; f < e; ++f) {
+                                    seen |= plan.feedback[f].source == entry_source;
+                                }
+                                prior_sources += seen ? 0u : 1u;
+                            }
                             DrawResources::Scratch* made = resources.GetRetypedScratch(
-                                s, 200u + static_cast<u32>(binding.type), target);
+                                s, 200u + static_cast<u32>(binding.type) + 64u * prior_sources,
+                                target);
                             if (made) {
                                 if (placeholder_logged
                                         .insert(texture->serial << 8 ^ static_cast<u64>(binding.type))
@@ -2206,45 +2240,55 @@ bool DrawContext::PushPlan(PipelineBase& pipe, DrawPlan& plan, VkPipelineBindPoi
 
 VkDescriptorSet DrawContext::AllocateSet(VkDescriptorSetLayout layout) {
     constexpr u32 SETS_PER_POOL = 256;
-    if (!set_pool || set_pool_used >= SETS_PER_POOL) {
-        const std::array<VkDescriptorPoolSize, 6> sizes{{
-            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SETS_PER_POOL * 24},
-            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, SETS_PER_POOL * 16},
-            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, SETS_PER_POOL * 48},
-            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, SETS_PER_POOL * 8},
-            {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, SETS_PER_POOL * 4},
-            {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, SETS_PER_POOL * 4},
-        }};
-        try {
-            set_pool = std::make_shared<vk::DescriptorPool>(impl.device.GetLogical().CreateDescriptorPool({
-                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .maxSets = SETS_PER_POOL,
-                .poolSizeCount = static_cast<u32>(sizes.size()),
-                .pPoolSizes = sizes.data(),
-            }));
-        } catch (const vk::Exception& exception) {
-            LOG_ERROR(Render_Vulkan, "[nvn] descriptor pool creation failed: {}", exception.what());
-            set_pool.reset();
+    // A pool can run out of one descriptor type before SETS_PER_POOL sets: start a new one and
+    // retry once (the old pool stays alive in its flight's keepalive).
+    for (u32 attempt = 0; attempt < 2; ++attempt) {
+        const bool fresh = !set_pool || set_pool_used >= SETS_PER_POOL;
+        if (fresh) {
+            const std::array<VkDescriptorPoolSize, 6> sizes{{
+                {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SETS_PER_POOL * 24},
+                {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, SETS_PER_POOL * 16},
+                {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, SETS_PER_POOL * 48},
+                {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, SETS_PER_POOL * 8},
+                {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, SETS_PER_POOL * 4},
+                {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, SETS_PER_POOL * 4},
+            }};
+            try {
+                set_pool = std::make_shared<vk::DescriptorPool>(impl.device.GetLogical().CreateDescriptorPool({
+                    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                    .pNext = nullptr,
+                    .flags = 0,
+                    .maxSets = SETS_PER_POOL,
+                    .poolSizeCount = static_cast<u32>(sizes.size()),
+                    .pPoolSizes = sizes.data(),
+                }));
+            } catch (const vk::Exception& exception) {
+                LOG_ERROR(Render_Vulkan, "[nvn] descriptor pool creation failed: {}", exception.what());
+                set_pool.reset();
+                return VK_NULL_HANDLE;
+            }
+            host->HostFlight().keepalive.push_back(set_pool);
+            set_pool_used = 0;
+        }
+        const VkDescriptorSetAllocateInfo info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .pNext = nullptr,
+            .descriptorPool = **set_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &layout,
+        };
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        const VkResult result = impl.dld.vkAllocateDescriptorSets(impl.logical, &info, &set);
+        if (result == VK_SUCCESS) {
+            ++set_pool_used;
+            return set;
+        }
+        if (fresh || (result != VK_ERROR_OUT_OF_POOL_MEMORY && result != VK_ERROR_FRAGMENTED_POOL)) {
             return VK_NULL_HANDLE;
         }
-        host->HostFlight().keepalive.push_back(set_pool);
-        set_pool_used = 0;
+        set_pool_used = SETS_PER_POOL; // depleted: the next attempt starts a new pool
     }
-    const VkDescriptorSetAllocateInfo info{
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-        .pNext = nullptr,
-        .descriptorPool = **set_pool,
-        .descriptorSetCount = 1,
-        .pSetLayouts = &layout,
-    };
-    VkDescriptorSet set = VK_NULL_HANDLE;
-    if (impl.dld.vkAllocateDescriptorSets(impl.logical, &info, &set) != VK_SUCCESS) {
-        return VK_NULL_HANDLE;
-    }
-    ++set_pool_used;
-    return set;
+    return VK_NULL_HANDLE;
 }
 
 bool DrawContext::BindDescriptors(PipelineBase& pipe, VkPipelineBindPoint bind_point) {

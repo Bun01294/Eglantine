@@ -153,10 +153,18 @@ std::vector<u32> Emit(Translated& translated, bool profile_raw_global_memory) {
 /// the tool is not installed: the check only runs where it can.
 bool ValidSpirv(std::span<const u32> words) {
     const char* configured = std::getenv("EDEN_NVN_SPIRV_VAL");
-    const std::string tool = configured != nullptr && *configured != '\0'
-                                 ? configured
-                                 : "C:/eg/VulkanSDK/1.4.341.1/Bin/spirv-val.exe";
-    if (tool == "none" || !std::filesystem::exists(tool)) {
+    const bool explicit_tool = configured != nullptr && *configured != '\0';
+    const std::string tool =
+        explicit_tool ? configured : "C:/eg/VulkanSDK/1.4.341.1/Bin/spirv-val.exe";
+    if (tool == "none") {
+        return true;
+    }
+    if (!std::filesystem::exists(tool)) {
+        if (explicit_tool) {
+            // A validator asked for by name must run.
+            UNSCOPED_INFO("EDEN_NVN_SPIRV_VAL names a missing file: " << tool);
+            return false;
+        }
         return true;
     }
     const std::filesystem::path path = Tests::UniqueTempPath("nvn_raw_global_test", ".spv");
@@ -167,8 +175,12 @@ bool ValidSpirv(std::span<const u32> words) {
         std::fclose(file);
     }
     const std::filesystem::path log = path.string() + ".log";
-    const std::string command = "\"\"" + tool + "\" --target-env vulkan1.3 --uniform-buffer-standard-layout \"" + path.string() +
-                                "\" > \"" + log.string() + "\" 2>&1\"";
+    std::string command = "\"" + tool + "\" --target-env vulkan1.3 --uniform-buffer-standard-layout \"" +
+                          path.string() + "\" > \"" + log.string() + "\" 2>&1";
+#ifdef _WIN32
+    // cmd.exe /c strips the outer quotes of a line that starts with a quoted path.
+    command = "\"" + command + "\"";
+#endif
     const int code = std::system(command.c_str());
     if (code != 0) {
         std::FILE* file = std::fopen(log.string().c_str(), "rb");
@@ -190,6 +202,7 @@ struct ModuleFacts {
     u32 addressing_model{~0u};
     u32 convert_u_to_ptr{};
     u32 physical_pointer_types{};
+    bool malformed{};
 };
 
 ModuleFacts Scan(std::span<const u32> words) {
@@ -203,16 +216,19 @@ ModuleFacts Scan(std::span<const u32> words) {
     for (size_t i = 5; i < words.size();) {
         const u32 count = words[i] >> 16;
         const u32 opcode = words[i] & 0xffff;
-        if (count == 0) {
+        if (count == 0 || count > words.size() - i) {
+            facts.malformed = true; // truncated: its operands are not there
             break;
         }
-        if (opcode == OpCapability && words[i + 1] == CapabilityPhysicalStorageBufferAddresses) {
+        if (opcode == OpCapability && count >= 2 &&
+            words[i + 1] == CapabilityPhysicalStorageBufferAddresses) {
             facts.physical_storage_capability = true;
-        } else if (opcode == OpMemoryModel) {
+        } else if (opcode == OpMemoryModel && count >= 2) {
             facts.addressing_model = words[i + 1];
         } else if (opcode == OpConvertUToPtr) {
             ++facts.convert_u_to_ptr;
-        } else if (opcode == OpTypePointer && words[i + 2] == StorageClassPhysicalStorageBuffer) {
+        } else if (opcode == OpTypePointer && count >= 3 &&
+                   words[i + 2] == StorageClassPhysicalStorageBuffer) {
             ++facts.physical_pointer_types;
         }
         i += count;
@@ -277,6 +293,7 @@ TEST_CASE("NVN raw global memory: emission through PhysicalStorageBuffer64", "[n
         const std::vector<u32> words = Emit(*translated, true);
         CHECK(ValidSpirv(words));
         const ModuleFacts facts = Scan(words);
+        CHECK_FALSE(facts.malformed);
         CHECK(facts.physical_storage_capability);
         CHECK(facts.addressing_model == 5348); // PhysicalStorageBuffer64
         CHECK(facts.convert_u_to_ptr >= 1);
@@ -285,6 +302,7 @@ TEST_CASE("NVN raw global memory: emission through PhysicalStorageBuffer64", "[n
     SECTION("no profile support: the c0 storage buffer table fallback, logical addressing") {
         auto translated = Translate(POINTER_THROUGH_TABLE, true);
         const ModuleFacts facts = Scan(Emit(*translated, false));
+        CHECK_FALSE(facts.malformed);
         CHECK_FALSE(facts.physical_storage_capability);
         CHECK(facts.addressing_model == 0); // Logical
         CHECK(facts.convert_u_to_ptr == 0);
@@ -417,6 +435,17 @@ TEST_CASE("NVN raw global memory: address range table", "[nvn]") {
                    std::all_of(bank.begin() + 0xF10, bank.end(), [](u8 b) { return b == 0; });
         };
         CHECK(zero_except_header());
+        // The NVN words below the header keep what they held, not only zeros.
+        {
+            std::array<u8, 0x1000> filled;
+            filled.fill(0x5A);
+            Vulkan::Nvn::WriteRawGlobalTable(&table, 0, filled);
+            CHECK(std::all_of(filled.begin(), filled.begin() + 0xF00,
+                              [](u8 b) { return b == 0x5A; }));
+            u32 filled_count = 0;
+            std::memcpy(&filled_count, filled.data() + 0xF00, sizeof(filled_count));
+            CHECK(filled_count == 7);
+        }
         // With it, the ring's device address follows the table's.
         Vulkan::Nvn::WriteRawGlobalTable(&table, 0xFEDC'BA98'7654'3210, bank);
         u64 ring = 0;

@@ -148,6 +148,9 @@ Layout::TextureLayoutDesc ToLayout(const Desc& d) {
 // ---- Sparse tile layout (nxnative nvn_tex_sparse_tiles; nvn_texture_layout.h has no port) --------
 
 u32 Mip(u32 size, u32 level) {
+    if (level >= 32) {
+        return 1;
+    }
     size >>= level;
     return size ? size : 1;
 }
@@ -945,7 +948,8 @@ std::optional<GuestTag> ReadTextureTag(Call& c, u64 va) {
     return tag;
 }
 
-void CopyPackagedData(Call& c, u64 source, u64 destination, u64 size) {
+/// Returns the bytes copied (less than `size` when a read or write failed).
+u64 CopyPackagedData(Call& c, u64 source, u64 destination, u64 size) {
     std::array<u8, 16384> buffer;
     u64 done = 0;
     while (done < size) {
@@ -964,6 +968,7 @@ void CopyPackagedData(Call& c, u64 source, u64 destination, u64 size) {
     // The driver's own copy into the storage: the replay's copies of those bytes (a pool mirror)
     // follow, as they do for a store of the guest CPU.
     c.rec.NotifyHostWrite(destination, done);
+    return done;
 }
 
 // ---- Texture builder: setters -------------------------------------------------------------------
@@ -1483,8 +1488,7 @@ void nvnTextureInitialize(Call& c) {
         const u64 size = std::min({Layout::ComputeTextureLayout(layout_desc).size,
                                    SdkStorageSize(SdkTextureOf(b), c.runtime.device.OlderSdk()),
                                    pool->size - offset});
-        CopyPackagedData(c, b.pkg_data, storage, size);
-        packaged_bytes = size;
+        packaged_bytes = CopyPackagedData(c, b.pkg_data, storage, size);
     }
 
     TextureDesc desc{};
@@ -1682,7 +1686,8 @@ void nvnTextureCompare(Call& c) {
                   a->samples == b->samples && a->width == b->width && a->height == b->height &&
                   a->depth == b->depth && a->levels == b->levels && a->stride == b->stride &&
                   a->pkg_block_h == b->pkg_block_h && a->pool_serial == b->pool_serial &&
-                  a->pool_offset == b->pool_offset && swizzle(*a) == swizzle(*b));
+                  a->pool_offset == b->pool_offset && a->stencil == b->stencil &&
+                  swizzle(*a) == swizzle(*b));
 }
 
 /// Byte offset of a view's first level and layer inside the texture storage.
@@ -1836,6 +1841,10 @@ void TexelAccess(Call& c, bool write, u64 texture, u64 view_va, u64 region_va, u
         if (view.set_bits & ::VideoCommon::Nvn::GUEST_VIEW_SET_LAYERS) {
             layer = view.min_layer;
         }
+    }
+    if (level >= std::max<u32>(desc->levels, 1)) {
+        bad("level out of range");
+        return;
     }
     const u32 level_width = Mip(desc->width, level);
     const u32 level_height = Mip(desc->height, level);
@@ -1995,10 +2004,12 @@ void TexelAccess(Call& c, bool write, u64 texture, u64 view_va, u64 region_va, u
             return;
         }
         const u64 caller = data + slice * image_pitch;
-        std::vector<u8> linear_bytes(static_cast<size_t>(pitch * rows));
+        // Packed host scratch (row_bytes per row, bounded by the level): the guest row stride
+        // only places the rows in guest memory.
+        std::vector<u8> linear_bytes(static_cast<size_t>(row_bytes * rows));
         if (write) {
             for (u64 y = 0; y < rows; ++y) {
-                if (!c.mem.Read(caller + y * pitch, linear_bytes.data() + y * pitch,
+                if (!c.mem.Read(caller + y * pitch, linear_bytes.data() + y * row_bytes,
                                 static_cast<size_t>(row_bytes))) {
                     bad("guest memory access failed");
                     return;
@@ -2008,7 +2019,7 @@ void TexelAccess(Call& c, bool write, u64 texture, u64 view_va, u64 region_va, u
                                            static_cast<u32>(first_column_blocks),
                                            static_cast<u32>(first_row), region_cols,
                                            static_cast<u32>(rows), tile_h, tile_d,
-                                           static_cast<u32>(pitch), true);
+                                           static_cast<u32>(row_bytes), true);
             writes.Storage(guest_level, bytes.size());
             if (!c.mem.Write(guest_level, bytes.data(), bytes.size())) {
                 bad("guest memory access failed");
@@ -2020,10 +2031,10 @@ void TexelAccess(Call& c, bool write, u64 texture, u64 view_va, u64 region_va, u
                                          static_cast<u32>(first_column_blocks),
                                          static_cast<u32>(first_row), region_cols,
                                          static_cast<u32>(rows), tile_h, tile_d,
-                                         static_cast<u32>(pitch), true);
+                                         static_cast<u32>(row_bytes), true);
         for (u64 y = 0; y < rows; ++y) {
             writes.Caller(caller + y * pitch, row_bytes);
-            if (!c.mem.Write(caller + y * pitch, linear_bytes.data() + y * pitch,
+            if (!c.mem.Write(caller + y * pitch, linear_bytes.data() + y * row_bytes,
                              static_cast<size_t>(row_bytes))) {
                 bad("guest memory access failed");
                 return;

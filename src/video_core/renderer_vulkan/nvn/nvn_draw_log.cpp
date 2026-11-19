@@ -60,6 +60,10 @@ std::string_view StageTag(u32 stage) {
         return "tcs";
     case 4:
         return "tes";
+    case STAGE_TASK:
+        return "task";
+    case STAGE_MESH:
+        return "mesh";
     default:
         return "cs";
     }
@@ -176,7 +180,9 @@ std::string DrawContext::DescribeInputs(const PipelineBase* logged_pipeline, boo
         }
         std::vector<u8> bytes(want);
         std::vector<u8> readable((want + CHUNK - 1) / CHUNK, 0);
-        if (memory->Read(binding.address, bytes.data(), want)) {
+        // EDEN_NX2_NVN_UBO_SNAPSHOT: the submit-time bytes BuildDescriptors binds.
+        const bool from_snapshot = ReadSnapshotBytes(binding.address, bytes.data(), want);
+        if (from_snapshot || memory->Read(binding.address, bytes.data(), want)) {
             std::fill(readable.begin(), readable.end(), u8{1});
         } else {
             for (u64 chunk = 0; chunk < readable.size(); ++chunk) {
@@ -186,9 +192,12 @@ std::string DrawContext::DescribeInputs(const PipelineBase* logged_pipeline, boo
                     memory->Read(binding.address + begin, bytes.data() + begin, length) ? 1 : 0;
             }
         }
-        if (host != nullptr) {
+        // Byte spans the inline updates wrote: they complete an unreadable chunk only where they
+        // cover all of it.
+        std::vector<std::pair<u64, u64>> covered;
+        if (host != nullptr && !from_snapshot) {
             impl.ApplyPendingInlineWrites(binding.address, bytes.data(), want,
-                                          host->HostFlight().seq);
+                                          host->HostFlight().seq, &covered);
         }
         for (const InlineUpdate& update : inline_updates) {
             const u64 lo = (std::max)(update.address, binding.address);
@@ -196,14 +205,21 @@ std::string DrawContext::DescribeInputs(const PipelineBase* logged_pipeline, boo
             if (lo < hi) {
                 std::memcpy(bytes.data() + (lo - binding.address),
                             update.data + (lo - update.address), hi - lo);
-                for (u64 chunk = (lo - binding.address) / CHUNK;
-                     chunk <= (hi - 1 - binding.address) / CHUNK; ++chunk) {
-                    readable[chunk] = 1;
-                }
+                covered.emplace_back(lo - binding.address, hi - binding.address);
             }
         }
-        const bool complete = std::all_of(readable.begin(), readable.end(),
-                                          [](u8 value) { return value != 0; });
+        bool complete = true;
+        for (u64 chunk = 0; chunk < readable.size() && complete; ++chunk) {
+            if (readable[chunk] != 0) {
+                continue;
+            }
+            const u64 end = (std::min)((chunk + 1) * CHUNK, want);
+            for (u64 byte = chunk * CHUNK; byte < end && complete; ++byte) {
+                complete = std::any_of(covered.begin(), covered.end(), [byte](const auto& span) {
+                    return span.first <= byte && byte < span.second;
+                });
+            }
+        }
         item += fmt::format(",\"size_read\":{},\"complete\":{},\"words\":\"{}\"}}", want, complete,
                             Hex(bytes.data(), bytes.size()));
         add(cbufs, item);

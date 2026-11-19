@@ -433,6 +433,11 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
             }
         }
     }
+    if (result == VK_ERROR_FEATURE_NOT_PRESENT && device_strict && !huge) {
+        // Strict mode's required device-local flag matched no memory type the image accepts:
+        // take the host fallback below instead of failing.
+        result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         // Still out of device memory: a real image in host memory (slow, but valid) beats one
         // with nothing bound, which AMD's drivers do not survive being sampled.

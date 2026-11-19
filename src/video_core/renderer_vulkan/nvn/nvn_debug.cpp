@@ -570,8 +570,8 @@ std::string WriteTga(const PendingDump& dump, std::span<const u8> pixels) {
     const u32 factor = dump.thumb_width != 0 && dump.width > dump.thumb_width
                            ? (dump.width + dump.thumb_width - 1) / dump.thumb_width
                            : 1;
-    const u32 out_width = (std::max)(dump.width / factor, 1u);
-    const u32 out_height = (std::max)(dump.height / factor, 1u);
+    const u32 out_width = (std::max)((dump.width + factor - 1) / factor, 1u);
+    const u32 out_height = (std::max)((dump.height + factor - 1) / factor, 1u);
     std::vector<Rgba> box(static_cast<size_t>(out_width) * out_height);
     std::vector<u32> box_count(box.size());
     double sum[4]{};
@@ -613,6 +613,7 @@ std::string WriteTga(const PendingDump& dump, std::span<const u8> pixels) {
         o[2] = ToByte(box[i].r / n);
         o[3] = 255;
     }
+    bool written = false;
     if (std::FILE* file = std::fopen(dump.path.c_str(), "wb")) {
         std::array<u8, 18> header{};
         header[2] = 2;
@@ -622,9 +623,9 @@ std::string WriteTga(const PendingDump& dump, std::span<const u8> pixels) {
         header[15] = static_cast<u8>(out_height >> 8);
         header[16] = 32;
         header[17] = 0x28; // 8 alpha bits, top-down
-        std::fwrite(header.data(), 1, header.size(), file);
-        std::fwrite(out.data(), 1, out.size(), file);
-        std::fclose(file);
+        written = std::fwrite(header.data(), 1, header.size(), file) == header.size();
+        written = std::fwrite(out.data(), 1, out.size(), file) == out.size() && written;
+        written = std::fclose(file) == 0 && written;
     }
     if (factor == 1 && KeepsRaw(dump.format, dump.aspect)) {
         // The 8-bit TGA hides small depth differences and clamps float colour: keep the raw
@@ -635,9 +636,9 @@ std::string WriteTga(const PendingDump& dump, std::span<const u8> pixels) {
         }
     }
     const double n = static_cast<double>(count);
-    return fmt::format("mean=({:.6g},{:.6g},{:.6g},{:.6g}) nonzero={:.2f}% r_range=[{:.4g},{:.4g}]",
-                       sum[0] / n, sum[1] / n, sum[2] / n, sum[3] / n,
-                       100.0 * static_cast<double>(nonzero) / n, lo, hi);
+    return fmt::format("{}mean=({:.6g},{:.6g},{:.6g},{:.6g}) nonzero={:.2f}% r_range=[{:.4g},{:.4g}]",
+                       written ? "" : "WRITE FAILED ", sum[0] / n, sum[1] / n, sum[2] / n,
+                       sum[3] / n, 100.0 * static_cast<double>(nonzero) / n, lo, hi);
 }
 
 bool ToRgba8(VkFormat format, VkImageAspectFlags aspect, u32 width, u32 height,

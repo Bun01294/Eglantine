@@ -129,6 +129,7 @@ std::vector<u32> EmitWords(const Shader::Profile& profile, std::span<const u64> 
 struct MeshOutput {
     std::vector<u32> modes;
     std::vector<u32> builtins;
+    bool malformed{};
     [[nodiscard]] bool HasMode(u32 mode) const {
         return std::ranges::find(modes, mode) != modes.end();
     }
@@ -145,7 +146,8 @@ MeshOutput ScanMeshOutput(std::span<const u32> words) {
     for (size_t i = 5; i < words.size();) {
         const u32 count = words[i] >> 16;
         const u32 opcode = words[i] & 0xffff;
-        if (count == 0) {
+        if (count == 0 || count > words.size() - i) {
+            result.malformed = true; // truncated: its operands are not there
             break;
         }
         if (opcode == OpExecutionMode && count >= 3) {
@@ -178,6 +180,7 @@ TEST_CASE("Shaders: mesh programs output points, lines or triangles", "[nvn][sha
     fixed_size.fixed_state_point_size = 4.0f;
     const MeshOutput points =
         ScanMeshOutput(EmitWords(profile, program, Shader::Stage::Mesh, 0, fixed_size));
+    CHECK_FALSE(points.malformed);
     CHECK(points.HasMode(ModeOutputPoints));
     CHECK(points.HasBuiltIn(BuiltInPrimitivePointIndicesEXT));
     // Vulkan needs a size per point vertex: the fixed state one is written.
@@ -185,11 +188,13 @@ TEST_CASE("Shaders: mesh programs output points, lines or triangles", "[nvn][sha
     CHECK_FALSE(points.HasBuiltIn(BuiltInPrimitiveTriangleIndicesEXT));
 
     const MeshOutput lines = ScanMeshOutput(EmitWords(profile, program, Shader::Stage::Mesh, 1));
+    CHECK_FALSE(lines.malformed);
     CHECK(lines.HasMode(ModeOutputLinesEXT));
     CHECK(lines.HasBuiltIn(BuiltInPrimitiveLineIndicesEXT));
     CHECK_FALSE(lines.HasBuiltIn(BuiltInPointSize));
 
     const MeshOutput triangles = ScanMeshOutput(EmitWords(profile, program, Shader::Stage::Mesh));
+    CHECK_FALSE(triangles.malformed);
     CHECK(triangles.HasMode(ModeOutputTrianglesEXT));
     CHECK(triangles.HasBuiltIn(BuiltInPrimitiveTriangleIndicesEXT));
     CHECK_FALSE(triangles.HasMode(ModeOutputPoints));

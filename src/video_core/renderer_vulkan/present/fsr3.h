@@ -93,6 +93,7 @@ private:
         std::array<vk::Image, MaxStage> images;
         std::array<vk::ImageView, MaxStage> image_views;
         std::array<vk::Framebuffer, MaxStage> framebuffers;
+        bool record_ready{}; ///< Record left this image's stages in GENERAL
     };
     std::vector<Images> m_dynamic_images;
 
@@ -104,7 +105,6 @@ private:
         vk::DescriptorSets sets;
     };
     std::shared_ptr<RecordDescriptorSets> m_record_descriptor_sets;
-    bool m_record_images_ready{};
     bool m_images_ready{};
     bool m_has_prev_frame{};
     u32 m_frame_counter{};

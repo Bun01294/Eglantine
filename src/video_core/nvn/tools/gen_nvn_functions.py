@@ -34,6 +34,8 @@ OVERRIDES = {
     "nvnTextureBuilderGetMemoryPool": ("NVNmemoryPool*", "const NVNtextureBuilder*"),
     # non-const this in the header
     "nvnMultisampleStateGetRasterSamples": ("int", "const NVNmultisampleState*"),
+    # returns the callback's void* user data, not void
+    "nvnCommandBufferGetMemoryCallbackData": ("void*", "const NVNcommandBuffer*"),
 }
 
 

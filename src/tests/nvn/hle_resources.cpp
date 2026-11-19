@@ -889,7 +889,11 @@ TEST_CASE("nvn hle sync: the window's acquire sync is signalled without a fence"
 }
 
 TEST_CASE("nvn hle sync: a pending fence times out or is released by the completion", "[nvn]") {
+    WaitProbe probe;
+    // An infinite wait that is never released fails the test instead of hanging it.
+    probe.infinite_limit = std::chrono::seconds{20};
     Rig rig;
+    probe.Install(rig);
     InitQueueAndPool(rig);
     REQUIRE(rig.Call("nvnSyncInitialize", {Rig::I(SYNC), Rig::I(0xDE)}) == 1);
     const u64 seq = FenceSync(rig);
@@ -907,9 +911,11 @@ TEST_CASE("nvn hle sync: a pending fence times out or is released by the complet
         }};
         return std::make_pair(std::move(waiter), result);
     };
+    // The finite expiry above counted one wait.
+    const u32 waits_before = probe.waiting.load();
     {
         auto [waiter, result] = wait_in_thread(60'000'000'000ull);
-        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        CHECK(probe.AwaitWaiting(waits_before + 1));
         CHECK(result->load() == ~0ull);
         rig.sink.Complete(seq);
         waiter.join();
@@ -920,7 +926,8 @@ TEST_CASE("nvn hle sync: a pending fence times out or is released by the complet
     const u64 second = FenceSync(rig);
     {
         auto [waiter, result] = wait_in_thread(INFINITE_TIMEOUT);
-        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        CHECK(probe.AwaitWaiting(waits_before + 2));
+        CHECK(probe.saw_infinite.load());
         CHECK(result->load() == ~0ull);
         rig.sink.Complete(second);
         waiter.join();

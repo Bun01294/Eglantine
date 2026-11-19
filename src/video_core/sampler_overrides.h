@@ -42,7 +42,12 @@ struct Config {
                                 : ForcedFilter::Linear;
         }
         if (const char* aniso = std::getenv("EDEN_NX2_FORCE_ANISO"); aniso != nullptr) {
-            result.anisotropy = static_cast<u32>(std::clamp(std::atoi(aniso), 0, 16));
+            // Invalid or non-positive values leave the override off.
+            char* end = nullptr;
+            const long value = std::strtol(aniso, &end, 10);
+            if (end != aniso && *end == '\0' && value > 0) {
+                result.anisotropy = static_cast<u32>(std::min(value, 16L));
+            }
         }
         result.diagnostics = std::getenv("EDEN_NX2_SAMPLER_DIAGNOSTICS") != nullptr;
         return result;
@@ -82,10 +87,11 @@ inline bool ApplyFilters(VkFilter& mag, VkFilter& min, VkSamplerMipmapMode& mip,
     return forced;
 }
 
-/// `EDEN_NX2_FORCE_FILTER`: the guest's LOD clamp is dropped for every forced sampler (tests whether
-/// it is what leaves minified art on mip 0). Returns whether the range was replaced.
+/// `EDEN_NX2_FORCE_FILTER=linear`: the guest's LOD clamp is dropped for every forced sampler (tests
+/// whether it is what leaves minified art on mip 0); point mode keeps it. Returns whether the range
+/// was replaced.
 inline bool ApplyLod(f32& min_lod, f32& max_lod) {
-    if (Get().filter == ForcedFilter::None) {
+    if (Get().filter != ForcedFilter::Linear) {
         return false;
     }
     min_lod = 0.0f;

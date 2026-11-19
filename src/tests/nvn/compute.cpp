@@ -139,9 +139,10 @@ std::unique_ptr<Translated> Translate(ComputeEnvironment& env) {
 std::vector<u32> Emit(Translated& translated) {
     static const bool logging = [] {
         // A failed recompiler assertion aborts: keep its message.
-        std::filesystem::create_directories("C:/eg/results/nvn/work/eden-log");
-        Common::FS::SetEdenPath(Common::FS::EdenPath::LogDir,
-                                std::filesystem::path{"C:/eg/results/nvn/work/eden-log"});
+        const std::filesystem::path log_dir =
+            std::filesystem::temp_directory_path() / "eden-nvn-compute-test-log";
+        std::filesystem::create_directories(log_dir);
+        Common::FS::SetEdenPath(Common::FS::EdenPath::LogDir, log_dir);
         Common::Log::Initialize();
         Common::Log::SetGlobalFilter(Common::Log::Filter{Common::Log::Level::Error});
         Common::Log::SetColorConsoleBackendEnabled(true);

@@ -17,7 +17,8 @@
 /// Runtime diagnostic requests for the Switch 2 paths (legacy GPU emulation and NVN HLE).
 ///
 /// A tool (eden-mcp `request`, ab_runner `requests`, or a human) writes one command per line into
-/// `<user dir>/nx2-request.txt`. `Poll` is called from both present paths; at most every 250 ms it
+/// `<user dir>/nx2-request.txt`. `Poll` is called only from the NVN present path (the legacy GPU
+/// present path does not poll); at most every 250 ms it
 /// looks for that file, takes it (rename to `nx2-request.txt.taken`, then delete), logs
 /// `[diag] request: <command>` for each line and runs the registered handler. Handlers run on the
 /// polling (present) thread and must only arm a bounded one-shot capture or do a small dump; the

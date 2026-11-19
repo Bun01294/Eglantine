@@ -468,7 +468,7 @@ NVN_SIGNATURE(488, nvnCommandBufferInsertDebugMarkerStatic, "void", "NVNcommandB
 NVN_SIGNATURE(489, nvnCommandBufferInsertDebugMarkerDynamic, "void", "NVNcommandBuffer*, uint32_t, const char*")
 NVN_SIGNATURE(490, nvnCommandBufferInsertDebugMarker, "void", "NVNcommandBuffer*, const char*")
 NVN_SIGNATURE(491, nvnCommandBufferGetMemoryCallback, "PFNNVNCOMMANDBUFFERMEMORYCALLBACKPROC", "const NVNcommandBuffer*")
-NVN_SIGNATURE(492, nvnCommandBufferGetMemoryCallbackData, "void", "const NVNcommandBuffer*")
+NVN_SIGNATURE(492, nvnCommandBufferGetMemoryCallbackData, "void*", "const NVNcommandBuffer*")
 NVN_SIGNATURE(493, nvnCommandBufferIsRecording, "NVNboolean", "const NVNcommandBuffer*")
 NVN_SIGNATURE(494, nvnSyncInitialize, "NVNboolean", "NVNsync*, NVNdevice*")
 NVN_SIGNATURE(495, nvnSyncFinalize, "void", "NVNsync*")

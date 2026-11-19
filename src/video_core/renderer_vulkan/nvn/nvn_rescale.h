@@ -268,8 +268,9 @@ struct Rect {
 [[nodiscard]] constexpr Rect ScaleRect(const Factor& factor, const Rect& rect) noexcept {
     const s32 x0 = factor.ScaleStart(rect.x);
     const s32 y0 = factor.ScaleStart(rect.y);
-    const s32 x1 = factor.ScaleEnd(rect.x + static_cast<s32>(rect.width));
-    const s32 y1 = factor.ScaleEnd(rect.y + static_cast<s32>(rect.height));
+    // An empty axis stays empty (rounding its end up would give it a pixel).
+    const s32 x1 = rect.width == 0 ? x0 : factor.ScaleEnd(rect.x + static_cast<s32>(rect.width));
+    const s32 y1 = rect.height == 0 ? y0 : factor.ScaleEnd(rect.y + static_cast<s32>(rect.height));
     return {x0, y0, static_cast<u32>((std::max)(x1 - x0, 0)),
             static_cast<u32>((std::max)(y1 - y0, 0))};
 }
@@ -279,7 +280,10 @@ struct Rect {
     const float scale = factor.UpFactor();
     viewport.x = ScaleViewportValue(viewport.x, scale);
     viewport.y = ScaleViewportValue(viewport.y, scale);
-    viewport.width = ScaleViewportValue(viewport.width, scale);
+    if (viewport.width > 0.0f) {
+        // Vulkan needs a positive width: a downscale must not round it to zero.
+        viewport.width = (std::max)(ScaleViewportValue(viewport.width, scale), 1.0f);
+    }
     viewport.height = ScaleViewportValue(viewport.height, scale);
     return viewport;
 }

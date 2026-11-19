@@ -462,8 +462,8 @@ TEST_CASE("nvn queue sync: a blocked stream blocks only its own queue", "[nvn]")
         REQUIRE(scheduler.Released() == 0);
         REQUIRE(world.log == std::vector<int>{1, 4});
 
-        // Without release_old nothing moves however late it is.
-        scheduler.Pump(false, T0 + TIMEOUT * 10);
+        // Without release_old nothing moves, at the same expired time that releases it below.
+        scheduler.Pump(false, T0 + TIMEOUT + std::chrono::milliseconds(1));
         REQUIRE(scheduler.Released() == 0);
         REQUIRE(world.log == std::vector<int>{1, 4});
 

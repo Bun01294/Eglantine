@@ -58,11 +58,20 @@ struct BindRig {
         REQUIRE(rig.recorder.TextureInitialize(va, desc, POOL, offset));
     }
 
-    /// Ends the recording and submits it; returns the submitted (expanded) list.
-    const std::vector<u64>& Submit() {
-        const u64 handle = rig.recorder.EndRecording(CMD);
+    /// Ends the recording; returns the command handle for Submit.
+    u64 End() {
+        return rig.recorder.EndRecording(CMD);
+    }
+
+    /// Submits an ended recording; returns the submitted (expanded) list.
+    const std::vector<u64>& Submit(u64 handle) {
         REQUIRE(rig.recorder.QueueSubmitCommands(QUEUE, std::array{handle}) != 0);
         return rig.sink.submissions.back().lists.at(0);
+    }
+
+    /// Ends the recording and submits it; returns the submitted (expanded) list.
+    const std::vector<u64>& Submit() {
+        return Submit(End());
     }
 
     Rig rig;
@@ -223,9 +232,10 @@ TEST_CASE("nvn hle bind: uniform and storage buffers, immediate and deferred", "
                {I(BindRig::CMD), I(STAGE_VERTEX), I(5), I(1), I(SCRATCH + 0x100)});
     f.rig.Call("nvnCommandBufferBindStorageBuffersDeferred",
                {I(BindRig::CMD), I(STAGE_VERTEX), I(6), I(1), I(SCRATCH + 0x100)});
+    const u64 handle = f.End();
     f.rig.memory.Put(SCRATCH + 0x100, std::array<u64, 2>{Rig::STORAGE + 0x50, 5});
 
-    const std::vector<u64>& list = f.Submit();
+    const std::vector<u64>& list = f.Submit(handle);
     const auto uniforms = Find(list, Op::BindUniformBuffers);
     REQUIRE(uniforms.size() == 3);
     const auto* ubo = RecordPayload<BindBuffersPayload>(uniforms[0]);
@@ -330,10 +340,11 @@ TEST_CASE("nvn hle bind: texture handle arrays, counts and deferred reads", "[nv
                {I(BindRig::CMD), I(STAGE_FRAGMENT), I(10), I(1), I(SCRATCH + 0x100)});
     f.rig.Call("nvnCommandBufferBindSeparateSamplersDeferred",
                {I(BindRig::CMD), I(STAGE_FRAGMENT), I(11), I(1), I(SCRATCH + 0x108)});
+    const u64 handle = f.End();
     f.rig.memory.Put(SCRATCH + 0x100, std::array<u64, 2>{0x33, 0x44ULL << 20});
 
     const RecorderStats stats = f.rig.recorder.Stats();
-    const std::vector<u64>& list = f.Submit();
+    const std::vector<u64>& list = f.Submit(handle);
     CHECK(stats.bad_argument >= 1);
 
     const auto textures = Find(list, Op::BindTextures);
@@ -746,6 +757,9 @@ TEST_CASE("nvn hle bind: accepted-and-ignored switches record nothing", "[nvn]")
 
     const std::vector<u64>& list = f.Submit();
     CHECK(RecordCount(list) == 1); // only the depth clamp
+    const auto clamps = Find(list, Op::SetDepthClamp);
+    REQUIRE(clamps.size() == 1);
+    CHECK(RecordPayload<EnablePayload>(clamps[0])->enable == 1);
 }
 
 TEST_CASE("nvn hle bind: binds outside a recording are counted and dropped", "[nvn]") {

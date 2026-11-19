@@ -31,8 +31,8 @@ struct DynsymHit {
     u64 size{};
 };
 
-/// Finds the defined dynsym entries whose name satisfies `wanted`. Uses Core::Symbols::GetSymbols
-/// after the bounded probe above has accepted the image.
+/// Finds the defined dynsym entries whose name satisfies `wanted`. Walks the table the bounded
+/// probe above located, checking every symbol and name read against the image size.
 [[nodiscard]] std::vector<DynsymHit> FindDynsymHits(std::span<const u8> image,
                                                     bool (*wanted)(std::string_view));
 

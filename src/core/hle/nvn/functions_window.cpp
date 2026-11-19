@@ -502,7 +502,9 @@ bool AcquireTexture(Call& c, u64 window, u64 index_out) {
         if (slot != -1) {
             break;
         }
-        // Sleep until a completion frees a slot, or until the display releases one.
+        // Sleep until a completion frees a slot, or until the display releases one. An indefinite
+        // wait also ends when a display deadline appears (nothing notifies at that time), so the
+        // loop rearms with that deadline.
         u64 next_wait_ns = ~u64{0};
         bool ready;
         {
@@ -510,12 +512,15 @@ bool AcquireTexture(Call& c, u64 window, u64 index_out) {
                 [&] {
                     next_wait_ns = ~u64{0};
                     slot = TryAcquireSlot(c, window, &next_wait_ns);
-                    return slot != -1;
+                    return slot != -1 || (wait_ns == ~u64{0} && next_wait_ns != ~u64{0});
                 },
                 wait_ns == ~u64{0} ? std::chrono::nanoseconds{-1}
                                    : std::chrono::nanoseconds{static_cast<s64>(wait_ns)});
         }
         if (ready) {
+            if (slot == -1) {
+                continue; // a display deadline appeared: wait for it
+            }
             break;
         }
         if (wait_ns == ~u64{0}) {
@@ -525,7 +530,14 @@ bool AcquireTexture(Call& c, u64 window, u64 index_out) {
     if (slot < 0) {
         return false;
     }
-    c.Store<s32>(index_out, slot);
+    if (!c.Store<s32>(index_out, slot)) {
+        // The game never learns the index: hand the slot back instead of leaking it.
+        std::scoped_lock lock{c.runtime.window_mutex};
+        if (const auto it = c.runtime.windows.find(window); it != c.runtime.windows.end()) {
+            it->second.acquired_mask &= ~(1u << slot);
+        }
+        return false;
+    }
     return true;
 }
 

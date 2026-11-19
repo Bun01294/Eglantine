@@ -17,6 +17,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "common/literals.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "video_core/nvn/guest_memory.h"
 #include "video_core/nvn/record.h"
@@ -750,7 +751,8 @@ TEST_CASE("NVN indirect: a counter batch longer than one resolve dispatch keeps 
     CounterFlight flight;
     Vulkan::Nvn::CounterBatch batch;
     rig.Immediate([&](Vulkan::vk::CommandBuffer cmd) {
-        cmd.FillBuffer(*result, 0, ACCUMULATOR + 8, 0xCDCDCDCDu);
+        // Zero: an untouched slot fails the `value > 0` check of non-precise devices.
+        cmd.FillBuffer(*result, 0, ACCUMULATOR + 8, 0);
         engine.ResetAccumulator(cmd, QUEUE);
         rig.BeginPass(cmd);
         for (u32 i = 0; i < DRAWS; ++i) {
@@ -897,6 +899,13 @@ TEST_CASE("NVN indirect: counter and value reports reach the guest, on both pool
         constexpr u64 FAKE_TICKS = 0x1234'0000;
         std::atomic<u64> next_tick{FAKE_TICKS};
         VC::SetLegacyTickSource([&] { return next_tick.fetch_add(1); });
+        // Restored even when an assertion aborts, after the Context below stopped.
+        SCOPE_EXIT {
+            VC::SetTimestampModeOverride(std::nullopt);
+            VC::SetLegacyTickSource({});
+            VC::SetGuestClockSource({});
+            Settings::SetCurrentProgramIsSwitch2(false);
+        };
         constexpr u64 POOL_VA = 0x1000'0000;
         FakeMemory memory;
         u8* data = memory.Add(POOL_VA, 64_KiB);
@@ -962,10 +971,12 @@ TEST_CASE("NVN indirect: counter and value reports reach the guest, on both pool
         CHECK(stats.counter_reports_unsupported == 1);
         CHECK(stats.counter_reports_value == 1);
         CHECK(stats.ops_failed == 0);
-        VC::SetTimestampModeOverride(std::nullopt);
-        VC::SetLegacyTickSource({});
-        VC::SetGuestClockSource({});
-        Settings::SetCurrentProgramIsSwitch2(false);
+        // The pool path that ran: the import is only covered when the device took it.
+        if (!import) {
+            CHECK(stats.pools_imported == 0);
+        } else if (stats.pools_imported == 0) {
+            WARN("host import unavailable: the reports ran on the mirror path only");
+        }
         } // real
     }     // import
 }
@@ -1257,7 +1268,7 @@ TEST_CASE("NVN indirect: indirect draws that cannot run are counted, not dropped
     draw.instance_count = 1;
     draw.max_draws = 1;
     draw.indirect = CLEAR_BUFFER_POOL_VA;
-    draw.mode = 7; // QUADS: needs indices built from the GPU-written count
+    draw.mode = 2; // LINE_LOOP: needs indices built from the GPU-written count
     Push(list, VC::Op::Draw, draw);
     draw.mode = 4;
     draw.indirect = 0x9000'0000; // not in any pool
@@ -1271,7 +1282,7 @@ TEST_CASE("NVN indirect: indirect draws that cannot run are counted, not dropped
     context.Submit(MakeSubmission(1, 0, std::move(list)));
     REQUIRE(context.Wait(1, 20s));
     const Vulkan::Nvn::ContextStats stats = context.Stats();
-    CHECK(stats.indirect_unsupported == 2); // QUADS and the odd stride
+    CHECK(stats.indirect_unsupported == 2); // LINE_LOOP and the odd stride
     CHECK(stats.indirect_draws == 0);
     CHECK(stats.ops_failed >= 1); // the address outside every pool
 }
@@ -1288,8 +1299,16 @@ TEST_CASE("NVN indirect: a timestamp report inside an open render pass is writte
         memory.Add(CLEAR_TEXTURE_POOL_VA, 1_MiB);
         u8* buffers = memory.Add(CLEAR_BUFFER_POOL_VA, 1_MiB);
         std::memset(buffers, 0xAB, 1_MiB);
+        // The overrides set below are restored even when an assertion aborts, after the Context
+        // stopped.
+        SCOPE_EXIT {
+            VC::SetTimestampModeOverride(std::nullopt);
+            VC::SetGuestClockSource({});
+            Settings::SetCurrentProgramIsSwitch2(false);
+        };
+        // No early submission: a piece would end the pass the reports must land in.
         Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr,
-                                     {.allow_host_import = import});
+                                     {.allow_host_import = import, .early_submit = false});
         context.SetGuestMemory(&memory);
         context.CreatePool({.serial = 1, .guest_address = CLEAR_TEXTURE_POOL_VA, .size = 1_MiB,
                             .flags = 1});
@@ -1344,6 +1363,13 @@ TEST_CASE("NVN indirect: a timestamp report inside an open render pass is writte
             previous = time;
         }
         CHECK(Pixel(buffers, 0, 255, 0));
-        CHECK(context.Stats().ops_failed == 0);
+        const Vulkan::Nvn::ContextStats stats = context.Stats();
+        CHECK(stats.ops_failed == 0);
+        // The pool path that ran: the import is only covered when the device took it.
+        if (!import) {
+            CHECK(stats.pools_imported == 0);
+        } else if (stats.pools_imported == 0) {
+            WARN("host import unavailable: the reports ran on the mirror path only");
+        }
     }
 }

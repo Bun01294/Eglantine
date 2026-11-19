@@ -894,6 +894,10 @@ const VC::EvaluateDlssPayload* Evaluation(const std::vector<u64>& list, size_t n
     VC::RecordReader reader{list.data(), list.size()};
     while (const VC::RecordHeader* header = reader.Next()) {
         if (VC::RecordOp(header) == VC::Op::EvaluateDlss && nth-- == 0) {
+            // A record too short for the payload is not an evaluation.
+            if (VC::RecordPayloadSize(header) < sizeof(VC::EvaluateDlssPayload)) {
+                return nullptr;
+            }
             return VC::RecordPayload<VC::EvaluateDlssPayload>(header);
         }
     }
@@ -1061,12 +1065,15 @@ TEST_CASE("nvn hle dlss parameters: every setter writes its own field", "[nvn][d
     f.ChangesOnly("nvnDlssParametersSetMotionVectors",
                   {Rig::I(PARAMS), Rig::I(TEX_MOTION), Rig::I(VIEW)}, POffMotion, POffMotion + 16);
     CHECK(f.memory.Get<u64>(PARAMS + POffMotion) == TEX_MOTION);
+    CHECK(f.memory.Get<u64>(PARAMS + POffMotion + 8) == VIEW);
     f.ChangesOnly("nvnDlssParametersSetDepth", {Rig::I(PARAMS), Rig::I(TEX_DEPTH), Rig::I(VIEW)},
                   POffDepth, POffDepth + 16);
     CHECK(f.memory.Get<u64>(PARAMS + POffDepth) == TEX_DEPTH);
+    CHECK(f.memory.Get<u64>(PARAMS + POffDepth + 8) == VIEW);
     f.ChangesOnly("nvnDlssParametersSetBiasCurrentColorMask",
                   {Rig::I(PARAMS), Rig::I(TEX_BIAS), Rig::I(VIEW)}, POffBias, POffBias + 16);
     CHECK(f.memory.Get<u64>(PARAMS + POffBias) == TEX_BIAS);
+    CHECK(f.memory.Get<u64>(PARAMS + POffBias + 8) == VIEW);
     f.ChangesOnly("nvnDlssParametersSetExposureTexture",
                   {Rig::I(PARAMS), Rig::I(TEX_EXPOSURE), Rig::I(VIEW)}, POffExposure,
                   POffExposure + 16);

@@ -157,7 +157,7 @@ void nvnCommandBufferSetViewportSwizzles(Call& c) {
     const s32 first = c.args.NextS32();
     const s32 count = c.args.NextS32();
     const u64 values = c.args.NextPointer();
-    if (first < 0 || count < 0 || first + count > MaxViewports) {
+    if (first < 0 || count < 0 || count > MaxViewports - first) {
         NVN_LOG_ONCE(LOG_WARNING, "[nvn] SetViewportSwizzles first={} count={} out of range", first,
                      count);
         return;

@@ -804,7 +804,7 @@ TEST_CASE("NVN containers: ScanFile and ScanRoot", "[nvn]") {
     SECTION("ScanFile labels and reads whole files") {
         ScanOutput one;
         REQUIRE(ScanFile(root / "romfs/Shader/a.bfsha.zs", "label.zs", one));
-        CHECK(one.shaders.size() == 1);
+        REQUIRE(one.shaders.size() == 1);
         CHECK(one.shaders[0].source.find("label.zs#BNSH@") == 0);
 
         ScanOutput missing;
@@ -818,7 +818,8 @@ TEST_CASE("NVN containers: ScanFile and ScanRoot", "[nvn]") {
         ScanOutput none;
         ScanRoot(root / "nowhere", none);
         CHECK(none.shaders.empty());
-        CHECK(none.failures.size() <= 1);
+        REQUIRE(none.failures.size() == 1);
+        CHECK(none.failures[0].reason.rfind("container:directory-walk", 0) == 0);
     }
 }
 

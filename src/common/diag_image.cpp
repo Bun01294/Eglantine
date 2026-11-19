@@ -36,6 +36,7 @@ bool WritePng(const std::filesystem::path& path, u32 width, u32 height, std::spa
     }
     std::ofstream out{path, std::ios::binary | std::ios::trunc};
     out.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+    out.close();
     if (!out) {
         LOG_ERROR(Core, "[diag] cannot write {}", path.string());
         return false;
@@ -46,6 +47,7 @@ bool WritePng(const std::filesystem::path& path, u32 width, u32 height, std::spa
 bool WriteTextFile(const std::filesystem::path& path, std::string_view text) {
     std::ofstream out{path, std::ios::binary | std::ios::trunc};
     out.write(text.data(), static_cast<std::streamsize>(text.size()));
+    out.close();
     if (!out) {
         LOG_ERROR(Core, "[diag] cannot write {}", path.string());
         return false;

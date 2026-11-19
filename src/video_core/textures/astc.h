@@ -17,8 +17,10 @@ void Decompress(std::span<const uint8_t> data, uint32_t width, uint32_t height, 
 /// True if no 16-byte block in `data` decodes to alpha below 1.
 bool IsOpaque(std::span<const uint8_t> data);
 
-/// What the blocks of an ASTC texture decode to (ClassifyChannels). Bit 1: some texel has
-/// R, G and B unequal; bit 0: some texel has alpha below 1.
+/// What the blocks of an ASTC texture may decode to (ClassifyChannels). The bits are conservative:
+/// a set bit means a stand-in must preserve that channel, not that a decoded texel necessarily
+/// uses it. Bit 1: some texel may have R, G and B unequal; bit 0: some texel may have alpha below
+/// 1 (set from the endpoint mode alone, e.g. for mode 4 even when both endpoints are opaque).
 enum class Channels : uint8_t {
     Luminance = 0,      ///< R = G = B and alpha 1 everywhere: luminance endpoints only
     LuminanceAlpha = 1, ///< R = G = B everywhere: luminance and luminance+alpha endpoints

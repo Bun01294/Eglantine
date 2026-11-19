@@ -204,7 +204,8 @@ struct Pointer {
 [[nodiscard]] std::vector<u8> Blob(const Capture& capture);
 
 /// Writes `<seq>-<code key>-p<present>-o<ordinal>.json` and `.bin` into the path's directory
-/// (created on the first write) and logs one line. Thread safe. Returns the JSON path.
+/// (created on the first write) and logs one line. Thread safe. Returns the JSON path, or an empty
+/// path (with the error logged) when either file could not be written.
 std::filesystem::path Write(const Capture& capture);
 
 /// The directory of a path's captures (empty until the first Write).

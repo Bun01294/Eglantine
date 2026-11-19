@@ -532,8 +532,10 @@ void Profiler::Complete(Flight& flight) {
                     // The queue is in order: the gap to the previous command buffer is time the
                     // GPU had nothing to run (or waited on a semaphore).
                     const u64 first = begin[0] & mask;
-                    if (have_segment_end && first > last_segment_end) {
-                        const double gap = static_cast<double>(first - last_segment_end) * period_ns;
+                    // Masked: the counter may wrap; a "gap" past half its range is overlap.
+                    const u64 delta = (first - last_segment_end) & mask;
+                    if (have_segment_end && delta != 0 && delta <= (mask >> 1)) {
+                        const double gap = static_cast<double>(delta) * period_ns;
                         const bool frame_start = previous_was_present && first_segment;
                         AddIdle(window, gap, frame_start);
                         AddIdle(total, gap, frame_start);
@@ -569,11 +571,11 @@ void Profiler::Complete(Flight& flight) {
     }
     if (flight.is_present && !frame_flights.empty()) {
         // One frame: the command buffers since the previous present, this one's included.
-        double busy_ns = 0.0;
+        double busy_ns = frame_busy_carry_ns;
         for (const FlightLine& f : frame_flights) {
             busy_ns += f.busy_ns;
         }
-        const u64 first = frame_flights.front().first_begin;
+        const u64 first = have_frame_first ? frame_first_begin : frame_flights.front().first_begin;
         const u64 last = frame_flights.back().last_end;
         const double span_ns = static_cast<double>((last - first) & mask) * period_ns;
         for (Window* w : {&window, &total}) {
@@ -581,9 +583,21 @@ void Profiler::Complete(Flight& flight) {
             w->frame_span_ms.push_back(static_cast<float>(span_ns / 1e6));
         }
     }
-    if (flight.is_present || frame_flights.size() > 256) {
-        if (!quiet && flight.is_present && total.presents % 200 == 100) {
+    if (flight.is_present) {
+        if (!quiet && total.presents % 200 == 100) {
             ReportFrame();
+        }
+        frame_flights.clear();
+        frame_busy_carry_ns = 0.0;
+        have_frame_first = false;
+    } else if (frame_flights.size() > 256) {
+        // Only the detailed lines are dropped: the frame's totals carry over to its present.
+        if (!have_frame_first) {
+            frame_first_begin = frame_flights.front().first_begin;
+            have_frame_first = true;
+        }
+        for (const FlightLine& f : frame_flights) {
+            frame_busy_carry_ns += f.busy_ns;
         }
         frame_flights.clear();
     }

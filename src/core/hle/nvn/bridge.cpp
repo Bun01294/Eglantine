@@ -123,7 +123,9 @@ bool WriteFileAtomically(const std::filesystem::path& path, const std::string& t
             return false;
         }
         out.write(text.data(), static_cast<std::streamsize>(text.size()));
+        out.close();
         if (!out) {
+            std::filesystem::remove(temporary, ec);
             return false;
         }
     }
@@ -133,6 +135,7 @@ bool WriteFileAtomically(const std::filesystem::path& path, const std::string& t
         std::filesystem::remove(temporary, ec);
         std::ofstream out{path, std::ios::binary | std::ios::trunc};
         out.write(text.data(), static_cast<std::streamsize>(text.size()));
+        out.close();
         return static_cast<bool>(out);
     }
     return true;
@@ -745,8 +748,10 @@ u64 Bridge::ResolveHleProc(const std::string& name) {
                  : hle_bodies[*id] != nullptr ? "HLE body"
                                               : "unimplemented stub (no HLE body)";
     }
+    // Bounded: a guest probing many distinct names must not grow the cache without limit.
+    constexpr size_t MaxProcLogged = 8192;
     std::scoped_lock lock{proc_log_mutex};
-    if (proc_logged.insert(name).second) {
+    if (proc_logged.size() < MaxProcLogged && proc_logged.insert(name).second) {
         LOG_INFO(Core, "[nvn] GetProcAddress {} -> {}", name, answer);
     }
     return address;
