@@ -31,7 +31,7 @@ constexpr int SideGap = 16;
 constexpr int TitleReserve = 44;
 constexpr int MinCenterSize = 160;
 /// How far each stacked card peeks past the card in front of it, as a share of the center card.
-constexpr qreal PeekFraction = 0.08;
+constexpr qreal PeekFraction = 0.12;
 /// Size falloff per step into the stack, so the strip reads as receding.
 constexpr qreal ScaleStep = 0.90;
 constexpr qreal MinScale = 0.40;
@@ -247,7 +247,7 @@ CarouselMetrics MetricsFor(const QSize& area) {
     m.card_w = cartridge ? m.card_h * GameCard::CartridgeAspect : m.card_h;
     // The card floats centered in the available height at every size.
     m.center = QPointF(area.width() / 2.0, SideGap + available / 2.0);
-    m.peek = std::clamp(m.card_w * PeekFraction, qreal(28), qreal(64));
+    m.peek = std::clamp(m.card_w * PeekFraction, qreal(40), qreal(96));
     return m;
 }
 

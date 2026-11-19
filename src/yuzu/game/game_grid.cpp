@@ -65,7 +65,7 @@ void GameGrid::UpdateIconSize() {
         cartridge ? u32(qRound(icon_size * GameCard::CartridgeAspect)) : icon_size;
 
     int heightMargin = 0;
-    int widthMargin = 80;
+    int widthMargin = 100;
 
     if (UISettings::values.show_game_name) {
         switch (icon_size) {
@@ -73,7 +73,7 @@ void GameGrid::UpdateIconSize() {
             heightMargin = 65;
             break;
         case 0:
-            widthMargin = 120;
+            widthMargin = 140;
             heightMargin = 120;
             break;
         case 64:
@@ -85,7 +85,7 @@ void GameGrid::UpdateIconSize() {
             break;
         }
     } else {
-        widthMargin = 24;
+        widthMargin = 40;
         heightMargin = 24;
     }
 
@@ -93,9 +93,9 @@ void GameGrid::UpdateIconSize() {
 
     const double spacing = 0.01;
     // The narrower cartridge frees most of the margin a square needed; keep a floor so the
-    // name text still has room and the cells read tight but not cramped.
+    // name text still has room and the cells read spaced without crowding.
     const int item_margin =
-        cartridge ? std::max(24, widthMargin - int(icon_size - item_width)) : widthMargin;
+        cartridge ? std::max(40, widthMargin - int(icon_size - item_width)) : widthMargin;
     const int min_item_width = int(item_width) + item_margin;
 
     int columns = std::max(1, (view_width - 16) / min_item_width);
