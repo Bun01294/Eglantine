@@ -16,13 +16,15 @@
 // Pulls the music streams out of a game the emulator can open from a NUP archive
 // or a loose folder dump. Works on the Alto-family audio layout used by modern
 // Nintendo titles: romfs/Sound/Resource/Stream/BGM_*.bwav are the songs, Dm_*
-// cutscene music and ExampleMelody_* reference performances, while other
-// prefixes in the same folder are voice, effects and ambience. Only the selected
-// kinds (Options::kinds) are decoded and written.
+// cutscene music (which can also hide behind the song prefix as BGM_Dm_*) and
+// ExampleMelody_* reference performances, while other prefixes in the same
+// folder are voice, effects and ambience. Only the selected kinds
+// (Options::kinds) are decoded and written.
 namespace FileSys::Music {
 
 enum class Layout {
-    // One subfolder per area or scene, taken from the stream's clean name.
+    // One folder per kind (Music, Cutscenes, Title, Segments, Stems), each
+    // holding a subfolder per area or scene taken from the stream's clean name.
     ByKind,
     // Every track directly in the output folder.
     Flat,
@@ -39,8 +41,9 @@ enum class Encoding {
 // What a stream is, picked from its name; drives the kind filter and the manifest.
 enum class Kind : u32 {
     Bgm,      // BGM_*: the songs.
-    Cutscene, // Dm_* short of the title performance.
-    Title,    // Dm_Title*: the title screen performance.
+    Cutscene, // Dm_* (also behind the song prefix as BGM_Dm_*): scene and demo
+              // music short of the title performance.
+    Title,    // Dm_Title* / BGM_Dm_Title*: the title screen performance.
     Segments, // Intros, loops, jingles, outros and A/B/C sections of a song.
     Stems,    // Close/far ambience, vocal or noise layers the game mixes live.
     Count,

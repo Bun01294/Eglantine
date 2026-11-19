@@ -13,6 +13,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -292,16 +293,50 @@ bool Collect(const std::string& game_path, RealVfsFilesystem& vfs, Collected& co
 }
 
 // ---------------------------------------------------------------------------------------------
-// Track classification
+// Track classification and clean names
 // -------------------------------------------------------------------------------------
+
+// A stream name split into its underscore tokens with the category markers
+// (BGM, Dm, ExampleMelody) peeled off the front. Demo music can hide behind the
+// song prefix - "BGM_Dm_*" belongs to the same cutscene family as the plain
+// "Dm_*" - so the peel keeps going past BGM.
+struct NameParts {
+    // Owned copies: the source string lives only inside ParseName, so views into
+    // it would dangle the moment the function returns.
+    std::vector<std::string> tokens;
+    bool demo{}; // a Dm marker was peeled off
+};
+
+NameParts ParseName(const std::string& entry_name) {
+    const std::string stem =
+        EndsWithCI(entry_name, ".bwav") ? entry_name.substr(0, entry_name.size() - 5) : entry_name;
+    NameParts parts;
+    std::size_t start = 0;
+    bool real = false; // a non-marker token has been seen
+    for (std::size_t i = 0; i <= stem.size(); ++i) {
+        if (i != stem.size() && stem[i] != '_') {
+            continue;
+        }
+        if (i > start) {
+            const std::string_view token = std::string_view{stem}.substr(start, i - start);
+            const std::string head = Lower(token);
+            if (real || (head != "bgm" && head != "dm" && head != "examplemelody")) {
+                real = true;
+                parts.tokens.emplace_back(token);
+            } else if (head == "dm") {
+                parts.demo = true;
+            }
+        }
+        start = i + 1;
+    }
+    return parts;
+}
 
 Kind KindOf(const std::string& name) {
     const std::string stem = EndsWithCI(name, ".bwav") ? name.substr(0, name.size() - 5) : name;
-    if (stem.starts_with("Dm_Title")) {
+    const NameParts parts = ParseName(name);
+    if (parts.demo && !parts.tokens.empty() && Lower(parts.tokens.front()) == "title") {
         return Kind::Title;
-    }
-    if (stem.starts_with("Dm_")) {
-        return Kind::Cutscene;
     }
     // Layers the game mixes live: close/far ambience, vocal or noise stems, final-lap variants.
     for (const std::string_view marker : {"_Close_", "_Far_", "_Noise", "_Pad", "_Vocal_", "_FL"}) {
@@ -322,8 +357,17 @@ Kind KindOf(const std::string& name) {
         stem[stem.size() - 2] == '_') {
         return Kind::Segments;
     }
+    if (parts.demo) {
+        return Kind::Cutscene;
+    }
     return Kind::Bgm;
 }
+
+// Folder spelling of each kind, in Kind order; matches the checkboxes in the
+// extraction dialog so the disk layout reads like the choices behind it.
+constexpr std::array<std::string_view, KindCount> KindFolders{
+    "Music", "Cutscenes", "Title", "Segments", "Stems",
+};
 
 // ---------------------------------------------------------------------------------------------
 // BWAV (NintendoWare wave), laid out as vgmstream reads it:
@@ -702,47 +746,43 @@ bool IsAllDigits(std::string_view value) {
 }
 
 // "BGM_XXX_YYY_0005" becomes folder "XXX" and title "YYY": the category markers
-// (BGM, Dm, ExampleMelody) are dropped, a single trailing numeric token goes away,
-// the remaining tokens join with spaces, and a lone token lands directly in the
-// output folder.
-std::pair<std::string, std::string> CleanNameFor(const std::string& entry_name) {
-    const std::string stem = EndsWithCI(entry_name, ".bwav")
-                                 ? entry_name.substr(0, entry_name.size() - 5)
-                                 : entry_name;
-    std::vector<std::string_view> tokens;
-    std::size_t start = 0;
-    for (std::size_t i = 0; i <= stem.size(); ++i) {
-        if (i == stem.size() || stem[i] == '_') {
-            if (i > start) {
-                tokens.push_back(std::string_view{stem}.substr(start, i - start));
-            }
-            start = i + 1;
-        }
-    }
-    while (!tokens.empty()) {
-        const auto head = Lower(tokens.front());
-        if (head != "bgm" && head != "dm" && head != "examplemelody") {
-            break;
-        }
-        tokens.erase(tokens.begin());
-    }
+// are dropped by ParseName, a single trailing numeric token is peeled off as the
+// cue id, the remaining tokens join with spaces, and a lone token lands directly
+// in the kind folder.
+struct CleanName {
+    std::string folder;
+    std::string title;
+    // The cue id peeled off the title. It folds back in when another stream
+    // cleans to the same name, so "Scene 0001" and "Scene 0002" keep their own
+    // identities instead of becoming "Scene 1" and "Scene 2".
+    std::string cue;
+};
+
+CleanName CleanNameFor(const std::string& entry_name) {
+    std::vector<std::string> tokens = ParseName(entry_name).tokens;
+    CleanName clean;
     if (tokens.size() >= 2 && IsAllDigits(tokens.back())) {
+        clean.cue = tokens.back();
         tokens.pop_back();
     }
     if (tokens.empty()) {
-        return {"", stem};
+        clean.title = EndsWithCI(entry_name, ".bwav")
+                          ? entry_name.substr(0, entry_name.size() - 5)
+                          : entry_name;
+        return clean;
     }
     if (tokens.size() == 1) {
-        return {"", std::string{tokens[0]}};
+        clean.title = tokens[0];
+        return clean;
     }
-    std::string title;
+    clean.folder = tokens[0];
     for (std::size_t i = 1; i < tokens.size(); ++i) {
-        if (!title.empty()) {
-            title += ' ';
+        if (!clean.title.empty()) {
+            clean.title += ' ';
         }
-        title += tokens[i];
+        clean.title += tokens[i];
     }
-    return {std::string{tokens[0]}, title};
+    return clean;
 }
 
 // What gets embedded into every written track.
@@ -1405,39 +1445,61 @@ Result ExtractMusic(const std::string& game_path, const Options& options,
         state.bytes_total += entry.file != nullptr ? entry.file->GetSize() : 0;
     }
 
-    // Output naming: clean titles, a folder from the first remaining token, and
-    // 1, 2, 3... when several streams end up with the same name.
+    // Output naming: a kind folder first (Music, Cutscenes, Title, Segments,
+    // Stems), an area subfolder from the first remaining token, and the stream's
+    // cue id in place of a counter when several streams clean to the same name.
     struct OutputPlan {
         std::string folder;
         std::string title;
         std::string file_name;
     };
+    struct CleanPlan {
+        std::string folder;
+        std::string title;
+        std::string cue;
+    };
     const std::string_view extension = ExtensionOf(options.encoding);
     std::map<std::pair<std::string, std::string>, u32> name_groups;
-    std::vector<std::pair<std::string, std::string>> clean_names;
-    clean_names.reserve(collected.entries.size());
+    std::vector<CleanPlan> cleans;
+    cleans.reserve(collected.entries.size());
     for (const auto& entry : collected.entries) {
-        auto clean = CleanNameFor(entry.name);
-        if (options.layout == Layout::Flat) {
-            // Flat mode ignores the folder, so collisions are counted by title alone.
-            clean.first.clear();
+        const CleanName clean = CleanNameFor(entry.name);
+        CleanPlan out;
+        if (options.layout == Layout::ByKind) {
+            out.folder = std::string{KindFolders[static_cast<std::size_t>(KindOf(entry.name))]};
+            if (!clean.folder.empty()) {
+                out.folder += '/';
+                out.folder += clean.folder;
+            }
         }
-        clean_names.emplace_back(clean.first, clean.second);
-        ++name_groups[{clean.first, clean.second}];
+        out.title = std::move(clean.title);
+        out.cue = std::move(clean.cue);
+        ++name_groups[{out.folder, out.title}];
+        cleans.push_back(std::move(out));
     }
     std::map<std::pair<std::string, std::string>, u32> name_seen;
+    std::set<std::pair<std::string, std::string>> used_names;
     std::vector<OutputPlan> plans;
-    plans.reserve(clean_names.size());
-    for (const auto& [folder, title] : clean_names) {
-        const auto key = std::make_pair(folder, title);
+    plans.reserve(cleans.size());
+    for (const auto& [folder, title, cue] : cleans) {
         OutputPlan plan;
         plan.folder = folder;
-        plan.title = title;
-        if (name_groups[key] > 1) {
-            plan.file_name = fmt::format("{} {}{}", title, ++name_seen[key], extension);
-        } else {
-            plan.file_name = fmt::format("{}{}", title, extension);
+        std::string display = title;
+        if (name_groups[{folder, title}] > 1) {
+            // Collisions fold the stream's own cue id back in when it has one;
+            // a plain counter only when nothing distinguishes the names.
+            display = cue.empty() ? fmt::format("{} {}", title, ++name_seen[{folder, title}])
+                                  : fmt::format("{} {}", title, cue);
         }
+        // Differently-marked streams can still clean to the same display name in
+        // Flat mode; number whatever is left.
+        const std::string base = display;
+        u32 extra = 1;
+        while (!used_names.emplace(folder, display).second) {
+            display = fmt::format("{} {}", base, ++extra);
+        }
+        plan.title = display;
+        plan.file_name = fmt::format("{}{}", display, extension);
         plans.push_back(std::move(plan));
     }
 

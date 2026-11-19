@@ -55,7 +55,7 @@ struct KindChoice {
 };
 constexpr std::array<KindChoice, FileSys::Music::KindCount> KindRows{{
     {"Music", "The BGM_ songs played during normal play."},
-    {"Cutscenes", "Dm_ cutscene music."},
+    {"Cutscenes", "Dm_ cutscene music, including the BGM_Dm_ variants."},
     {"Title", "The title screen performance (Dm_Title)."},
     {"Segments", "Intros, loops, jingles and other sequenced parts of a song."},
     {"Stems", "Close and far ambience, vocal and noise layers the game mixes live."},
@@ -122,8 +122,9 @@ MusicExtractDialog::MusicExtractDialog(const FileSys::Music::SourceInfo& info,
     auto* kinds_holder = new QWidget;
     kinds_holder->setLayout(kinds_grid);
 
-    layout_tree =
-        new QRadioButton(tr("Sort into subfolders (one per area, scene or category)"));
+    layout_tree = new QRadioButton(
+        tr("Sort into category folders (Music, Cutscenes, Title, Segments, Stems), "
+           "one subfolder per area or scene inside each"));
     layout_tree->setChecked(true);
     layout_flat = new QRadioButton(tr("Flat - every track directly in the output folder"));
 
