@@ -25,7 +25,7 @@ public:
     /// game art sits, in the frame's 232x324 coordinates.
     static constexpr qreal CartridgeAspect = 232.0 / 324.0;
     static constexpr QSizeF CartridgeBase{232.0, 324.0};
-    static constexpr QRectF CartridgeLabel{32.6, 35.4, 166.0, 234.0};
+    static constexpr QRectF CartridgeLabel{32.6, 39.5, 166.0, 234.0};
 
     /// The cartridge frame rendered `height_px` logical pixels tall. Rendering the SVG on every
     /// card paint would be far too slow to scroll, so heights are quantized to 32-pixel buckets
