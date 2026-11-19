@@ -126,6 +126,10 @@ void DrawContext::AppendBindingDump(std::string& text, const PipelineBase& pipe)
                 readable = true;
             } else {
                 read_guest();
+                if (host != nullptr) {
+                    impl.ApplyPendingInlineWrites(game.address, bytes.data(), bytes.size(),
+                                                  host->HostFlight().seq);
+                }
             }
             const bool inline_updates_pending = InlineUpdatePending(game.address, size);
             const bool copied = inline_updates_pending || snapshot == UniformSnapshotView::npos;

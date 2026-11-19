@@ -327,6 +327,9 @@ std::optional<VkDescriptorBufferInfo> DrawContext::SnapshotUniform(size_t index,
 
 void DrawContext::OnEventWaitPassed(u64 event_address) {
     impl.uniform_snapshots.OnEventWait(usnap, event_address);
+    if (host != nullptr) {
+        impl.InvalidatePendingInlineBytes(host->HostFlight().seq);
+    }
 }
 
 bool DrawContext::ReadSnapshotBytes(u64 address, void* out, u64 size) const {

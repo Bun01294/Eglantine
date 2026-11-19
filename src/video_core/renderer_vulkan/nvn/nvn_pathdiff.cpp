@@ -54,6 +54,9 @@ std::vector<u8> DrawContext::PathDiffUniformBytes(u64 address, u64 size) const {
     if (const u8* source = impl.GuestPointer(address, size)) {
         std::memcpy(bytes.data(), source, size);
     }
+    if (host != nullptr) {
+        impl.ApplyPendingInlineWrites(address, bytes.data(), size, host->HostFlight().seq);
+    }
     for (const InlineUpdate& update : inline_updates) {
         const u64 begin = (std::max)(update.address, address);
         const u64 end = (std::min)(update.address + update.size, address + size);

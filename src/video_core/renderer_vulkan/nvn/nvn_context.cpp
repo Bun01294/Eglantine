@@ -1212,7 +1212,19 @@ void Context::Impl::CompleteMain() {
             VC::GuestMemory* memory = guest.load(std::memory_order_acquire);
             for (const InFlight::Readback& readback : flight->readbacks) {
                 const u8* source = mapped.data() + readback.download_offset;
-                if (readback.pool->host) {
+                if (readback.row_count > 0 && readback.row_bytes > 0) {
+                    for (u32 row = 0; row < readback.row_count; ++row) {
+                        const u64 rel = static_cast<u64>(row) * readback.row_stride;
+                        const u64 len = (std::min)(readback.row_bytes, readback.size - rel);
+                        if (readback.pool->host) {
+                            std::memcpy(readback.pool->host + readback.pool_offset + rel,
+                                        source + rel, static_cast<size_t>(len));
+                        } else if (memory) {
+                            memory->Write(readback.pool->address + readback.pool_offset + rel,
+                                          source + rel, static_cast<size_t>(len));
+                        }
+                    }
+                } else if (readback.pool->host) {
                     std::memcpy(readback.pool->host + readback.pool_offset, source, readback.size);
                 } else if (memory) {
                     memory->Write(readback.pool->address + readback.pool_offset, source,
@@ -1323,6 +1335,12 @@ void Context::Impl::CompleteMain() {
         }
         flight->download.reset();
         flight->keepalive.clear();
+        {
+            const u64 current = gpu_completed_seq.load(std::memory_order_relaxed);
+            if (flight->seq > current) {
+                gpu_completed_seq.store(flight->seq, std::memory_order_release);
+            }
+        }
 
         {
             // Held while the callback runs: SetCompletionCallback({}) therefore waits for a running
@@ -2316,6 +2334,136 @@ void Context::CollectStats(std::vector<VideoCommon::Nvn::SinkStat>& out) const {
     out.push_back({"indirect_draw_unsupported", s.indirect_unsupported});
     out.push_back({"raw_global_pools_skipped", s.raw_global_pools_skipped});
     out.push_back({"raw_global_ranges_dropped", s.raw_global_ranges_dropped});
+}
+
+static void CollapsePendingPoolWrites(std::vector<Context::Impl::PendingPoolWrite>& writes) {
+    if (writes.size() < 4096) {
+        return;
+    }
+    std::vector<Context::Impl::PendingPoolWrite> collapsed;
+    for (const Context::Impl::PendingPoolWrite& write : writes) {
+        const auto it = std::ranges::find_if(
+            collapsed, [&](const auto& hull) { return hull.seq == write.seq; });
+        if (it == collapsed.end()) {
+            collapsed.push_back({write.begin, write.end, write.seq, {}});
+        } else {
+            it->begin = (std::min)(it->begin, write.begin);
+            it->end = (std::max)(it->end, write.end);
+        }
+    }
+    writes = std::move(collapsed);
+}
+
+void Context::Impl::PrunePendingPoolWrites() {
+    const u64 done = gpu_completed_seq.load(std::memory_order_acquire);
+    std::erase_if(pending_pool_writes,
+                  [done](const PendingPoolWrite& write) { return write.seq <= done; });
+}
+
+void Context::Impl::NoteFlushedInlinePoolWrite(u64 address, const u8* data, u64 size, u64 seq) {
+    if (size == 0 || data == nullptr) {
+        return;
+    }
+    PrunePendingPoolWrites();
+    const u64 end = address + size;
+    std::erase_if(pending_pool_writes, [address, end](const PendingPoolWrite& write) {
+        return write.begin >= address && write.end <= end;
+    });
+    CollapsePendingPoolWrites(pending_pool_writes);
+    pending_pool_writes.push_back(
+        {address, end, seq, std::vector<u8>(data, data + static_cast<size_t>(size))});
+}
+
+void Context::Impl::NoteNonInlinePoolWrite(u64 address, u64 size, u64 seq) {
+    if (size == 0 || noting_inline_pool_write) {
+        return;
+    }
+    PrunePendingPoolWrites();
+    const u64 end = address + size;
+    std::erase_if(pending_pool_writes, [address, end](const PendingPoolWrite& write) {
+        return write.begin >= address && write.end <= end;
+    });
+    for (PendingPoolWrite& write : pending_pool_writes) {
+        if (!write.inline_bytes.empty() && write.begin < end && address < write.end) {
+            write.inline_bytes.clear();
+        }
+    }
+    if (!pending_pool_writes.empty()) {
+        PendingPoolWrite& last = pending_pool_writes.back();
+        if (last.seq == seq && last.inline_bytes.empty() && address <= last.end &&
+            last.begin <= end) {
+            last.begin = (std::min)(last.begin, address);
+            last.end = (std::max)(last.end, end);
+            return;
+        }
+    }
+    CollapsePendingPoolWrites(pending_pool_writes);
+    pending_pool_writes.push_back({address, end, seq, {}});
+}
+
+void Context::Impl::InvalidatePendingInlineBytes(u64 seq) {
+    PrunePendingPoolWrites();
+    for (PendingPoolWrite& write : pending_pool_writes) {
+        if (seq == 0 || write.seq == seq) {
+            write.inline_bytes.clear();
+        }
+    }
+}
+
+void Context::Impl::InvalidatePendingInlineBytesOverlapping(u64 address, u64 size) {
+    if (size == 0 || pending_pool_writes.empty()) {
+        return;
+    }
+    PrunePendingPoolWrites();
+    const u64 end = address + size;
+    for (PendingPoolWrite& write : pending_pool_writes) {
+        if (!write.inline_bytes.empty() && write.begin < end && address < write.end) {
+            write.inline_bytes.clear();
+        }
+    }
+}
+
+void Context::Impl::ErasePendingPoolWritesForSeq(u64 seq) {
+    std::erase_if(pending_pool_writes,
+                  [seq](const PendingPoolWrite& write) { return write.seq == seq; });
+}
+
+bool Context::Impl::NeedsGpuFlushForUniform(u64 begin, u64 end, u64 current_seq) {
+    if (end <= begin || pending_pool_writes.empty()) {
+        return false;
+    }
+    PrunePendingPoolWrites();
+    for (const PendingPoolWrite& write : pending_pool_writes) {
+        if (write.begin < end && begin < write.end &&
+            (write.inline_bytes.empty() || write.seq != current_seq)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void Context::Impl::ApplyPendingInlineWrites(u64 base_address, u8* dst, u64 size,
+                                             u64 current_seq,
+                                             std::vector<std::pair<u64, u64>>* written) const {
+    if (size == 0 || dst == nullptr || pending_pool_writes.empty()) {
+        return;
+    }
+    const u64 end = base_address + size;
+    for (const PendingPoolWrite& write : pending_pool_writes) {
+        if (write.seq != current_seq || write.inline_bytes.empty()) {
+            continue;
+        }
+        const u64 lo = (std::max)(write.begin, base_address);
+        const u64 hi = (std::min)(write.end, end);
+        if (lo < hi) {
+            std::memcpy(dst + (lo - base_address),
+                        write.inline_bytes.data() + (lo - write.begin),
+                        static_cast<size_t>(hi - lo));
+            if (written != nullptr) {
+                written->emplace_back(lo - base_address, hi - base_address);
+            }
+        }
+    }
 }
 
 } // namespace Vulkan::Nvn

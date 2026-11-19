@@ -381,6 +381,9 @@ public:
     [[nodiscard]] bool HasShadows() const noexcept {
         return !shadows.empty();
     }
+    [[nodiscard]] bool HasInlineUpdates() const noexcept {
+        return !inline_updates.empty();
+    }
     /// UpdateUniformBuffer writes recorded but not copied yet (they land when the pass ends): true
     /// when one overlaps guest bytes [address, address + size).
     [[nodiscard]] bool InlineUpdatePending(u64 address, u64 size) const noexcept {
@@ -395,6 +398,7 @@ public:
     /// mirror when it holds the bytes (`ref` is pointed at it), else from guest memory after the
     /// shadows over the range went back (NoteExtraRead).
     void ResolveIndirectSource(BufferRef& ref, u64 size);
+    [[nodiscard]] bool HasOverlappingShadow(const Pool& pool, u64 begin, u64 end) const noexcept;
 
     /// Reads a u32 of a uniform buffer bound to `stage`/`slot` as the draw would see it (inline
     /// updates applied; from the submission's uniform snapshot when it holds the word).

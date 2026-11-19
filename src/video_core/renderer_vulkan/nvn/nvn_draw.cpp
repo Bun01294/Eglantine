@@ -1431,9 +1431,12 @@ void DrawContext::FlushInlineUpdates() {
             if (usnap.Active()) {
                 ++counters.uniform_snapshot_layers;
             }
-            impl.uniform_snapshots.NoteInlineWrite(update.address, update.data, update.size,
-                                                   host->HostFlight().seq);
+            const u64 seq = host->HostFlight().seq;
+            impl.NoteFlushedInlinePoolWrite(update.address, update.data, update.size, seq);
+            impl.uniform_snapshots.NoteInlineWrite(update.address, update.data, update.size, seq);
+            impl.noting_inline_pool_write = true;
             host->HostNotePoolWrite(*target.pool, target.pool_offset, update.size);
+            impl.noting_inline_pool_write = false;
             impl.uniform_snapshots.EndInlineWrite();
         }
     }
@@ -2462,6 +2465,10 @@ std::optional<u32> DrawContext::ReadUniformWord(u32 stage, u32 slot, u32 byte_of
     VC::GuestMemory* memory = impl.guest.load(std::memory_order_acquire);
     if (!memory || !memory->Read(address, &value, sizeof(value))) {
         return std::nullopt;
+    }
+    if (host != nullptr) {
+        impl.ApplyPendingInlineWrites(address, reinterpret_cast<u8*>(&value), sizeof(value),
+                                      host->HostFlight().seq);
     }
     return value;
 }

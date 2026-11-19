@@ -77,10 +77,19 @@ struct DrawPlan {
         /// to a 1x1x1 3D scratch (1) or to every face of a cube scratch (6).
         u32 retype_layers{0};
     };
+    /// GPU copies to arena uniform buffers for misaligned GPU-owned/DeviceLocal ranges.
+    struct UniformCopy {
+        VkBuffer src;
+        u64 src_offset;
+        VkBuffer dst;
+        u64 dst_offset;
+        u64 size;
+    };
     std::vector<ImageUse> images;
     std::vector<RangeUse> ranges;
     std::vector<ImageBinding> bindings;
     std::vector<FeedbackCopy> feedback;
+    std::vector<UniformCopy> uniform_copies;
     /// Allocated descriptor set (pipelines that cannot push), filled by PushPlan.
     VkDescriptorSet set{VK_NULL_HANDLE};
     /// The plan is for a graphics draw (false: a dispatch); only the fallback counters read it.
@@ -99,6 +108,8 @@ struct DrawPlan {
     bool raw_stores_written_through{false};
     /// The pipeline writes a bound storage image.
     bool image_writes{false};
+    /// An overlapping inline uniform update must flush to the GPU pool before the draw.
+    bool flush_inline{false};
     /// Resolution scaling: which texture and storage image descriptors (in the order of the
     /// pipeline's stages) the draw binds the scaled twin of (Rescale::Words).
     Rescale::Words rescale_words;
@@ -109,12 +120,14 @@ struct DrawPlan {
         ranges.clear();
         bindings.clear();
         feedback.clear();
+        uniform_copies.clear();
         set = VK_NULL_HANDLE;
         raw_global_writes = false;
         raw_stores_written_through = false;
         raw_global = false;
         shadow_candidates = false;
         image_writes = false;
+        flush_inline = false;
         rescale_words.Clear();
     }
     void UseImage(const std::shared_ptr<Storage>& storage, VkImageLayout layout,
