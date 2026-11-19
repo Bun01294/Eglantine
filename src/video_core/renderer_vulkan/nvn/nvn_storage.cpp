@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
 #include <unordered_set>
@@ -36,9 +37,26 @@ u32 Mip(u32 size, u32 level) {
 } // Anonymous namespace
 
 u64 Context::Impl::PollTick() {
+    // Idle ticks of one ordinary frame (64 ms, ~15 fps): not kept when the next present comes, so
+    // at a steady frame rate the clock moves one tick per present.
+    constexpr u64 IDLE_FRAME_TICKS = 4;
     const auto now = std::chrono::steady_clock::now();
     const u64 presents = stats.presents.load(std::memory_order_relaxed);
-    if (presents != poll_presents_seen || poll_last_change == std::chrono::steady_clock::time_point{}) {
+    if (poll_last_change == std::chrono::steady_clock::time_point{}) {
+        poll_presents_seen = presents;
+        poll_last_change = now;
+        poll_tick = (std::max)(poll_tick, presents);
+        poll_tick_at_change = poll_tick;
+    } else if (presents != poll_presents_seen) {
+        // A stretch without presents (a loading screen, a cold start's compile stalls) moved the
+        // clock ahead of the present count. Counting from the present count again froze it until
+        // the presents caught up, and a check scheduled during the stretch waited that long
+        // (Mario Kart World: glyphs written then stayed blank for ~900 presents). The next
+        // stretch counts from the clock as it stands.
+        const u64 idle_ticks = poll_tick - poll_tick_at_change;
+        const u64 advance = presents > poll_presents_seen ? presents - poll_presents_seen : 0;
+        poll_tick_at_change += advance + (idle_ticks > IDLE_FRAME_TICKS ? idle_ticks : 0);
+        poll_tick = (std::max)(poll_tick, poll_tick_at_change);
         poll_presents_seen = presents;
         poll_last_change = now;
     }
@@ -46,7 +64,7 @@ u64 Context::Impl::PollTick() {
         static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(now - poll_last_change)
                              .count()) /
         16;
-    poll_tick = (std::max)(poll_tick, presents + idle);
+    poll_tick = (std::max)(poll_tick, poll_tick_at_change + idle);
     return poll_tick;
 }
 
@@ -159,10 +177,56 @@ bool Context::Impl::PoolWrittenSince(const Pool& pool, u64 offset, u64 size, u32
     return false;
 }
 
+bool Context::Impl::SettleLinearWriteback(Storage& s) {
+    if (s.linear_writeback_seq == 0) {
+        return true;
+    }
+    if (completed_seq.load(std::memory_order_acquire) < s.linear_writeback_seq) {
+        return false;
+    }
+    s.linear_writeback_seq = 0;
+    s.watch_valid = false;
+    if (s.origin == StorageOrigin::Gpu) {
+        s.gpu_guest_sig = 0;
+        s.gpu_guest_sig_valid = false;
+        s.gpu_takeover_armed = false;
+        const auto pool_it = pools.find(s.pool_serial);
+        if (pool_it != pools.end() && pool_it->second) {
+            Pool& pool = *pool_it->second;
+            if ((pool.flags & PoolFlag::CpuNoAccess) == 0 && !pool.IsVirtual() &&
+                s.pool_offset < pool.size) {
+                const u64 size = (std::min)(s.layout.size, pool.size - s.pool_offset);
+                if (size != 0) {
+                    std::vector<u8> scratch;
+                    if (const u8* const data = GuestBytes(pool, s.pool_offset, size, scratch)) {
+                        s.gpu_guest_sig = SampleGuestBytes(data, size, mario_kart_world);
+                        s.gpu_guest_sig_valid = true;
+                    }
+                    VC::GuestMemory* const memory = guest.load(std::memory_order_acquire);
+                    if (pool.takeover_track == 0 && !pool.takeover_track_tried) {
+                        pool.takeover_track_tried = true;
+                        if (memory != nullptr) {
+                            pool.takeover_track = memory->Track(pool.address, pool.size);
+                        }
+                    }
+                    if (pool.takeover_track != 0 && memory != nullptr) {
+                        memory->Arm(pool.takeover_track, pool.address + s.pool_offset, size);
+                        s.gpu_takeover_armed = true;
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
 void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
     // A storage the GPU wrote is watched too (a decoder writing a video plane the game cleared
     // first): its baseline is the guest signature at the first check after the GPU write, so a
     // GPU-only change never looks like a CPU one.
+    if (s.linear_writeback_seq != 0 && !SettleLinearWriteback(s)) {
+        return;
+    }
     if (s.sparse || s.force_upload || s.samples != VK_SAMPLE_COUNT_1_BIT ||
         s.origin == StorageOrigin::None || s.checked_seq == seq) {
         return;
@@ -187,7 +251,7 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
     if (size == 0) {
         return;
     }
-    constexpr u64 SMALL_STORAGE = u64{4} << 20;
+    constexpr u64 SMALL_STORAGE = u64{16} << 20;
     const auto schedule_unchanged = [&] {
         ++s.unchanged_checks;
         u64 backoff = CheckBackoff(s.unchanged_checks);
@@ -264,7 +328,10 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
     // A texture the CPU keeps writing parts of (a glyph atlas) shows new content only in a few
     // lines the signature may not sample: small uncompressed ones and ones that changed before
     // are compared in full at every check. Block-compressed data is rewritten whole (a streamed
-    // tile), so its signature plus the scheduled full compare are enough.
+    // tile), so its signature plus the scheduled full compare are enough. Mario Kart World's
+    // glyph atlas is 1024x8192 R8 (8 MiB): above 4 MiB it only had the scheduled full compare,
+    // whose per-present budget (FULL_HASH_BYTES_PER_PRESENT) the many new textures of a cold
+    // start used up first, so glyphs written then stayed blank.
     const bool compressed = s.desc.format != 0 && FormatBlockInfo(s.desc.format).width > 1;
     const bool every_check = forced || s.dynamic || (size <= SMALL_STORAGE && !compressed);
     bool full = every_check || tick >= s.next_full_tick;
@@ -522,7 +589,8 @@ bool Context::Impl::EnsureImage(Storage& s) {
             // Tile-backed: a sparse residency image with no memory; the tiles the pool maps get
             // theirs (SparseBacking::Prepare).
             const char* reason = "the device cannot create a sparse residency image";
-            s.image = allocator->CreateUnbackedImage(image_info);
+            // Shared tile pages (SparseShareEnabled) need SPARSE_ALIASED images.
+            s.image = allocator->CreateUnbackedImage(image_info, SparseShareEnabled());
             if (s.image && s.sparse->Attach(*this, s, reason)) {
                 s.current_layout = VK_IMAGE_LAYOUT_UNDEFINED;
                 stats.storages_created.fetch_add(1, std::memory_order_relaxed);
@@ -821,6 +889,7 @@ void Context::Impl::MapVirtualNow(u64 pool_serial, const std::vector<VC::Virtual
             storage.contents_valid = false;
             storage.origin = StorageOrigin::None;
             storage.gpu_write_gen = 0; // no longer a source for overlapping textures
+            storage.linear_writeback_seq = 0;
             storage.force_upload = false;
         }
     }
@@ -918,6 +987,21 @@ void Context::Impl::FlushedRuns(Pool& pool, u64 begin, u64 size,
     stats.vram_flush_pages_taken.fetch_add(taken, std::memory_order_relaxed);
 }
 
+bool Context::Impl::SparseShareEnabled() {
+    if (!sparse_share_enabled) {
+        const char* value = std::getenv("EDEN_NX2_NVN_SPARSE_SHARE");
+        const char forced = value == nullptr ? '\0' : value[0];
+        const bool wanted = forced == '1' || (forced != '0' && mario_kart_world);
+        const bool supported = device.IsSparseResidencyAliasedSupported();
+        sparse_share_enabled = wanted && supported;
+        LOG_INFO(Render_Vulkan, "[nvn] sparse tiles of the same guest bytes share pages: {}",
+                 *sparse_share_enabled ? "on"
+                 : !wanted             ? "off"
+                                       : "off (the device cannot alias sparse memory)");
+    }
+    return *sparse_share_enabled;
+}
+
 std::span<const u64> Context::Impl::MkwSparseVirtualUsers(u64 physical_serial) {
     if (mkw_sparse_users_dirty) {
         mkw_sparse_physical_users.clear();
@@ -963,6 +1047,7 @@ void Context::Impl::NotifyCpuWriteNow(u64 address, u64 size, bool host_write) {
     }
     // Live storage shadows are normally authoritative until their segment ends. Refresh only the
     // CPU-written overlap before either a whole-shadow copy-back or a mirror word-merge.
+    InvalidatePendingInlineBytesOverlapping(address, size);
     for (const auto& [run_begin, run_end] : runs) {
         for (auto& [owner_queue, draw] : draw_contexts) {
             static_cast<void>(owner_queue);
@@ -1072,6 +1157,18 @@ void Context::Impl::NotifyCpuWriteNow(u64 address, u64 size, bool host_write) {
             // may still go by it (as a mirror's trusted pages do); anything else hashes in full.
             if (flush_tracked && !host_write && tex_hash_tracked && tex_flush_trusted) {
                 storage.next_check_tick = 0;
+            } else {
+                storage.force_check = true;
+            }
+        } else if (storage.origin == StorageOrigin::Gpu) {
+            // A guest flush after a linear GPU write-back may have overwritten the written-back
+            // bytes before DetectGuestChange ever sampled them; force an upload if the write-back
+            // had already completed, otherwise drop the backoff so the next use checks at once.
+            if (storage.linear_writeback_seq != 0 &&
+                storage.linear_writeback_seq <= completed_seq.load(std::memory_order_acquire)) {
+                storage.linear_writeback_seq = 0;
+                storage.watch_valid = false;
+                storage.force_upload = true;
             } else {
                 storage.force_check = true;
             }
@@ -1908,6 +2005,7 @@ void Context::Impl::FlushTextureNow(CmdFlushTexture& command) {
     }
     // The guest bytes are the texture's contents now: from here on it is a CPU-sourced storage.
     s.origin = StorageOrigin::Cpu;
+    s.linear_writeback_seq = 0;
     s.guest_hash = HashGuestBytes(storage_bytes, storage_size);
     s.sample_hash = SampleGuestBytes(storage_bytes, storage_size, mario_kart_world);
     s.cpu_trusted_gen = 0;

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -64,18 +67,12 @@ public:
     }
 
     /// The frontend's game list, or nullopt if this frontend has none.
-    /// The games the user's own game list shows. Full paths are for the host side only: tools
-    /// must not return them to MCP clients (they expose where files live on the machine).
     [[nodiscard]] virtual std::optional<std::vector<GameEntry>> ListGames() {
         return std::nullopt;
     }
 
     /// Each returns an empty string on success or an error message.
     /// Boots the game at path, as if the user opened it.
-    /// Boots a game. `path` is always one of ListGames()' paths (the tool resolves it from the
-    /// list); an implementation MUST still refuse anything that is not a plain local path of a
-    /// listed game (no UNC / `\\?\` / URL / drive-relative paths). Returns an empty string on
-    /// success or an error message; so do the actions below.
     virtual std::string BootGame([[maybe_unused]] const std::string& path) {
         return "not supported by this frontend";
     }

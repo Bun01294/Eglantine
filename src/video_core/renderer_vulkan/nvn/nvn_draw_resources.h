@@ -173,6 +173,7 @@ enum class BreakCause : u32 {
     ShadowAlias,      ///< a storage range shadowed in device memory is used another way (host copy stale)
     ReportRead,       ///< a draw uses memory a counter report of the pass writes (in-pass queries)
     MeshIndirectConvert, ///< 1D mesh-task arguments are rewritten as VkDrawMeshTasksIndirectCommandEXT
+    InlineUpdate,     ///< pending inline uniform updates flushed to GPU pool memory
     SegmentEnd,       ///< the command buffer ends
     Other,
     Count,
@@ -218,6 +219,8 @@ enum class BreakCause : u32 {
         return "draw reads a counter report of its pass";
     case BreakCause::MeshIndirectConvert:
         return "mesh indirect argument conversion";
+    case BreakCause::InlineUpdate:
+        return "inline uniform update flush";
     default:
         return "other";
     }

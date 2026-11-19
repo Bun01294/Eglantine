@@ -1,8 +1,11 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// Guest memory: read/write, pattern search and frame-sampled watches (changes become timeline
-// events), so an agent can find addresses, not just read them.
+// Guest memory: read/write, pattern search, frame-sampled watches (changes become timeline
+// events) and Cheat-Engine-style value scans, so an agent can find addresses, not just read them.
 
 #include <algorithm>
 #include <bit>
@@ -18,15 +21,12 @@
 
 #include "core/arm/debug.h"
 #include "core/core.h"
-#include "core/debugger/mapped_range_hook.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/memory.h"
 #include "mcp/context.h"
-#include "mcp/server.h"
 #include "mcp/timeline.h"
 #include "mcp/tool_registry.h"
-#include "mcp/tools/app_process.h"
 #include "mcp/tools/tool_helpers.h"
 
 namespace Mcp {
@@ -38,15 +38,9 @@ enum class ValueType { U8, U16, U32, U64, S8, S16, S32, S64, F32, F64 };
 
 /// Type names as used in tool arguments, in ValueType order (indexed by the enum value).
 constexpr std::array<std::pair<std::string_view, ValueType>, 10> kTypes{{
-    {"u8", ValueType::U8},
-    {"u16", ValueType::U16},
-    {"u32", ValueType::U32},
-    {"u64", ValueType::U64},
-    {"s8", ValueType::S8},
-    {"s16", ValueType::S16},
-    {"s32", ValueType::S32},
-    {"s64", ValueType::S64},
-    {"f32", ValueType::F32},
+    {"u8", ValueType::U8},   {"u16", ValueType::U16}, {"u32", ValueType::U32},
+    {"u64", ValueType::U64}, {"s8", ValueType::S8},   {"s16", ValueType::S16},
+    {"s32", ValueType::S32}, {"s64", ValueType::S64}, {"f32", ValueType::F32},
     {"f64", ValueType::F64},
 }};
 
@@ -87,6 +81,11 @@ size_t TypeSize(ValueType type) {
     }
 }
 
+/// True for the f32 and f64 value types.
+bool IsFloat(ValueType type) {
+    return type == ValueType::F32 || type == ValueType::F64;
+}
+
 /// Raw little-endian bits of a value of `type` read from bytes.
 u64 LoadBits(const u8* p, ValueType type) {
     u64 bits = 0;
@@ -97,26 +96,16 @@ u64 LoadBits(const u8* p, ValueType type) {
 /// Numeric value for comparisons and display.
 double AsDouble(u64 bits, ValueType type) {
     switch (type) {
-    case ValueType::U8:
-        return static_cast<double>(static_cast<u8>(bits));
-    case ValueType::U16:
-        return static_cast<double>(static_cast<u16>(bits));
-    case ValueType::U32:
-        return static_cast<double>(static_cast<u32>(bits));
-    case ValueType::U64:
-        return static_cast<double>(bits);
-    case ValueType::S8:
-        return static_cast<double>(static_cast<s8>(bits));
-    case ValueType::S16:
-        return static_cast<double>(static_cast<s16>(bits));
-    case ValueType::S32:
-        return static_cast<double>(static_cast<s32>(bits));
-    case ValueType::S64:
-        return static_cast<double>(static_cast<s64>(bits));
-    case ValueType::F32:
-        return static_cast<double>(std::bit_cast<f32>(static_cast<u32>(bits)));
-    case ValueType::F64:
-        return std::bit_cast<f64>(bits);
+    case ValueType::U8: return static_cast<double>(static_cast<u8>(bits));
+    case ValueType::U16: return static_cast<double>(static_cast<u16>(bits));
+    case ValueType::U32: return static_cast<double>(static_cast<u32>(bits));
+    case ValueType::U64: return static_cast<double>(bits);
+    case ValueType::S8: return static_cast<double>(static_cast<s8>(bits));
+    case ValueType::S16: return static_cast<double>(static_cast<s16>(bits));
+    case ValueType::S32: return static_cast<double>(static_cast<s32>(bits));
+    case ValueType::S64: return static_cast<double>(static_cast<s64>(bits));
+    case ValueType::F32: return static_cast<double>(std::bit_cast<f32>(static_cast<u32>(bits)));
+    case ValueType::F64: return std::bit_cast<f64>(bits);
     }
     return 0.0;
 }
@@ -125,32 +114,24 @@ double AsDouble(u64 bits, ValueType type) {
 /// (sign-extended for signed types).
 json ValueJson(u64 bits, ValueType type) {
     switch (type) {
-    case ValueType::U64:
-        return bits;
-    case ValueType::S64:
-        return static_cast<s64>(bits);
+    case ValueType::U64: return bits;
+    case ValueType::S64: return static_cast<s64>(bits);
     case ValueType::F32:
-    case ValueType::F64:
-        return AsDouble(bits, type);
-    default:
-        return static_cast<s64>(AsDouble(bits, type));
+    case ValueType::F64: return AsDouble(bits, type);
+    default: return static_cast<s64>(AsDouble(bits, type));
     }
 }
 
 /// Bits of `value` (a JSON number) stored as `type`.
 u64 ToBits(const json& value, ValueType type) {
     switch (type) {
-    case ValueType::F32:
-        return std::bit_cast<u32>(value.get<f32>());
-    case ValueType::F64:
-        return std::bit_cast<u64>(value.get<f64>());
-    case ValueType::U64:
-        return value.get<u64>();
+    case ValueType::F32: return std::bit_cast<u32>(value.get<f32>());
+    case ValueType::F64: return std::bit_cast<u64>(value.get<f64>());
+    case ValueType::U64: return value.get<u64>();
     default: {
         const s64 v = value.get<s64>();
         const size_t bytes = TypeSize(type);
-        return bytes == 8 ? static_cast<u64>(v)
-                          : static_cast<u64>(v) & ((u64{1} << (bytes * 8)) - 1);
+        return bytes == 8 ? static_cast<u64>(v) : static_cast<u64>(v) & ((u64{1} << (bytes * 8)) - 1);
     }
     }
 }
@@ -176,42 +157,26 @@ std::optional<u64> ParseAddress(const json& v) {
 }
 
 json AddressSchema(const char* what) {
-    return json{
-        {"description", fmt::format("{} as a hex string (\"0x8004a000\") or integer.", what)}};
+    return json{{"description", fmt::format("{} as a hex string (\"0x8004a000\") or integer.", what)}};
 }
 
-/// The value of one hex digit, or nullopt.
-std::optional<u8> HexNibble(char c) {
-    if (c >= '0' && c <= '9') {
-        return static_cast<u8>(c - '0');
-    }
-    if (c >= 'a' && c <= 'f') {
-        return static_cast<u8>(c - 'a' + 10);
-    }
-    if (c >= 'A' && c <= 'F') {
-        return static_cast<u8>(c - 'A' + 10);
-    }
-    return std::nullopt;
-}
-
-/// Strict hex bytes: optional "0x", whitespace ignored, then an even, non-empty run of hex digits.
+/// Bytes from a hex string, ignoring whitespace and one leading "0x". Returns nullopt for an odd
+/// digit count or a non-hex pair.
 std::optional<std::vector<u8>> ParseHexBytes(std::string text) {
-    std::erase_if(text, [](char c) { return c == ' ' || c == '\n' || c == '\t' || c == '\r'; });
+    std::erase_if(text, [](char c) { return c == ' ' || c == '\n' || c == '\t'; });
     if (text.starts_with("0x")) {
         text = text.substr(2);
     }
-    if (text.empty() || text.size() % 2 != 0) {
+    if (text.size() % 2 != 0) {
         return std::nullopt;
     }
     std::vector<u8> out;
-    out.reserve(text.size() / 2);
     for (size_t i = 0; i < text.size(); i += 2) {
-        const auto hi = HexNibble(text[i]);
-        const auto lo = HexNibble(text[i + 1]);
-        if (!hi || !lo) {
+        try {
+            out.push_back(static_cast<u8>(std::stoul(text.substr(i, 2), nullptr, 16)));
+        } catch (...) {
             return std::nullopt;
         }
-        out.push_back(static_cast<u8>(*hi << 4 | *lo));
     }
     return out;
 }
@@ -252,9 +217,9 @@ std::vector<Region> SearchRegions(Kernel::KProcess& process, const std::string& 
         const auto info = mem_info.GetSvcMemoryInfo();
         const bool mapped = info.state != S::Free && info.state != S::Inaccessible &&
                             info.state != S::Io && info.state != S::Kernel;
-        const bool readable =
-            mapped && (info.permission == P::Read || info.permission == P::ReadWrite ||
-                       info.permission == P::ReadExecute);
+        const bool readable = mapped && (info.permission == P::Read ||
+                                         info.permission == P::ReadWrite ||
+                                         info.permission == P::ReadExecute);
         bool take = false;
         if (which == "all") {
             take = readable;
@@ -279,10 +244,8 @@ std::vector<Region> SearchRegions(Kernel::KProcess& process, const std::string& 
 }
 
 /// The application process, or null when there is no system or no application running.
-/// True when address + length wraps around the 64-bit address space (the range checks below
-/// would then validate a different, wrapped range than the one being accessed).
-bool RangeWraps(u64 address, u64 length) {
-    return length > std::numeric_limits<u64>::max() - address;
+Kernel::KProcess* Process(ToolContext& ctx) {
+    return ctx.system ? ctx.system->ApplicationProcess() : nullptr;
 }
 
 // ---- read / write -------------------------------------------------------------------------
@@ -299,9 +262,6 @@ ToolResult ReadMemory(ToolContext& ctx, const json& args) {
     size_t length = args.value("length", size_t{0});
     std::optional<ValueType> type;
     if (format != "hex" && format != "ascii") {
-        if (count == 0 || count > 8192) {
-            return ToolResult::Error("count must be 1..8192");
-        }
         type = ParseType(format);
         length = TypeSize(*type) * count;
     } else if (length == 0) {
@@ -310,17 +270,10 @@ ToolResult ReadMemory(ToolContext& ctx, const json& args) {
     if (length > 65536) {
         return ToolResult::Error("at most 64 KiB per read");
     }
-    if (RangeWraps(*address, length)) {
-        return ToolResult::Error("address + length wraps around the address space");
-    }
-    const AppProcessRef process{*ctx.system};
-    if (!process) {
-        return ToolResult::Error(kNoApplicationProcess);
-    }
-    auto& memory = process.Memory();
+    auto& memory = ctx.system->ApplicationMemory();
     if (!memory.IsValidVirtualAddressRange(*address, length)) {
-        return ToolResult::Error(
-            fmt::format("{} + {:#x} is not fully mapped (memory_map)", Hex(*address), length));
+        return ToolResult::Error(fmt::format("{} + {:#x} is not fully mapped (memory_map)",
+                                             Hex(*address), length));
     }
     std::vector<u8> bytes(length);
     memory.ReadBlock(*address, bytes.data(), length);
@@ -367,25 +320,18 @@ ToolResult WriteMemory(ToolContext& ctx, const json& args) {
     } else {
         return ToolResult::Error("pass hex, or value + type");
     }
-    if (RangeWraps(*address, bytes.size())) {
-        return ToolResult::Error("address + length wraps around the address space");
-    }
-    const AppProcessRef process{*ctx.system};
-    if (!process) {
-        return ToolResult::Error(kNoApplicationProcess);
-    }
-    auto& memory = process.Memory();
+    auto& memory = ctx.system->ApplicationMemory();
     if (!memory.IsValidVirtualAddressRange(*address, bytes.size())) {
         return ToolResult::Error("range not fully mapped");
     }
     std::vector<u8> before(bytes.size());
     memory.ReadBlock(*address, before.data(), before.size());
     memory.WriteBlock(*address, bytes.data(), bytes.size());
-    Core::InvalidateInstructionCacheRange(process.Get(), *address, bytes.size());
+    Core::InvalidateInstructionCacheRange(Process(ctx), *address, bytes.size());
     if (ctx.timeline) {
-        ctx.timeline->Push(
-            EventKind::Watch, 0, "mcp",
-            fmt::format("write {} {} -> {}", Hex(*address), ToHex(before), ToHex(bytes)));
+        ctx.timeline->Push(EventKind::Watch, 0, "mcp",
+                           fmt::format("write {} {} -> {}", Hex(*address), ToHex(before),
+                                       ToHex(bytes)));
     }
     return ToolResult::Structured(
         json{{"address", Hex(*address)}, {"before", ToHex(before)}, {"after", ToHex(bytes)}});
@@ -393,43 +339,21 @@ ToolResult WriteMemory(ToolContext& ctx, const json& args) {
 
 // ---- search -------------------------------------------------------------------------------
 
-/// How much one search/scan call may do: a client-sized region list ("all") must not pin a worker
-/// thread (and the memory it reads) for minutes.
-struct ScanBudget {
-    static constexpr u64 kMaxBytes = u64{2} << 30; // 2 GiB
-    static constexpr auto kMaxTime = std::chrono::seconds{8};
-    std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now() + kMaxTime;
-    u64 used = 0;
-    bool exhausted = false; ///< A limit (bytes, time, server stopping) cut the scan short.
-
-    bool Spent() {
-        if (used >= kMaxBytes || ServerStopping() || std::chrono::steady_clock::now() >= deadline) {
-            exhausted = true;
-        }
-        return exhausted;
-    }
-};
-
 /// Calls fn(address, data, size) over every region in chunks (with `overlap` bytes carried over
 /// so matches across chunk boundaries are found). Reads bypass GPU read traps (no side effects).
-/// Stops when `budget` is spent (checked between chunks).
 template <typename Fn>
-void ForEachChunk(Core::Memory::Memory& memory, const std::vector<Region>& regions, size_t overlap,
-                  ScanBudget& budget, Fn&& fn) {
-    constexpr size_t kChunk = 1024 * 1024;
+void ForEachChunk(Core::Memory::Memory& memory, const std::vector<Region>& regions,
+                  size_t overlap, Fn&& fn) {
+    constexpr size_t kChunk = 4 * 1024 * 1024;
     std::vector<u8> buffer(kChunk + overlap);
     for (const auto& region : regions) {
         for (u64 offset = 0; offset < region.size; offset += kChunk) {
-            if (budget.Spent()) {
-                return;
-            }
             const u64 addr = region.base + offset;
             const size_t size =
                 static_cast<size_t>(std::min<u64>(kChunk + overlap, region.size - offset));
             if (!memory.ReadBlockUnsafe(addr, buffer.data(), size)) {
                 continue;
             }
-            budget.used += size;
             if (!fn(addr, buffer.data(), size)) {
                 return;
             }
@@ -441,46 +365,35 @@ void ForEachChunk(Core::Memory::Memory& memory, const std::vector<Region>& regio
 /// or a typed value, at addresses that are multiples of `align`. Stops at max_results matches.
 /// Blocks the HTTP worker thread for the whole scan, which can take a while for large regions.
 ToolResult SearchMemory(ToolContext& ctx, const json& args) {
-    const AppProcessRef process{*ctx.system};
+    auto* process = Process(ctx);
     if (!process) {
-        return ToolResult::Error(kNoApplicationProcess);
+        return ToolResult::Error("no application process");
     }
-    constexpr size_t kMaxPattern = 256;
     // Pattern bytes with a wildcard mask.
     std::vector<u8> pattern;
     std::vector<bool> mask;
     if (args.contains("hex")) {
         std::string text = args["hex"].get<std::string>();
-        std::erase_if(text, [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; });
-        if (text.empty() || text.size() % 2 != 0 || text.size() > kMaxPattern * 2) {
-            return ToolResult::Error(
-                "hex pattern: 1..256 bytes, each two hex digits or ?? (e.g. \"DE AD ?? EF\")");
+        std::erase_if(text, [](char c) { return c == ' '; });
+        if (text.size() % 2 != 0) {
+            return ToolResult::Error("hex pattern: pairs of hex digits or ??");
         }
-        bool has_fixed_byte = false;
         for (size_t i = 0; i < text.size(); i += 2) {
-            if (text[i] == '?' && text[i + 1] == '?') {
+            const auto pair = text.substr(i, 2);
+            if (pair == "??") {
                 pattern.push_back(0);
                 mask.push_back(false);
-                continue;
+            } else {
+                auto b = ParseHexBytes(pair);
+                if (!b) {
+                    return ToolResult::Error("bad hex byte: " + pair);
+                }
+                pattern.push_back((*b)[0]);
+                mask.push_back(true);
             }
-            const auto hi = HexNibble(text[i]);
-            const auto lo = HexNibble(text[i + 1]);
-            if (!hi || !lo) {
-                return ToolResult::Error("bad hex byte: " + text.substr(i, 2));
-            }
-            pattern.push_back(static_cast<u8>(*hi << 4 | *lo));
-            mask.push_back(true);
-            has_fixed_byte = true;
-        }
-        if (!has_fixed_byte) {
-            return ToolResult::Error("hex pattern needs at least one non-?? byte");
         }
     } else if (args.contains("ascii")) {
-        const std::string text = args["ascii"].get<std::string>();
-        if (text.empty() || text.size() > kMaxPattern) {
-            return ToolResult::Error("ascii pattern: 1..256 bytes");
-        }
-        for (const char c : text) {
+        for (const char c : args["ascii"].get<std::string>()) {
             pattern.push_back(static_cast<u8>(c));
             mask.push_back(true);
         }
@@ -496,14 +409,13 @@ ToolResult SearchMemory(ToolContext& ctx, const json& args) {
     if (pattern.empty()) {
         return ToolResult::Error("empty pattern");
     }
-    const size_t max_results = std::clamp<size_t>(args.value("max_results", size_t{50}), 1, 10000);
-    const size_t align = std::max<size_t>(args.value("align", size_t{1}), 1);
-    const auto regions = SearchRegions(*process.Get(), args.value("region", "data"));
+    const size_t max_results = args.value("max_results", size_t{50});
+    const size_t align = args.value("align", size_t{1});
+    const auto regions = SearchRegions(*process, args.value("region", "data"));
     json matches = json::array();
     u64 scanned = 0;
-    ScanBudget budget;
     const size_t overlap = pattern.size() - 1;
-    ForEachChunk(process.Memory(), regions, overlap, budget,
+    ForEachChunk(ctx.system->ApplicationMemory(), regions, overlap,
                  [&](u64 base, const u8* data, size_t size) {
                      scanned += size > overlap ? size - overlap : size;
                      for (size_t i = 0; i + pattern.size() <= size; ++i) {
@@ -523,27 +435,17 @@ ToolResult SearchMemory(ToolContext& ctx, const json& args) {
                      }
                      return true;
                  });
-    // Read before `matches` is moved into the result.
     const bool capped = matches.size() >= max_results;
-    json out{{"matches", std::move(matches)},
-             {"regions", regions.size()},
-             {"bytes_scanned", scanned},
-             {"capped", capped}};
-    if (budget.exhausted) {
-        out["truncated"] = true;
-        out["truncated_note"] = "search stopped at its time/size limit (8 s, 2 GiB); narrow "
-                                "'region' to cover the rest";
-    }
-    return ToolResult::Structured(std::move(out));
+    return ToolResult::Structured(json{{"matches", std::move(matches)},
+                                       {"regions", regions.size()},
+                                       {"bytes_scanned", scanned},
+                                       {"capped", capped}});
 }
 
 // ---- watches ------------------------------------------------------------------------------
 
 /// Samples watched addresses once per presented frame on its own thread and records changes in
-/// the timeline. Runs only while watches exist and a game is running. Watches added with
-/// at_invalidate are sampled instead on the guest thread inside NVN InvalidateMappedRange calls
-/// that cover them (Core::Trace::g_invalidate_hook, installed only while such watches exist):
-/// GPU results the guest reads there and clears before the next present are invisible per frame.
+/// the timeline. Runs only while watches exist and a game is running.
 class WatchSampler {
 public:
     static constexpr size_t kMaxWatches = 256;
@@ -555,11 +457,9 @@ public:
         u64 address;
         ValueType type;
         std::string label;
-        bool at_invalidate = false;
         std::optional<u64> last;
         u64 changes = 0;
         u64 last_change_frame = 0;
-        u64 samples = 0; ///< Successful reads (unmapped addresses are skipped, not counted)
     };
 
     static WatchSampler& Get() {
@@ -569,10 +469,9 @@ public:
 
     /// Adds a watch and returns its id. Starts the sampling thread if it is not running, joining
     /// a previous thread that stopped by itself. `system` and `timeline` must outlive the thread.
-    /// Returns 0 and sets `error` when the server is shutting down or the watch limit is reached
-    /// (checked under the lock, so concurrent callers can't overshoot).
+    /// Returns 0 and sets `error` when the server is shutting down or the watch limit is reached.
     u32 Add(Core::System& system, Timeline* timeline, u64 address, ValueType type,
-            std::string label, bool at_invalidate, std::string& error) {
+            std::string label, std::string& error) {
         std::scoped_lock lock{mutex};
         // Checked under the lock Shutdown takes: a watch added after shutdown began would start
         // a sampler that nothing joins.
@@ -585,17 +484,15 @@ public:
             return 0;
         }
         const u32 id = next_id++;
-        watches.push_back({id, address, type, std::move(label), at_invalidate});
-        hook_system = &system;
-        hook_timeline = timeline;
-        UpdateHook();
+        watches.push_back({id, address, type, std::move(label)});
         if (!thread.joinable() || stopped) {
             if (thread.joinable()) {
                 thread.join();
             }
             stopped = false;
-            thread = std::jthread(
-                [this, &system, timeline](std::stop_token stop) { Run(stop, system, timeline); });
+            thread = std::jthread([this, &system, timeline](std::stop_token stop) {
+                Run(stop, system, timeline);
+            });
         }
         return id;
     }
@@ -604,41 +501,12 @@ public:
     /// no watches remain.
     bool Remove(u32 id) {
         std::scoped_lock lock{mutex};
-        const bool removed =
-            std::erase_if(watches, [id](const Watch& w) { return w.id == id; }) != 0;
-        UpdateHook();
-        return removed;
+        return std::erase_if(watches, [id](const Watch& w) { return w.id == id; }) != 0;
     }
 
     void Clear() {
         std::scoped_lock lock{mutex};
         watches.clear();
-        UpdateHook();
-    }
-
-    /// Invalidate hook body: samples the at_invalidate watches inside [address, address + size).
-    void SampleAtInvalidate(u64 address, u64 size) {
-        std::scoped_lock lock{mutex};
-        if (hook_system == nullptr) {
-            return;
-        }
-        const auto covered = [&](const Watch& w) {
-            return w.at_invalidate && w.address >= address &&
-                   w.address + TypeSize(w.type) <= address + size;
-        };
-        if (std::none_of(watches.begin(), watches.end(), covered)) {
-            return;
-        }
-        const AppProcessRef process{*hook_system};
-        if (!process) {
-            return;
-        }
-        const u64 frame = PresentedFrames();
-        for (auto& w : watches) {
-            if (covered(w)) {
-                Sample(w, process.Memory(), frame, hook_timeline);
-            }
-        }
     }
 
     /// Copy of the current watches, taken under the lock.
@@ -653,7 +521,6 @@ public:
         {
             std::scoped_lock lock{mutex};
             watches.clear();
-            UpdateHook();
             finished = std::move(thread);
             stopped = false;
         }
@@ -663,6 +530,7 @@ public:
         }
     }
 
+    /// Stops and joins the sampling thread if it is still running.
     ~WatchSampler() {
         if (thread.joinable()) {
             thread.request_stop();
@@ -684,68 +552,39 @@ private:
             }
             last_frame = frame;
             std::scoped_lock lock{mutex};
-            if (watches.empty() || !system.IsPoweredOn() || system.IsShuttingDown()) {
+            if (watches.empty() || !system.IsPoweredOn()) {
                 watches.clear();
-                UpdateHook();
                 stopped = true;
                 return;
             }
-            // Booting: the process doesn't exist yet. Keep the watches, sample next frame.
-            const AppProcessRef process{system};
-            if (!process) {
-                continue;
-            }
+            auto& memory = system.ApplicationMemory();
             for (auto& w : watches) {
-                if (!w.at_invalidate) {
-                    Sample(w, process.Memory(), frame, timeline);
+                const size_t size = TypeSize(w.type);
+                u8 buf[8]{};
+                if (!memory.IsValidVirtualAddressRange(w.address, size) ||
+                    !memory.ReadBlockUnsafe(w.address, buf, size)) {
+                    continue;
                 }
+                const u64 bits = LoadBits(buf, w.type);
+                if (w.last && *w.last != bits) {
+                    ++w.changes;
+                    w.last_change_frame = frame;
+                    if (timeline) {
+                        timeline->Push(EventKind::Watch, 0,
+                                       w.label.empty() ? Hex(w.address) : w.label,
+                                       fmt::format("{} {}: {} -> {}", Hex(w.address),
+                                                   kTypes[static_cast<size_t>(w.type)].first,
+                                                   ValueJson(*w.last, w.type).dump(),
+                                                   ValueJson(bits, w.type).dump()));
+                    }
+                }
+                w.last = bits;
             }
         }
-    }
-
-    /// Reads one watch and posts a timeline event when the value differs from the last sample
-    /// (the first sample only records the value). Call with the lock held.
-    static void Sample(Watch& w, Core::Memory::Memory& memory, u64 frame, Timeline* timeline) {
-        const size_t size = TypeSize(w.type);
-        u8 buf[8]{};
-        if (!memory.IsValidVirtualAddressRange(w.address, size) ||
-            !memory.ReadBlockUnsafe(w.address, buf, size)) {
-            return;
-        }
-        ++w.samples;
-        const u64 bits = LoadBits(buf, w.type);
-        if (w.last && *w.last != bits) {
-            ++w.changes;
-            w.last_change_frame = frame;
-            if (timeline) {
-                timeline->Push(EventKind::Watch, 0, w.label.empty() ? Hex(w.address) : w.label,
-                               fmt::format("{} {}{}: {} -> {}", Hex(w.address),
-                                           kTypes[static_cast<size_t>(w.type)].first,
-                                           w.at_invalidate ? " @invalidate" : "",
-                                           ValueJson(*w.last, w.type).dump(),
-                                           ValueJson(bits, w.type).dump()));
-            }
-        }
-        w.last = bits;
-    }
-
-    /// Installs the invalidate hook while an at_invalidate watch exists. Call with the lock held.
-    void UpdateHook() {
-        const bool wanted = std::any_of(watches.begin(), watches.end(),
-                                        [](const Watch& w) { return w.at_invalidate; });
-        Core::Trace::g_invalidate_hook.store(wanted ? &OnInvalidate : nullptr,
-                                             std::memory_order_release);
-    }
-
-    static void OnInvalidate(u64 address, u64 size) {
-        Get().SampleAtInvalidate(address, size);
     }
 
     std::mutex mutex;
     std::vector<Watch> watches;
-    /// What the invalidate hook samples with (set by Add; the system outlives the server).
-    Core::System* hook_system = nullptr;
-    Timeline* hook_timeline = nullptr;
     u32 next_id = 1;
     bool stopped = true;
     std::jthread thread;
@@ -758,39 +597,20 @@ ToolResult WatchAdd(ToolContext& ctx, const json& args) {
         return ToolResult::Error("bad address");
     }
     const ValueType type = ParseType(args.value("type", "u32"));
-    if (RangeWraps(*address, TypeSize(type))) {
-        return ToolResult::Error("address + size wraps around the address space");
+    if (!ctx.system->ApplicationMemory().IsValidVirtualAddressRange(*address, TypeSize(type))) {
+        return ToolResult::Error("address not mapped");
     }
-    {
-        const AppProcessRef process{*ctx.system};
-        if (!process) {
-            return ToolResult::Error(kNoApplicationProcess);
-        }
-        if (!process.Memory().IsValidVirtualAddressRange(*address, TypeSize(type))) {
-            return ToolResult::Error("address not mapped");
-        }
-    }
-    const bool at_invalidate = args.value("at", "present") == "invalidate";
     std::string error;
     const u32 id = WatchSampler::Get().Add(*ctx.system, ctx.timeline, *address, type,
-                                           args.value("label", ""), at_invalidate, error);
+                                           args.value("label", ""), error);
     if (id == 0) {
         return ToolResult::Error(error);
     }
     return ToolResult::Structured(
         json{{"id", id},
-             {"at", at_invalidate ? "invalidate" : "present"},
-             {"note", at_invalidate
-                          ? "Sampled inside each NVN InvalidateMappedRange call that covers the "
-                            "address (VTX-HLE only), i.e. what the guest reads there; changes "
-                            "appear as 'watch' events marked @invalidate. Never sampled if the "
-                            "game does not invalidate that range. Watches clear when the game "
-                            "stops."
-                          : "Sampled once per presented frame; changes appear as 'watch' events "
-                            "in the timeline (timeline kinds:[\"watch\"], or act/wait_for). "
-                            "Changes that revert within one frame are missed (GPU results the "
-                            "guest clears after reading: try at:\"invalidate\"). Watches clear "
-                            "when the game stops."}});
+             {"note", "Sampled once per presented frame; changes appear as 'watch' events in the "
+                      "timeline (timeline kinds:[\"watch\"], or act/wait_for). Changes that revert "
+                      "within one frame are missed. Watches clear when the game stops."}});
 }
 
 /// watch_list: each watch with its last value (null before the first sample) and change count.
@@ -801,8 +621,6 @@ ToolResult WatchList(ToolContext&, const json&) {
                    {"address", Hex(w.address)},
                    {"type", kTypes[static_cast<size_t>(w.type)].first},
                    {"label", w.label},
-                   {"at", w.at_invalidate ? "invalidate" : "present"},
-                   {"samples", w.samples},
                    {"changes", w.changes},
                    {"last_change_frame", w.last_change_frame}};
         entry["value"] = w.last ? ValueJson(*w.last, w.type) : json{};
@@ -825,11 +643,157 @@ ToolResult WatchRemove(ToolContext&, const json& args) {
                : ToolResult::Error("no watch with that id");
 }
 
+// ---- scans --------------------------------------------------------------------------------
+
+/// The one value scan in progress: candidate addresses and their values from the last round.
+/// round 0 means no scan has been started. Guarded by mutex.
+struct ScanState {
+    std::mutex mutex;
+    ValueType type = ValueType::U32;
+    std::vector<u64> addresses;
+    std::vector<u64> values;
+    u32 round = 0;
+    bool truncated = false;
+};
+
+ScanState& Scan() {
+    static ScanState state;
+    return state;
+}
+
+constexpr size_t kMaxCandidates = 10'000'000;
+
+/// Whether a candidate passes a scan_next filter, comparing its current value with `value` or with
+/// its value from the previous round. Unknown filters return false.
+bool Compare(const std::string& filter, double now, double before, double value) {
+    if (filter == "equals") return now == value;
+    if (filter == "not_equals") return now != value;
+    if (filter == "greater") return now > value;
+    if (filter == "less") return now < value;
+    if (filter == "changed") return now != before;
+    if (filter == "unchanged") return now == before;
+    if (filter == "increased") return now > before;
+    if (filter == "decreased") return now < before;
+    return false;
+}
+
+/// scan_start: replaces any previous scan with every type-aligned address in the chosen regions
+/// holding `value` (floats within `tolerance`). Holds the scan lock for the whole scan and stops
+/// at kMaxCandidates, setting "truncated".
+ToolResult ScanStart(ToolContext& ctx, const json& args) {
+    auto* process = Process(ctx);
+    if (!process) {
+        return ToolResult::Error("no application process");
+    }
+    auto& scan = Scan();
+    std::scoped_lock lock{scan.mutex};
+    scan.type = ParseType(args.value("type", "u32"));
+    scan.addresses.clear();
+    scan.values.clear();
+    scan.round = 1;
+    scan.truncated = false;
+    const size_t size = TypeSize(scan.type);
+    const double target = args.at("value").get<double>();
+    const double tolerance = args.value("tolerance", 0.0);
+    const auto regions = SearchRegions(*process, args.value("region", "data"));
+    u64 scanned = 0;
+    ForEachChunk(ctx.system->ApplicationMemory(), regions, 0,
+                 [&](u64 base, const u8* data, size_t len) {
+                     scanned += len;
+                     for (size_t i = 0; i + size <= len; i += size) {
+                         const u64 bits = LoadBits(data + i, scan.type);
+                         const double v = AsDouble(bits, scan.type);
+                         if (IsFloat(scan.type) ? std::abs(v - target) <= tolerance : v == target) {
+                             scan.addresses.push_back(base + i);
+                             scan.values.push_back(bits);
+                             if (scan.addresses.size() >= kMaxCandidates) {
+                                 scan.truncated = true;
+                                 return false;
+                             }
+                         }
+                     }
+                     return true;
+                 });
+    return ToolResult::Structured(json{{"candidates", scan.addresses.size()},
+                                       {"bytes_scanned", scanned},
+                                       {"truncated", scan.truncated},
+                                       {"next", "Change the value in game, then scan_next "
+                                                "(e.g. filter:'decreased' or 'equals' value:N)."}});
+}
+
+/// scan_next: rereads every candidate and keeps those passing the filter, storing their new
+/// values for the next round. Unreadable candidates are dropped. Lists the results once 20 or
+/// fewer remain. Fails if no scan was started or the filter needs a value and none was given.
+ToolResult ScanNext(ToolContext& ctx, const json& args) {
+    auto& scan = Scan();
+    std::scoped_lock lock{scan.mutex};
+    if (scan.round == 0) {
+        return ToolResult::Error("no scan in progress (scan_start)");
+    }
+    const std::string filter = args.at("filter").get<std::string>();
+    const bool needs_value = filter == "equals" || filter == "not_equals" ||
+                             filter == "greater" || filter == "less";
+    if (needs_value && !args.contains("value")) {
+        return ToolResult::Error("this filter needs value");
+    }
+    const double value = args.value("value", 0.0);
+    auto& memory = ctx.system->ApplicationMemory();
+    const size_t size = TypeSize(scan.type);
+    size_t kept = 0;
+    for (size_t i = 0; i < scan.addresses.size(); ++i) {
+        u8 buf[8]{};
+        if (!memory.ReadBlockUnsafe(scan.addresses[i], buf, size)) {
+            continue;
+        }
+        const u64 bits = LoadBits(buf, scan.type);
+        if (Compare(filter, AsDouble(bits, scan.type), AsDouble(scan.values[i], scan.type),
+                    value)) {
+            scan.addresses[kept] = scan.addresses[i];
+            scan.values[kept] = bits;
+            ++kept;
+        }
+    }
+    scan.addresses.resize(kept);
+    scan.values.resize(kept);
+    ++scan.round;
+    json out{{"candidates", kept}, {"round", scan.round}};
+    if (kept <= 20) {
+        json list = json::array();
+        for (size_t i = 0; i < kept; ++i) {
+            list.push_back({{"address", Hex(scan.addresses[i])},
+                            {"value", ValueJson(scan.values[i], scan.type)}});
+        }
+        out["results"] = std::move(list);
+    }
+    return ToolResult::Structured(std::move(out));
+}
+
+/// scan_results: the first `limit` candidates with their current value and the value stored by
+/// the last round. Does not filter or change the scan.
+ToolResult ScanResults(ToolContext& ctx, const json& args) {
+    auto& scan = Scan();
+    std::scoped_lock lock{scan.mutex};
+    const size_t limit = std::min(args.value("limit", size_t{100}), scan.addresses.size());
+    auto& memory = ctx.system->ApplicationMemory();
+    const size_t size = TypeSize(scan.type);
+    json list = json::array();
+    for (size_t i = 0; i < limit; ++i) {
+        u8 buf[8]{};
+        memory.ReadBlockUnsafe(scan.addresses[i], buf, size);
+        list.push_back({{"address", Hex(scan.addresses[i])},
+                        {"value", ValueJson(LoadBits(buf, scan.type), scan.type)},
+                        {"previous", ValueJson(scan.values[i], scan.type)}});
+    }
+    return ToolResult::Structured(json{{"candidates", scan.addresses.size()},
+                                       {"type", kTypes[static_cast<size_t>(scan.type)].first},
+                                       {"round", scan.round},
+                                       {"results", std::move(list)}});
+}
+
 json RegionSchema() {
-    return json{
-        {"type", "string"},
-        {"enum", {"data", "heap", "code", "all"}},
-        {"description", "data = writable regions (default), heap, code (r-x), all readable."}};
+    return json{{"type", "string"},
+                {"enum", {"data", "heap", "code", "all"}},
+                {"description", "data = writable regions (default), heap, code (r-x), all readable."}};
 }
 
 } // namespace
@@ -838,7 +802,7 @@ void StopMemoryWork() {
     WatchSampler::Get().Shutdown();
 }
 
-/// Registers the memory read/write, search and watch tools.
+/// Registers the memory read/write, search, watch and value scan tools.
 void RegisterMemoryTools(ToolRegistry& registry) {
     registry.Add(Tool{
         .name = "read_memory",
@@ -850,15 +814,13 @@ void RegisterMemoryTools(ToolRegistry& registry) {
                          {"properties",
                           {{"address", AddressSchema("Virtual address")},
                            {"length", {{"type", "integer"}, {"minimum", 1}, {"maximum", 65536}}},
-                           {"format",
-                            {{"type", "string"},
-                             {"enum",
-                              [] {
-                                  json e = TypeEnum();
-                                  e.push_back("hex");
-                                  e.push_back("ascii");
-                                  return e;
-                              }()}}},
+                           {"format", {{"type", "string"},
+                                       {"enum", [] {
+                                            json e = TypeEnum();
+                                            e.push_back("hex");
+                                            e.push_back("ascii");
+                                            return e;
+                                        }()}}},
                            {"count", {{"type", "integer"}, {"minimum", 1}, {"maximum", 8192}}}}},
                          {"required", {"address"}},
                          {"additionalProperties", false}},
@@ -891,18 +853,16 @@ void RegisterMemoryTools(ToolRegistry& registry) {
         .title = "Search guest memory",
         .description = "Find a byte pattern (hex with ?? wildcards, e.g. \"DE AD ?? EF\"), an "
                        "ascii string, or a typed value in the application's memory. Returns up to "
-                       "max_results addresses (default 50). Stops at 8 s / 2 GiB per call "
-                       "('truncated').",
+                       "max_results addresses (default 50).",
         .input_schema = {{"type", "object"},
                          {"properties",
-                          {{"hex", {{"type", "string"}, {"maxLength", 768}}},
-                           {"ascii", {{"type", "string"}, {"maxLength", 256}}},
+                          {{"hex", {{"type", "string"}}},
+                           {"ascii", {{"type", "string"}}},
                            {"type", {{"type", "string"}, {"enum", TypeEnum()}}},
                            {"value", {{"type", "number"}}},
                            {"region", RegionSchema()},
                            {"align", {{"type", "integer"}, {"minimum", 1}, {"maximum", 4096}}},
-                           {"max_results",
-                            {{"type", "integer"}, {"minimum", 1}, {"maximum", 10000}}}}},
+                           {"max_results", {{"type", "integer"}, {"minimum", 1}, {"maximum", 10000}}}}},
                          {"additionalProperties", false}},
         .annotations = {.read_only = true},
         .requires_game = true,
@@ -911,27 +871,17 @@ void RegisterMemoryTools(ToolRegistry& registry) {
     registry.Add(Tool{
         .name = "watch_add",
         .title = "Watch an address",
-        .description = "Watch a value; it is sampled every presented frame (or, with at "
-                       "\"invalidate\", inside each NVN InvalidateMappedRange covering it) and "
-                       "each change becomes a 'watch' timeline event (old -> new, with the "
-                       "frame). Use with act or wait_for {kinds:[\"watch\"]} to see what an input "
-                       "changed.",
+        .description = "Watch a value; it is sampled every presented frame and each change becomes "
+                       "a 'watch' timeline event (old -> new, with the frame). Use with act or "
+                       "wait_for {kinds:[\"watch\"]} to see what an input changed.",
         .input_schema = {{"type", "object"},
                          {"properties",
                           {{"address", AddressSchema("Virtual address")},
                            {"type", {{"type", "string"}, {"enum", TypeEnum()}}},
-                           {"label", {{"type", "string"}, {"maxLength", 100}}},
-                           {"at",
-                            {{"type", "string"},
-                             {"enum", {"present", "invalidate"}},
-                             {"description",
-                              "When to sample: once per presented frame (default), or when the "
-                              "guest invalidates a mapped range covering the address (GPU results "
-                              "it reads and clears within a frame; VTX-HLE only)."}}}}},
+                           {"label", {{"type", "string"}, {"maxLength", 100}}}}},
                          {"required", {"address"}},
                          {"additionalProperties", false}},
         .requires_game = true,
-        .requires_control = true,
         .handler = WatchAdd,
     });
     registry.Add(Tool{
@@ -947,11 +897,58 @@ void RegisterMemoryTools(ToolRegistry& registry) {
         .description = "Remove one watch by id, or all with all:true.",
         .input_schema = {{"type", "object"},
                          {"properties",
-                          {{"id", {{"type", "integer"}, {"minimum", 1}}},
-                           {"all", {{"type", "boolean"}}}}},
+                          {{"id", {{"type", "integer"}, {"minimum", 1}}}, {"all", {{"type", "boolean"}}}}},
                          {"additionalProperties", false}},
-        .requires_control = true,
         .handler = WatchRemove,
+    });
+    registry.Add(Tool{
+        .name = "scan_start",
+        .title = "Start a value scan",
+        .description = "Cheat-Engine-style search for an unknown address: scan memory for every "
+                       "location holding value (as type, default u32; floats match within "
+                       "tolerance). Then change the value in game and narrow with scan_next until "
+                       "a few candidates remain.",
+        .input_schema = {{"type", "object"},
+                         {"properties",
+                          {{"value", {{"type", "number"}}},
+                           {"type", {{"type", "string"}, {"enum", TypeEnum()}}},
+                           {"tolerance", {{"type", "number"}, {"minimum", 0}}},
+                           {"region", RegionSchema()}}},
+                         {"required", {"value"}},
+                         {"additionalProperties", false}},
+        .annotations = {.read_only = true},
+        .requires_game = true,
+        .handler = ScanStart,
+    });
+    registry.Add(Tool{
+        .name = "scan_next",
+        .title = "Narrow a value scan",
+        .description = "Keep only candidates whose current value passes filter: equals / "
+                       "not_equals / greater / less (with value), or changed / unchanged / "
+                       "increased / decreased (vs the previous round). Lists them once <= 20.",
+        .input_schema = {{"type", "object"},
+                         {"properties",
+                          {{"filter", {{"type", "string"},
+                                       {"enum", {"equals", "not_equals", "greater", "less",
+                                                 "changed", "unchanged", "increased",
+                                                 "decreased"}}}},
+                           {"value", {{"type", "number"}}}}},
+                         {"required", {"filter"}},
+                         {"additionalProperties", false}},
+        .annotations = {.read_only = true},
+        .requires_game = true,
+        .handler = ScanNext,
+    });
+    registry.Add(Tool{
+        .name = "scan_results",
+        .title = "Value scan results",
+        .description = "The current scan candidates with their current and previous values.",
+        .input_schema = {{"type", "object"},
+                         {"properties", {{"limit", {{"type", "integer"}, {"minimum", 1}, {"maximum", 5000}}}}},
+                         {"additionalProperties", false}},
+        .annotations = {.read_only = true},
+        .requires_game = true,
+        .handler = ScanResults,
     });
 }
 

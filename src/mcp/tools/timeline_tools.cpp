@@ -1,8 +1,12 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // Server-side reductions of the timeline (agents pay per token): a clustered summary, JSONL
-// export of a run, and a comparison of two exported runs (before/after a change).
+// export of a run, and a comparison of two exported runs (before/after a change). Plus the
+// installed firmware version.
 
 #include <algorithm>
 #include <cctype>
@@ -15,8 +19,8 @@
 #include "common/fs/file.h"
 #include "common/fs/path_util.h"
 #include "core/core.h"
+#include "frontend_common/firmware_manager.h"
 #include "mcp/context.h"
-#include "mcp/server.h"
 #include "mcp/timeline.h"
 #include "mcp/tool_registry.h"
 #include "mcp/tools/tool_helpers.h"
@@ -67,15 +71,8 @@ std::vector<Cluster> ClusterEvents(const std::vector<json>& events) {
         const std::string pattern = Normalize(msg);
         auto& c = clusters[kind + '\x1f' + source + '\x1f' + level + '\x1f' + pattern];
         if (c.count == 0) {
-            c = {kind,
-                 source,
-                 level,
-                 pattern,
-                 msg.substr(0, 300),
-                 0,
-                 e.value("frame", u64{0}),
-                 0,
-                 e.value("seq", u64{0})};
+            c = {kind, source, level, pattern, msg.substr(0, 300), 0,
+                 e.value("frame", u64{0}), 0, e.value("seq", u64{0})};
         }
         ++c.count;
         c.last_frame = e.value("frame", u64{0});
@@ -84,18 +81,14 @@ std::vector<Cluster> ClusterEvents(const std::vector<json>& events) {
     for (auto& [key, c] : clusters) {
         out.push_back(std::move(c));
     }
-    std::sort(out.begin(), out.end(),
-              [](const auto& a, const auto& b) { return a.count > b.count; });
+    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.count > b.count; });
     return out;
 }
 
 /// A cluster as JSON with its frame range; "level" only for log clusters.
 json ClusterJson(const Cluster& c) {
-    json j{{"kind", c.kind},
-           {"source", c.source},
-           {"count", c.count},
-           {"frames", fmt::format("{}..{}", c.first_frame, c.last_frame)},
-           {"example", c.example}};
+    json j{{"kind", c.kind}, {"source", c.source}, {"count", c.count},
+           {"frames", fmt::format("{}..{}", c.first_frame, c.last_frame)}, {"example", c.example}};
     if (!c.level.empty()) {
         j["level"] = c.level;
     }
@@ -166,30 +159,13 @@ ToolResult SummarizeSince(ToolContext& ctx, const json& args) {
 /// Exports live under <log dir>/mcp; names only (no paths), so no tool writes or reads elsewhere.
 std::optional<std::filesystem::path> ExportPath(const std::string& name) {
     if (name.empty() || name.size() > 64 ||
-        !std::all_of(name.begin(), name.end(),
-                     [](char c) {
-                         return std::isalnum(static_cast<unsigned char>(c)) || c == '-' ||
-                                c == '_' || c == '.';
-                     }) ||
-        name.find("..") != std::string::npos || IsReservedDeviceName(name)) {
+        !std::all_of(name.begin(), name.end(), [](char c) {
+            return std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' || c == '.';
+        }) ||
+        name.find("..") != std::string::npos) {
         return std::nullopt;
     }
     return Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / "mcp" / (name + ".jsonl");
-}
-
-constexpr size_t kMaxExports = 200;
-constexpr size_t kMaxExportBytes = 16 * 1024 * 1024;
-
-/// Number of exports already in <log dir>/mcp.
-size_t ExportCount(const std::filesystem::path& dir) {
-    size_t count = 0;
-    std::error_code ec;
-    for (std::filesystem::directory_iterator it{dir, ec}, end; !ec && it != end; it.increment(ec)) {
-        if (it->path().extension() == ".jsonl") {
-            ++count;
-        }
-    }
-    return count;
 }
 
 /// timeline_export: writes the events after since_seq (all log levels by default) as one JSON
@@ -201,17 +177,7 @@ ToolResult TimelineExport(ToolContext& ctx, const json& args) {
     }
     const auto path = ExportPath(args.at("name").get<std::string>());
     if (!path) {
-        return ToolResult::Error(
-            "name: letters, digits, '-', '_' or '.', up to 64 characters, not a reserved device "
-            "name (CON, NUL, COM1...)");
-    }
-    // Overwriting an export is fine; a new one counts against the quota.
-    std::error_code exists_ec;
-    if (!std::filesystem::exists(*path, exists_ec) &&
-        ExportCount(path->parent_path()) >= kMaxExports) {
-        return ToolResult::Error(fmt::format(
-            "{} exports already exist in the log directory's mcp folder; delete some by hand",
-            kMaxExports));
+        return ToolResult::Error("name: letters, digits, '-', '_' or '.', up to 64 characters");
     }
     const int min_level = args.contains("min_level")
                               ? ParseQuery(json{{"min_level", args["min_level"]}}).min_level
@@ -223,26 +189,18 @@ ToolResult TimelineExport(ToolContext& ctx, const json& args) {
         return ToolResult::Error("no events match; nothing was exported");
     }
     std::string text;
-    size_t written = 0;
     for (const auto& e : events) {
         text += e.dump();
         text += '\n';
-        ++written;
-        if (text.size() > kMaxExportBytes) {
-            break;
-        }
     }
     std::error_code ec;
     std::filesystem::create_directories(path->parent_path(), ec);
     if (Common::FS::WriteStringToFile(*path, Common::FS::FileType::TextFile, text) != text.size()) {
-        return ToolResult::Error("could not write " + DataRelativePath(*path));
+        return ToolResult::Error("could not write " + Common::FS::PathToUTF8String(*path));
     }
-    json out{{"path", DataRelativePath(*path)}, {"events", written}, {"bytes", text.size()}};
-    if (written < events.size()) {
-        out["truncated"] = true;
-        out["note"] = "Stopped at 16 MiB; raise since_seq or min_level for the rest.";
-    }
-    return ToolResult::Structured(std::move(out));
+    return ToolResult::Structured(json{{"path", Common::FS::PathToUTF8String(*path)},
+                                       {"events", events.size()},
+                                       {"bytes", text.size()}});
 }
 
 /// Parses a timeline_export file back into events, skipping lines that are not valid JSON.
@@ -339,6 +297,22 @@ ToolResult CompareRuns(ToolContext&, const json& args) {
                  "only_in_a = what the change removed."}});
 }
 
+/// firmware_status: whether firmware is installed and, if its version can be read, the version
+/// and display strings.
+ToolResult FirmwareStatus(ToolContext& ctx, const json&) {
+    const bool present = FirmwareManager::CheckFirmwarePresence(*ctx.system);
+    json out{{"installed", present}};
+    if (present) {
+        const auto [version, result] = FirmwareManager::GetFirmwareVersion(*ctx.system);
+        if (result.IsSuccess()) {
+            out["version"] = fmt::format("{}.{}.{}", version.major, version.minor, version.micro);
+            out["display_version"] = std::string{version.display_version.data()};
+            out["display_title"] = std::string{version.display_title.data()};
+        }
+    }
+    return ToolResult::Structured(std::move(out));
+}
+
 json LevelSchema() {
     return json{{"type", "string"},
                 {"enum", {"trace", "debug", "info", "warning", "error", "critical"}}};
@@ -346,7 +320,7 @@ json LevelSchema() {
 
 } // namespace
 
-/// Registers summarize_since, timeline_export and compare_runs.
+/// Registers summarize_since, timeline_export, compare_runs and firmware_status.
 void RegisterTimelineTools(ToolRegistry& registry) {
     registry.Add(Tool{
         .name = "summarize_since",
@@ -377,8 +351,6 @@ void RegisterTimelineTools(ToolRegistry& registry) {
                            {"min_level", LevelSchema()}}},
                          {"required", {"name"}},
                          {"additionalProperties", false}},
-        .requires_write = true,
-        .requires_control = true,
         .handler = TimelineExport,
     });
     registry.Add(Tool{
@@ -389,13 +361,20 @@ void RegisterTimelineTools(ToolRegistry& registry) {
                        "code change or setting did to the emulator's behaviour.",
         .input_schema = {{"type", "object"},
                          {"properties",
-                          {{"a", {{"type", "string"}, {"maxLength", 64}}},
-                           {"b", {{"type", "string"}, {"maxLength", 64}}},
+                          {{"a", {{"type", "string"}}},
+                           {"b", {{"type", "string"}}},
                            {"limit", {{"type", "integer"}, {"minimum", 1}, {"maximum", 500}}}}},
                          {"required", {"a", "b"}},
                          {"additionalProperties", false}},
         .annotations = {.read_only = true, .idempotent = true},
         .handler = CompareRuns,
+    });
+    registry.Add(Tool{
+        .name = "firmware_status",
+        .title = "Firmware status",
+        .description = "Whether system firmware is installed and its version.",
+        .annotations = {.read_only = true, .idempotent = true},
+        .handler = FirmwareStatus,
     });
 }
 

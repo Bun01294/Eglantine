@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -77,12 +80,16 @@ add_executable(yuzu
     configuration/nvidia_dlss_panel.cpp
     configuration/nvidia_dlss_panel.h
     configuration/configure_graphics.ui
+    configuration/configure_frame_generation.cpp
+    configuration/configure_frame_generation.h
     configuration/configure_graphics_advanced.cpp
     configuration/configure_graphics_advanced.h
     configuration/configure_graphics_advanced.ui
     configuration/configure_graphics_extensions.cpp
     configuration/configure_graphics_extensions.h
     configuration/configure_graphics_extensions.ui
+    configuration/configure_performance.cpp
+    configuration/configure_performance.h
     configuration/configure_hotkeys.cpp
     configuration/configure_hotkeys.h
     configuration/configure_hotkeys.ui
@@ -112,6 +119,8 @@ add_executable(yuzu
     configuration/configure_per_game.cpp
     configuration/configure_per_game.h
     configuration/configure_per_game.ui
+    configuration/configure_per_game_tweaks.cpp
+    configuration/configure_per_game_tweaks.h
     configuration/configure_per_game_addons.cpp
     configuration/configure_per_game_addons.h
     configuration/configure_per_game_addons.ui
@@ -198,6 +207,7 @@ add_executable(yuzu
     multiplayer/state.cpp
     multiplayer/state.h
     multiplayer/validation.h
+    nx2_switches.h
     startup_checks.cpp
     startup_checks.h
     set_play_time_dialog.cpp
@@ -226,6 +236,7 @@ add_executable(yuzu
     yuzu.rc
     migration_dialog.h migration_dialog.cpp
     nup_dialogs.h nup_dialogs.cpp
+    shader_warm_dialog.h shader_warm_dialog.cpp
     migration_worker.h migration_worker.cpp
     libqt_common.h libqt_common.cpp
 
@@ -235,6 +246,7 @@ add_executable(yuzu
     data_widget.ui
     ryujinx_dialog.h ryujinx_dialog.cpp ryujinx_dialog.ui
     main_window.h main_window.cpp main.ui
+    recommended_settings_dialog.h recommended_settings_dialog.cpp
 
     configuration/system/new_user_dialog.h configuration/system/new_user_dialog.cpp configuration/system/new_user_dialog.ui
     configuration/system/profile_avatar_dialog.h configuration/system/profile_avatar_dialog.cpp
@@ -249,7 +261,7 @@ add_executable(yuzu
 set_target_properties(yuzu PROPERTIES OUTPUT_NAME "eglantine")
 
 # Shipped next to the executable: the NX2 switches a GUI launch cannot set another way. Read at
-# startup (LoadNx2Switches in main.cpp); a user copy in %APPDATA%\eden overrides it.
+# startup (LoadNx2Switches in main.cpp); a user copy in %APPDATA%\eglantine overrides it.
 add_custom_command(TARGET yuzu POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${PROJECT_SOURCE_DIR}/dist/nx2_switches.txt" "$<TARGET_FILE_DIR:yuzu>/nx2_switches.txt"
@@ -280,6 +292,7 @@ file(GLOB_RECURSE THEMES ${PROJECT_SOURCE_DIR}/dist/qt_themes/*)
 
 if (ENABLE_UPDATE_CHECKER)
     target_compile_definitions(yuzu PUBLIC ENABLE_UPDATE_CHECKER)
+    target_link_libraries(yuzu PRIVATE QuaZip::QuaZip)
 endif()
 
 if (ENABLE_QT_TRANSLATION)
@@ -420,7 +433,8 @@ endif()
 target_link_libraries(yuzu PRIVATE nlohmann_json::nlohmann_json)
 
 if (ENABLE_MCP_SERVER)
-    target_sources(yuzu PRIVATE mcp_host_qt.cpp mcp_host_qt.h)
+    target_sources(yuzu PRIVATE mcp_host_qt.cpp mcp_host_qt.h
+        configuration/configure_mcp.cpp configuration/configure_mcp.h)
     target_link_libraries(yuzu PRIVATE mcp)
     target_compile_definitions(yuzu PRIVATE YUZU_ENABLE_MCP)
 endif()
@@ -467,7 +481,14 @@ if (WIN32 AND NOT YUZU_USE_BUNDLED_QT)
     endif()
     if (WINDEPLOYQT_EXECUTABLE)
         set(YUZU_EXE_DIR "$<TARGET_FILE_DIR:yuzu>")
-        add_custom_command(TARGET yuzu POST_BUILD COMMAND ${WINDEPLOYQT_EXECUTABLE} "$<TARGET_FILE:yuzu>" --dir "${YUZU_EXE_DIR}" --libdir "${YUZU_EXE_DIR}" --plugindir "${YUZU_EXE_DIR}/plugins" --no-compiler-runtime --no-opengl-sw --no-system-d3d-compiler --no-translations --verbose 0)
+        # MSYS2's Qt also has the GLib network information plugin. It pulls in GIO, which reads every
+        # app and mail client registration in the registry as soon as it loads, so malware sandboxes
+        # flag the package. Windows uses the Network List Manager plugin instead.
+        set(YUZU_WINDEPLOYQT_EXTRA_ARGS "")
+        if (MINGW)
+            set(YUZU_WINDEPLOYQT_EXTRA_ARGS --exclude-plugins qglib)
+        endif()
+        add_custom_command(TARGET yuzu POST_BUILD COMMAND ${WINDEPLOYQT_EXECUTABLE} "$<TARGET_FILE:yuzu>" --dir "${YUZU_EXE_DIR}" --libdir "${YUZU_EXE_DIR}" --plugindir "${YUZU_EXE_DIR}/plugins" --no-compiler-runtime --no-opengl-sw --no-system-d3d-compiler --no-translations --verbose 1 ${YUZU_WINDEPLOYQT_EXTRA_ARGS})
     else()
         message(WARNING "windeployqt not found: copy the Qt DLLs next to the executable yourself")
     endif()

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -244,20 +247,33 @@ void RemoveAddOnContent(u64 program_id, InstalledEntryType type) {
 
 void RemoveTransferableShaderCache(u64 program_id, GameListRemoveTarget target) {
     const auto shader_cache_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
-    const auto shader_cache_folder_path = shader_cache_dir / fmt::format("{:016x}", program_id);
+    const auto title_cache_dir = shader_cache_dir / fmt::format("{:016x}", program_id);
     std::vector<std::filesystem::path> files;
-    Common::FS::IterateDirEntries(
-        shader_cache_folder_path,
-        [&](const std::filesystem::directory_entry& entry) {
-            const std::string name = entry.path().filename().string();
-            if ((target == GameListRemoveTarget::GlShaderCache && name == "opengl.bin") ||
-                (target == GameListRemoveTarget::VkShaderCache &&
-                 VideoCommon::IsVulkanPipelineCacheFile(name))) {
-                files.push_back(entry.path());
-            }
-            return true;
-        },
-        Common::FS::DirEntryFilter::File);
+    const auto collect_from = [&](const std::filesystem::path& dir) {
+        if (!Common::FS::Exists(dir)) {
+            return;
+        }
+        Common::FS::IterateDirEntries(
+            dir,
+            [&](const std::filesystem::directory_entry& entry) {
+                const std::string name = entry.path().filename().string();
+                if ((target == GameListRemoveTarget::GlShaderCache && name == "opengl.bin") ||
+                    (target == GameListRemoveTarget::VkShaderCache &&
+                     VideoCommon::IsVulkanPipelineCacheFile(name))) {
+                    files.push_back(entry.path());
+                }
+                return true;
+            },
+            Common::FS::DirEntryFilter::File);
+    };
+    collect_from(title_cache_dir);
+    if (target == GameListRemoveTarget::VkShaderCache) {
+        const auto vk_cache_dir =
+            Common::FS::GetVulkanPipelineCacheDir(shader_cache_dir, program_id);
+        if (vk_cache_dir != title_cache_dir) {
+            collect_from(vk_cache_dir);
+        }
+    }
 
     if (files.empty()) {
         QtCommon::Frontend::Warning(tr("Error Removing Transferable Shader Cache"),

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -31,13 +34,26 @@ public:
     /// Does not block on the GUI thread.
     Mcp::PerfSnapshot GetPerfSnapshot() override;
     InputCommon::InputSubsystem* GetInputSubsystem() override;
+    /// Walks the game list model on the GUI thread (blocking) and returns one entry per unique
+    /// path, or nullopt if the game list widget does not exist.
+    std::optional<std::vector<Mcp::GameEntry>> ListGames() override;
+    /// Boots the game on the GUI thread (blocking). Fails if a game is already running.
+    std::string BootGame(const std::string& path) override;
     /// Pauses emulation on the GUI thread (blocking). Fails if no game is running.
     std::string Pause() override;
     /// Resumes emulation on the GUI thread (blocking). Fails if no game is running.
     std::string Resume() override;
+    /// Shuts the game down on the GUI thread (blocking), without a confirmation prompt.
+    std::string Stop() override;
+    /// Queues a stop and window close on the GUI thread and returns at once, so the reply can be
+    /// sent before the MCP server is destroyed.
+    std::string Quit() override;
     /// Applies Settings::values to the running system on the GUI thread (blocking). No-op when
     /// no game is running.
     std::string ApplySettings() override;
+    /// Switches docked/handheld mode on the GUI thread (blocking), like the status bar button but
+    /// without its warning box. Docking with handheld connected moves player 1 to Pro Controller.
+    std::string SetDocked(bool docked) override;
     /// Runs fn against the TAS driver on the GUI thread (blocking), then refreshes the TAS status
     /// label. Resets player 1's system buttons first when a game is running.
     std::string WithTas(bool require_game,

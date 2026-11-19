@@ -2415,3 +2415,48 @@ TEST_CASE("MKW buffer lookup cache follows pool replacement and virtual remaps",
     REQUIRE_FALSE(impl->ResolveBuffer(0x3fff0, 32, pool, offset));
     resolve(0x3fff0, 16, 2, 0xfff0);
 }
+
+TEST_CASE("SparsePagePool tracks stale shared pages, IsShared, and full-budget key hits",
+          "[nvn][sparse]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    Nvn::Context::Impl impl(*vulkan->device, vulkan->submit_mutex, nullptr,
+                            {.background_backing = false});
+    Nvn::SparsePagePool pool(*impl.allocator, Nvn::SparsePagePool::PageBytes);
+    const Nvn::SparseAliasKey key_a{0x1000'0000ULL, 0xABCDULL};
+    const Nvn::SparseAliasKey key_b{0x2000'0000ULL, 0xABCDULL};
+    bool reused = false;
+    const u32 page = pool.AcquireShared(key_a, ~0u, 1, reused);
+    REQUIRE(page != Nvn::SparsePagePool::NoPage);
+    CHECK_FALSE(reused);
+    CHECK(pool.IsShared(page));
+    CHECK_FALSE(pool.HasRoom());
+
+    CHECK(pool.AcquireShared(key_a, ~0u, 2, reused, false) == page);
+    CHECK(reused);
+    pool.Free(page);
+
+    CHECK(pool.AcquireShared(key_b, ~0u, 2, reused, false) == Nvn::SparsePagePool::NoPage);
+    CHECK_FALSE(reused);
+
+    pool.MarkSharedStale(page);
+    CHECK(pool.AcquireShared(key_a, ~0u, 3, reused, false) == page);
+    CHECK_FALSE(reused);
+    pool.Free(page);
+
+    pool.ClearSharedStale(page);
+    CHECK(pool.AcquireShared(key_a, ~0u, 3, reused, false) == page);
+    CHECK(reused);
+    pool.Free(page);
+
+    CHECK(pool.Allocate(~0u) == Nvn::SparsePagePool::NoPage);
+
+    pool.Free(page);
+    CHECK(pool.HasRoom());
+    const u32 priv = pool.Allocate(~0u);
+    REQUIRE(priv != Nvn::SparsePagePool::NoPage);
+    CHECK_FALSE(pool.IsShared(priv));
+    pool.Free(priv);
+}

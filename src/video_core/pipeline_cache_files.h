@@ -21,8 +21,10 @@ inline constexpr std::array<char, 8> NVN_DRIVER_CACHE_MAGIC{'N', 'V', 'N', 'V',
 inline constexpr std::string_view NVN_DRIVER_CACHE_FILE_NAME = "nvn_pipelines.vkcache";
 
 inline constexpr std::string_view MKW_EMULATED_CACHE_SUBDIR = "mkw_zero_depth_v1";
-inline constexpr std::array<std::string_view, 4> EMULATED_VULKAN_CACHE_FILES{
-    "vulkan.bin", "vulkan_mesh.bin", "vulkan_used.bin", "vulkan_pipelines.bin",
+inline constexpr std::array<std::string_view, 8> EMULATED_VULKAN_CACHE_FILES{
+    "vulkan.bin",        "vulkan_mesh.bin",        "vulkan_used.bin",        "vulkan_pipelines.bin",
+    "vulkan.mythos.bin", "vulkan_mesh.mythos.bin", "vulkan_used.mythos.bin",
+    "vulkan_pipelines.mythos.bin",
 };
 
 [[nodiscard]] constexpr bool IsNvnPipelineCacheFile(std::string_view name) {

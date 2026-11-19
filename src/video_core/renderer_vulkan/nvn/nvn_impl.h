@@ -322,6 +322,9 @@ struct Storage : std::enable_shared_from_this<Storage> {
     /// GPU origin: `sample_hash` is the guest signature taken at the first check after the last
     /// GPU write (the baseline a CPU rewrite is compared with).
     bool watch_valid{false};
+    /// GPU origin on a linear storage in a CPU-readable pool: `seq` of the last submission that
+    /// queued a write-back of the GPU's linear texels to guest memory (0: none, or settled).
+    u64 linear_writeback_seq{0};
     /// The CPU changed the bytes behind this storage at least once (checked in full from then on).
     bool dynamic{false};
     /// CPU origin: the pool's `cpu_write_gen` when a full hash last found the guest bytes unchanged
@@ -432,6 +435,9 @@ struct InFlight {
         u64 pool_offset;
         u64 size;
         u64 download_offset;
+        u64 row_bytes{0};
+        u64 row_stride{0};
+        u32 row_count{0};
     };
 
     u64 seq{};
@@ -866,6 +872,9 @@ struct Context::Impl {
     std::mutex failure_mutex; ///< Held while failure_callback runs (and while it is replaced).
     bool stopping{false};
     std::atomic<u64> completed_seq{0};
+    /// Newest submission whose GPU commands and mirror readbacks have finished (published right
+    /// before `completion_callback`, whereas `completed_seq` is published right after it).
+    std::atomic<u64> gpu_completed_seq{0};
     /// What the replay thread is doing (diagnostics only).
     std::atomic<const char*> replay_stage{"starting"};
     std::atomic<u64> replay_seq{0};
@@ -947,6 +956,14 @@ struct Context::Impl {
 
     // --- replay thread only ---
     bool mario_kart_world{};
+    /// Sparse tiles mapped to the same guest bytes share one host page (SparseBacking). On by
+    /// default for MKW where the device can alias sparse memory; EDEN_NX2_NVN_SPARSE_SHARE=0 turns
+    /// it off, =1 on for every title.
+    std::optional<bool> sparse_share_enabled;
+    bool SparseShareEnabled();
+    /// Counts SparseBacking::Prepare calls: a shared page allocated by an earlier call has its
+    /// texels earlier in the command stream.
+    u64 sparse_prepare_epoch{0};
     std::optional<bool> mkw_bc3_atlas_supported;
     bool MkwBc3AtlasSupported();
     bool mkw_coalesce_early_submit{};
@@ -1023,6 +1040,28 @@ struct Context::Impl {
     /// GPU writes against the submit-time uniform copies (nvn_uniform_snapshot.h). Replay thread
     /// only; declared before the draw contexts and streams that refer to it.
     UniformSnapshotTracker uniform_snapshots;
+    /// Uncompleted GPU buffer writes recorded on the replay thread, kept until `gpu_completed_seq`
+    /// passes their submission. When `inline_bytes` is non-empty, it holds the exact bytes copied
+    /// by `DrawContext::FlushInlineUpdates` so same-submission in-pass private uniform copies can
+    /// overlay them without breaking the render pass; when empty, the write is non-inline (or
+    /// invalidated by a CPU write / WaitEvent) and overlapping uniform draws flush on the GPU.
+    struct PendingPoolWrite {
+        u64 begin;
+        u64 end;
+        u64 seq;
+        std::vector<u8> inline_bytes;
+    };
+    std::vector<PendingPoolWrite> pending_pool_writes;
+    bool noting_inline_pool_write{false};
+    void PrunePendingPoolWrites();
+    void NoteFlushedInlinePoolWrite(u64 address, const u8* data, u64 size, u64 seq);
+    void NoteNonInlinePoolWrite(u64 address, u64 size, u64 seq);
+    void InvalidatePendingInlineBytes(u64 seq);
+    void InvalidatePendingInlineBytesOverlapping(u64 address, u64 size);
+    void ErasePendingPoolWritesForSeq(u64 seq);
+    [[nodiscard]] bool NeedsGpuFlushForUniform(u64 begin, u64 end, u64 current_seq);
+    void ApplyPendingInlineWrites(u64 base_address, u8* dst, u64 size, u64 current_seq,
+                                  std::vector<std::pair<u64, u64>>* written = nullptr) const;
     /// Draw state per NVN queue index (it persists across submissions on a queue).
     std::map<u32, std::unique_ptr<DrawContext>> draw_contexts;
     std::map<u32, QueueState> queues;
@@ -1156,9 +1195,12 @@ struct Context::Impl {
     u32 virtual_storages_logged{0};
     u64 write_clock{0};
     /// Clock the CPU-change checks are scheduled by: the present count, plus 1 per 16 ms while no
-    /// present happens (a loading screen), so checks never stall. Replay thread only.
+    /// present happens (a loading screen), so checks never stall. Every new present moves it on,
+    /// also after such a stretch moved it ahead of the present count. Replay thread only.
     u64 poll_tick{0};
     u64 poll_presents_seen{0};
+    /// `poll_tick` at the last new present: the idle ticks of the current stretch count from here.
+    u64 poll_tick_at_change{0};
     std::chrono::steady_clock::time_point poll_last_change{};
     u64 full_hash_tick{~u64{0}};
     u64 full_hash_bytes{0};
@@ -1587,6 +1629,9 @@ struct Context::Impl {
     /// the GPU wrote. Replay thread.
     void NotifyHostWriteNow(u64 address, u64 size);
     void NotifyTextureWrittenNow(u64 texture_serial);
+    /// Settles a pending GPU write-back on a linear storage once its submission has completed,
+    /// refreshing `gpu_guest_sig` and re-arming `takeover_track` against the written-back bytes.
+    bool SettleLinearWriteback(Storage& s);
     /// Looks at a CPU-sourced storage's guest bytes when its check is due (a cheap signature, no
     /// commands recorded) and sets `force_upload` when they changed. At most once per `seq`.
     void DetectGuestChange(Storage& s, u64 seq);

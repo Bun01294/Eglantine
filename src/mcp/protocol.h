@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -8,8 +11,8 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <stop_token>
 #include <string>
-#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -70,6 +73,9 @@ struct ProtocolOptions {
     std::string bearer_token;
     size_t max_body_bytes = 1 << 20;
     size_t max_sessions = 16;
+    /// Called when a session ends (DELETE or eviction), before its control lease is freed, to
+    /// stop background work it started.
+    std::function<void(const std::string& session_id)> on_session_end;
 };
 
 /// Transport-independent MCP server core: Streamable HTTP request rules, sessions, version
@@ -103,19 +109,14 @@ public:
     [[nodiscard]] static bool IsAllowedOrigin(const std::string& origin);
     /// Host header check against DNS rebinding (loopback names only).
     [[nodiscard]] static bool IsAllowedHost(const std::string& host);
-    /// Fetch Metadata check: browsers say where a request comes from in Sec-Fetch-Site, also for
-    /// plain GETs (`<img src>`) that carry no Origin. Only the page's own origin or a request the
-    /// user typed ("none") may talk to the server; other clients send no such header.
-    [[nodiscard]] static bool IsAllowedFetchSite(const std::string& site);
-    /// Compares a presented bearer token with the configured one without stopping at the first
-    /// differing byte.
-    [[nodiscard]] static bool TokenMatches(std::string_view presented, std::string_view expected);
 
 private:
     /// State kept per Mcp-Session-Id. Guarded by sessions_mutex.
     struct Session {
         std::string protocol_version;
         std::chrono::steady_clock::time_point last_used;
+        /// Requested when the session ends: input its calls are still sending stops.
+        std::stop_source stop;
     };
 
     /// Validates a POST body and session, then dispatches requests. Notifications get 202.
@@ -138,6 +139,9 @@ private:
     /// Creates a session with a random id and returns the id. Evicts the least recently used
     /// session when max_sessions is reached.
     std::string CreateSession(std::string protocol_version);
+    /// Frees the control lease if the given (ended) session holds it, so other agents are not
+    /// locked out until it expires.
+    void ReleaseLease(const std::string& session_id);
 
     const ToolRegistry& registry;
     ProtocolOptions options;

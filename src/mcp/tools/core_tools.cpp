@@ -1,9 +1,11 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // Phase 1 tools: emulator status and the event timeline.
 
-#include <mutex>
 #include <thread>
 
 #include <fmt/format.h>
@@ -22,12 +24,16 @@
 
 namespace Mcp {
 
+/// An event as JSON; log events also get their level name.
 json EventJson(const Event& e) {
-    json out{{"seq", e.seq},       {"t_ms", static_cast<double>(e.time_us) / 1000.0},
-             {"frame", e.frame},   {"kind", EventKindName(e.kind)},
-             {"source", e.source}, {"msg", e.message}};
+    json out{{"seq", e.seq},
+             {"t_ms", static_cast<double>(e.time_us) / 1000.0},
+             {"frame", e.frame},
+             {"kind", EventKindName(e.kind)},
+             {"source", e.source},
+             {"msg", e.message}};
     if (e.kind == EventKind::Log) {
-        static constexpr const char* levels[] = {"trace",   "debug", "info",
+        static constexpr const char* levels[] = {"trace", "debug", "info",
                                                  "warning", "error", "critical"};
         out["level"] = e.level < std::size(levels) ? levels[e.level] : "?";
     }
@@ -45,9 +51,8 @@ json FilterProperties() {
          {{"type", "array"},
           {"items",
            {{"type", "string"},
-            {"enum",
-             {"log", "state", "input", "mark", "ipc", "svc", "unimpl", "watch", "crash",
-              "frame"}}}},
+            {"enum", {"log", "state", "input", "mark", "ipc", "svc", "unimpl", "watch", "crash",
+                      "frame", "break"}}}},
           {"description", "Event kinds to include (default: all)."}}},
         {"min_level",
          {{"type", "string"},
@@ -60,6 +65,7 @@ json FilterProperties() {
     };
 }
 
+/// Builds a timeline query from the shared filter arguments.
 Timeline::Query ParseQuery(const json& args) {
     Timeline::Query q;
     q.since_seq = args.value("since_seq", u64{0});
@@ -71,7 +77,7 @@ Timeline::Query ParseQuery(const json& args) {
         }
     }
     if (args.contains("min_level")) {
-        static constexpr std::string_view levels[] = {"trace",   "debug", "info",
+        static constexpr std::string_view levels[] = {"trace", "debug", "info",
                                                       "warning", "error", "critical"};
         const auto name = args["min_level"].get<std::string>();
         for (int i = 0; i < static_cast<int>(std::size(levels)); ++i) {
@@ -85,6 +91,7 @@ Timeline::Query ParseQuery(const json& args) {
     return q;
 }
 
+/// FPS, speed, frame time and shader builds from the host, or null if unavailable.
 json PerfJson(ToolContext& ctx) {
     if (!ctx.host) {
         return nullptr;
@@ -103,11 +110,13 @@ u64 PresentedFrames() {
     return Core::g_nx2_present_count.load(std::memory_order_relaxed);
 }
 
-u64 WaitFrames(u64 frames, std::chrono::milliseconds timeout) {
+/// Waits until `frames` more frames are presented, the timeout or a server stop.
+/// Returns the number of frames actually presented.
+u64 WaitFrames(u64 frames, std::chrono::milliseconds timeout, std::stop_token stop) {
     const u64 start = PresentedFrames();
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (PresentedFrames() - start < frames && std::chrono::steady_clock::now() < deadline &&
-           !ServerStopping()) {
+           !ServerStopping() && !stop.stop_requested()) {
         std::this_thread::sleep_for(std::chrono::milliseconds{2});
     }
     return PresentedFrames() - start;
@@ -133,7 +142,7 @@ ToolResult Status(ToolContext& ctx, const json&) {
     out["version"] = {{"build", std::string{Common::g_build_fullname}},
                       {"rev", std::string{Common::g_scm_rev}},
                       {"branch", std::string{Common::g_scm_branch}}};
-    out["mcp"] = {{"writes_enabled", ctx.WritesAllowed()},
+    out["mcp"] = {{"writes_enabled", ctx.writes_allowed},
                   {"timeline_last_seq", ctx.timeline ? ctx.timeline->LastSeq() : 0}};
     const bool running = ctx.GameRunning();
     out["powered_on"] = running;
@@ -209,9 +218,21 @@ ToolResult Mark(ToolContext& ctx, const json& args) {
     return ToolResult::Structured(json{{"seq", seq}});
 }
 
+/// set_log_filter: applies the filter string to the global logger and stores it in the settings
+/// value. Returns the new and previous filter strings; parse errors are not reported.
+ToolResult SetLogFilter(ToolContext&, const json& args) {
+    const std::string filter_string = args.at("filter").get<std::string>();
+    const std::string previous = Settings::values.log_filter.GetValue();
+    Common::Log::Filter filter;
+    filter.ParseFilterString(filter_string);
+    Common::Log::SetGlobalFilter(filter);
+    Settings::values.log_filter.SetValue(filter_string);
+    return ToolResult::Structured(json{{"filter", filter_string}, {"previous", previous}});
+}
+
 } // namespace
 
-/// Registers status, timeline, wait_for and mark.
+/// Registers status, timeline, wait_for, mark and set_log_filter.
 void RegisterCoreTools(ToolRegistry& registry) {
     registry.Add(Tool{
         .name = "status",
@@ -224,9 +245,7 @@ void RegisterCoreTools(ToolRegistry& registry) {
     });
 
     json timeline_props = FilterProperties();
-    timeline_props["limit"] = {{"type", "integer"},
-                               {"minimum", 1},
-                               {"maximum", 2000},
+    timeline_props["limit"] = {{"type", "integer"}, {"minimum", 1}, {"maximum", 2000},
                                {"description", "Max events to return (default 200)."}};
     registry.Add(Tool{
         .name = "timeline",
@@ -244,9 +263,7 @@ void RegisterCoreTools(ToolRegistry& registry) {
     });
 
     json wait_props = FilterProperties();
-    wait_props["timeout_ms"] = {{"type", "integer"},
-                                {"minimum", 0},
-                                {"maximum", 120000},
+    wait_props["timeout_ms"] = {{"type", "integer"}, {"minimum", 0}, {"maximum", 120000},
                                 {"description", "How long to wait (default 10000)."}};
     registry.Add(Tool{
         .name = "wait_for",
@@ -254,9 +271,7 @@ void RegisterCoreTools(ToolRegistry& registry) {
         .description = "Block until a timeline event matching the filters occurs (by default only "
                        "events after this call starts), or until timeout_ms. Use this instead of "
                        "polling, e.g. wait for a log line, a crash or a state change.",
-        .input_schema = {{"type", "object"},
-                         {"properties", wait_props},
-                         {"additionalProperties", false}},
+        .input_schema = {{"type", "object"}, {"properties", wait_props}, {"additionalProperties", false}},
         .annotations = {.read_only = true},
         .handler = WaitFor,
     });
@@ -274,19 +289,43 @@ void RegisterCoreTools(ToolRegistry& registry) {
         .annotations = {.read_only = false, .idempotent = false},
         .handler = Mark,
     });
+
+    registry.Add(Tool{
+        .name = "set_log_filter",
+        .title = "Set the log filter",
+        .description = "Change which log classes/levels are emitted, using the emulator's filter "
+                       "syntax: space-separated '<Class[.Sub]>:<Level>' rules applied left to "
+                       "right, e.g. '*:Info Service.NVDRV:Debug Render.Vulkan:Warning'. Levels: "
+                       "Trace, Debug, Info, Warning, Error, Critical. Returns the previous filter.",
+        .input_schema = {{"type", "object"},
+                         {"properties", {{"filter", {{"type", "string"}, {"minLength", 1}}}}},
+                         {"required", {"filter"}},
+                         {"additionalProperties", false}},
+        .annotations = {.read_only = false, .idempotent = true},
+        .requires_control = true,
+        .handler = SetLogFilter,
+    });
 }
 
+
 void RegisterAllTools(ToolRegistry& registry) {
+    RegisterTimelineTools(registry);
+    RegisterGameStateTools(registry);
+    RegisterSettingsTools(registry);
+    RegisterTraceTools(registry);
+    RegisterTasTools(registry);
+    RegisterPerfTools(registry);
+    RegisterProcessTools(registry);
+    RegisterMemoryTools(registry);
     RegisterCoreTools(registry);
     RegisterEmulationTools(registry);
     RegisterInputTools(registry);
+    RegisterDebugTools(registry);
     RegisterControlTools(registry);
     RegisterActTools(registry);
-    RegisterTasTools(registry);
-    RegisterProcessTools(registry);
-    RegisterMemoryTools(registry);
-    RegisterSettingsTools(registry);
-    RegisterTimelineTools(registry);
+    RegisterDebuggerTools(registry);
+    RegisterArtifactTools(registry);
+    RegisterAbTestTools(registry);
 }
 
 } // namespace Mcp

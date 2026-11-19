@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -26,10 +29,16 @@ public:
     /// Returns the stats last sampled by DrainMainThread. Does not block on the main thread.
     Mcp::PerfSnapshot GetPerfSnapshot() override;
     InputCommon::InputSubsystem* GetInputSubsystem() override;
+    /// Always fails: eden-cli cannot boot another game.
+    std::string BootGame(const std::string& path) override;
     /// Pauses the system on the main thread (blocking, up to 30 seconds).
     std::string Pause() override;
     /// Resumes the system on the main thread (blocking, up to 30 seconds).
     std::string Resume() override;
+    /// Sets the quit flag and returns at once: there is no idle state, so the app exits.
+    std::string Stop() override;
+    /// Sets the quit flag and returns at once; SDL_AppIterate ends the app.
+    std::string Quit() override;
     /// Applies Settings::values on the main thread (blocking). No-op if the system is off.
     std::string ApplySettings() override;
     /// Runs fn against the TAS driver on the main thread (blocking). Resets player 1's system
@@ -51,6 +60,10 @@ public:
 
     /// Called by SDL_AppIterate on the main thread: runs queued actions, refreshes perf.
     void DrainMainThread();
+    /// Set by Stop/Quit: SDL_AppIterate ends the app.
+    [[nodiscard]] bool QuitRequested() const {
+        return quit_requested.load();
+    }
 
 private:
     /// Runs fn on the SDL main thread and waits up to 30 s for it. On timeout it returns an error,
@@ -66,4 +79,5 @@ private:
     Mcp::PerfSnapshot perf;
     /// When DrainMainThread last sampled perf (it samples at most every 500 ms).
     std::chrono::steady_clock::time_point last_perf;
+    std::atomic<bool> quit_requested{false};
 };

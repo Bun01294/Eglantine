@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -31,13 +34,14 @@ static std::optional<u16> ParsePort(const char* text) {
     return static_cast<u16>(port);
 }
 
+/// Parses the command line options into a LaunchParams.
 LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wchar_t *argv_w[]) noexcept {
     LaunchParams p{};
 
     int option_index = 0;
     static struct option long_options[] = {
         // clang-format off
-        {"debug", no_argument, 0, 'd'},
+        {"debug", optional_argument, 0, 'd'},
         {"config", required_argument, 0, 'c'},
         {"fullscreen", no_argument, 0, 'f'},
         {"help", no_argument, 0, 'h'},
@@ -46,7 +50,7 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
         {"program", optional_argument, 0, 'p'},
         {"user", required_argument, 0, 'u'},
         {"version", no_argument, 0, 'v'},
-        {"input-profile", no_argument, 0, 'i'},
+        {"input-profile", required_argument, 0, 'i'},
         {"null-render", no_argument, 0, 'n'},
         {"singlecore", no_argument, 0, 's'},
         {"filter", no_argument, 0, 'x'},
@@ -69,10 +73,21 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
     };
 
     while (optind < argc) {
-        if (int arg = getopt_long(argc, argv, "dc:fhg:m:p:u:vinsx", long_options, &option_index); arg != -1) {
+        // -d takes an optional port (-d1234); -i takes the input profile. Both read optarg but
+        // were declared without arguments, so optarg was null and they crashed.
+        if (int arg = getopt_long(argc, argv, "d::c:fhg:m:p:u:vi:nsx", long_options, &option_index); arg != -1) {
             switch (arg) {
             case 'd':
-                p.override_gdb_port = uint16_t(atoi(optarg));
+                // Without a port, the configured one is used (the config is not loaded yet).
+                p.enable_gdbstub = true;
+                if (optarg != nullptr) {
+                    if (const auto port = ParsePort(optarg)) {
+                        p.override_gdb_port = *port;
+                    } else {
+                        LOG_ERROR(Frontend, "Invalid --debug port '{}', using the configured port",
+                                  optarg);
+                    }
+                }
                 break;
             case 'c':
                 p.config_path = optarg;
@@ -225,6 +240,7 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
     return p;
 }
 
+/// Applies the parsed command line options to the log filter and settings.
 void ApplyLaunchParams(LaunchParams const& lp) noexcept {
     // apply the log_filter setting
     // the logger was initialized before and doesn't pick up the filter on its own
@@ -242,8 +258,10 @@ void ApplyLaunchParams(LaunchParams const& lp) noexcept {
     if (lp.selected_user.has_value()) {
         Settings::values.current_user = std::clamp(*lp.selected_user, 0, 7);
     }
-    if (lp.override_gdb_port.has_value()) {
+    if (lp.enable_gdbstub) {
         Settings::values.use_gdbstub = true;
+    }
+    if (lp.override_gdb_port.has_value()) {
         Settings::values.gdbstub_port = *lp.override_gdb_port;
     }
     if (lp.force_single_core) {
