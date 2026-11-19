@@ -138,11 +138,14 @@ public:
     virtual void HostTransition(Storage& storage, VkImageLayout layout) = 0;
     /// The same for several images in one barrier call; records nothing when all are in layout
     /// (the caller flushes the pending barrier itself).
-    virtual void HostTransitionMany(std::span<const std::pair<Storage*, VkImageLayout>> images) = 0;
+    virtual void HostTransitionMany(std::span<const std::pair<Storage*, VkImageLayout>> images,
+                                    bool track_writes = true) = 0;
+    virtual void HostNoteImageWrite(Storage& storage) = 0;
     virtual void HostNoteTouched(const std::shared_ptr<Storage>& storage) = 0;
     /// Creates the image and loads the guest contents on first use (outside a render pass only).
     /// False: the image could not be created (the op must be dropped).
     virtual bool HostEnsureContents(Storage& storage, bool will_overwrite) = 0;
+    virtual bool HostEnsureAttachmentContents(Storage& storage) = 0;
     /// True when HostEnsureContents(storage, false) would record commands (first upload, CPU
     /// change, overlapping writes); creates the image. Safe inside a render pass.
     virtual bool HostNeedsCommands(Storage& storage, bool will_overwrite) = 0;
@@ -216,6 +219,10 @@ public:
     /// The records after the one being replayed, to the end of its command list (lookahead only;
     /// empty when unknown).
     [[nodiscard]] virtual std::span<const u64> HostRecordsAhead() {
+        return {};
+    }
+    /// Following command lists in the current submission, sharing its descriptor snapshots.
+    [[nodiscard]] virtual std::span<const std::vector<u64>> HostFollowingLists() {
         return {};
     }
     /// Diagnostics (EDEN_NX2_NVN_DUMP_TARGETS): records a copy of one subresource of `storage`
@@ -691,6 +698,8 @@ private:
     bool MaskedColorClear(const VC::ClearColorPayload& p, VkRect2D rect, bool gated);
     bool MaskedStencilClear(const VC::ClearDepthStencilPayload& p, VkRect2D rect, bool gated);
     [[nodiscard]] RenderPassKey MakePassKey() const;
+    [[nodiscard]] std::optional<RenderPassKey> LookaheadPassKey(
+        const VC::RecordHeader* header) const;
     [[nodiscard]] bool TargetsUsable() const;
     /// True when the game bound no colour and no depth target (an attachment-less pass).
     [[nodiscard]] bool NamesNoTarget() const;
@@ -702,8 +711,14 @@ private:
     /// (PipelineCacheOptions::async_compile) and the draw may be skipped (MaySkipUnbuiltDraw);
     /// such a draw that may not be skipped waits for the compile. Null without it: it cannot be
     /// built.
+    struct PipelineLookahead {
+        u64 skip_key;
+        RenderPassKey targets;
+    };
     std::shared_ptr<GraphicsPipeline> ResolvePipeline(u32 mode, u32 element_count,
-                                                      bool& awaiting_async);
+                                                      bool& awaiting_async,
+                                                      const PipelineLookahead* lookahead = nullptr);
+    void PrefetchUpcomingGraphics(u32 current_mode, u64 current_key);
     void ApplyDynamicState(const GraphicsPipeline& pipeline);
 
     // ---- descriptors (nvn_draw_descriptors.cpp) ----
@@ -793,6 +808,14 @@ private:
     std::array<u32, 3> compute_groups{};
 
     // ---- per command buffer / pass state ----
+    // The flight owns this framebuffer and its attachments until execution completes.
+    struct {
+        VkRenderPass pass{};
+        VkFramebuffer handle{};
+        VkExtent2D extent{};
+        u32 layers{};
+        std::array<VkImageView, MAX_COLOR_TARGETS + 1> views{};
+    } last_framebuffer;
     bool pass_open{false};
     void NoteFlipTarget(const std::shared_ptr<Storage>& storage, VkImageLayout sampled_layout);
     /// Storages that flip between attachment and sampled use, with the layout they are sampled in:
@@ -949,6 +972,7 @@ private:
     };
     std::array<PipelineMemo, 8> pipeline_memo;
     u32 pipeline_memo_next{0};
+    u64 shader_generation{};
     /// The driver (c0) and handle (c2) banks of the graphics stages are rebuilt only when what
     /// they are made of changed (storage buffer table, push constants, handle tables, raw global
     /// table): the arena copy of the last build is reused by every draw of the submission until
@@ -1002,6 +1026,7 @@ private:
     std::shared_ptr<vk::DescriptorPool> set_pool;
     u32 set_pool_used{};
     const GraphicsPipeline* last_kept{nullptr};
+    const ComputePipeline* last_compute_kept{nullptr};
     /// The submission and raw global table generation whose pools were last noted as used.
     u64 raw_noted_seq{~u64{0}};
     u64 raw_noted_generation{~u64{0}};

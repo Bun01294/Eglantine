@@ -391,8 +391,8 @@ void nvnWindowSetPresentInterval(Call& c) {
     std::scoped_lock lock{c.runtime.window_mutex};
     if (const auto it = c.runtime.windows.find(window); it != c.runtime.windows.end()) {
         if (it->second.present_interval != interval) {
-            LOG_INFO(Core, "[nvn] the game sets present interval {} -> {}",
-                     it->second.present_interval, interval);
+            LOG_DEBUG(Core, "[nvn] the game sets present interval {} -> {}",
+                      it->second.present_interval, interval);
         }
         it->second.present_interval = interval;
     }

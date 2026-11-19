@@ -729,9 +729,12 @@ struct Context::Impl {
         std::atomic<u64> mirror_upload_bytes{};          ///< guest bytes copied into mirrors
         std::atomic<u64> mirror_upload_runs{};           ///< ... in this many copies
         std::atomic<u64> mirror_uploads{};               ///< UploadRange calls that copied anything
+        std::atomic<u64> staging_chunks_reused{};
         std::atomic<u64> mirror_pages_hashed{};          ///< guest pages compared with the mirror
-        std::atomic<u64> mirror_pages_trusted{};         ///< ... not compared: the tracker saw no write
-        std::atomic<u64> mirror_ranges_clean{};          ///< range uses that needed no copy
+        std::atomic<u64> mirror_pages_trusted{}; ///< ... not compared: the tracker saw no write
+        std::atomic<u64>
+            mirror_pages_gpu_owned{}; ///< ... not compared: pending GPU writes own the page
+        std::atomic<u64> mirror_ranges_clean{}; ///< range uses that needed no copy
         /// VRAM mirrors of imported pools (EDEN_NX2_NVN_POOL_MIRROR).
         std::atomic<u64> vram_mirrors{};            ///< mirrors created
         std::atomic<u64> vram_mirror_refused{};     ///< ... refused (budget, allocation, tracker)
@@ -931,12 +934,12 @@ struct Context::Impl {
     // Recycled command buffers (returned by the completion thread).
     std::mutex free_commands_mutex;
     std::vector<VkCommandBuffer> free_command_buffers;
-    // Recycled staging chunks of the standard size (returned by the completion thread): a
-    // submission otherwise creates and frees one per upload burst, a new allocation each time.
-    static constexpr u64 STAGING_CHUNK_SIZE = u64{8} << 20;
-    static constexpr size_t MAX_FREE_STAGING = 16;
-    std::mutex free_staging_mutex;
-    std::vector<vk::Buffer> free_staging;
+
+    // The completion thread returns ordinary upload buffers after their final timeline signal.
+    static constexpr u64 STAGING_CHUNK = u64{8} << 20;
+    std::mutex staging_cache_mutex;
+    std::array<vk::Buffer, 2> staging_cache;
+    [[nodiscard]] vk::Buffer AcquireStaging(u64 size);
 
     /// Usage of pool buffers: POOL_BUFFER_USAGE, plus a device address when the device has
     /// buffer device address (raw global memory).

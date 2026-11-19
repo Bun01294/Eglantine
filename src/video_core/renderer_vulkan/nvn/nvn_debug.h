@@ -290,6 +290,8 @@ struct Config {
     /// EDEN_NX2_NVN_UPLOADLOG=1: logs every texture upload with its size, format, decode kind and
     /// the time of each step (guest read, hash, fill/decode, command recording).
     bool upload_log{};
+    /// EDEN_NX2_NVN_STORAGE_CENSUS=1 logs a detailed replay-side inventory every 900 presents.
+    bool storage_census{};
     /// EDEN_NX2_NVN_ASTC_VERIFY=1: every storage decoded on the GPU is also decoded on the CPU,
     /// read back and compared (logs the mismatches; slow, one GPU wait per storage).
     bool astc_verify{};

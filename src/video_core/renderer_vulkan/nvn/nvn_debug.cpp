@@ -73,6 +73,7 @@ Config Read() {
     config.cache_log = EnvFlag("EDEN_NX2_NVN_CACHE_LOG");
     config.async_workers = static_cast<u32>(EnvNumber("EDEN_NX2_NVN_ASYNC_WORKERS", 0));
     config.upload_log = EnvFlag("EDEN_NX2_NVN_UPLOADLOG");
+    config.storage_census = EnvFlag("EDEN_NX2_NVN_STORAGE_CENSUS");
     config.astc_verify = EnvFlag("EDEN_NX2_NVN_ASTC_VERIFY");
     config.no_depth = EnvFlag("EDEN_NX2_NVN_NO_DEPTH");
     config.depth_probe = static_cast<u32>(EnvNumber("EDEN_NX2_NVN_DEPTH_PROBE", 0));

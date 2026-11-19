@@ -185,6 +185,8 @@ struct ContextOptions {
     /// (nvn_barrier_track.h; DESIGN.md "Barrier merging"). The value of EDEN_NX2_TRY_BARRIER_MERGE
     /// (0 off, 1 all, 2..4 one part: BarrierMergeMask). Unset: the switch decides.
     std::optional<u32> barrier_merge{};
+    /// Interval of the opt-in shader refresh mode (zero: every present, for headless diagnostics).
+    std::chrono::seconds shader_refresh_interval{60};
 };
 
 /// Counters for things the replay cannot do (yet) or had to work around. All monotonic.
@@ -201,6 +203,8 @@ struct ContextStats {
     u64 mirror_ranges_clean{};          ///< range uses that needed no copy
     u64 mirror_pages_hashed{};          ///< guest pages compared with what the mirror holds
     u64 mirror_pages_trusted{};         ///< ... not compared: the page tracker saw no write
+    u64 staging_chunks_reused{};
+    u64 mirror_pages_gpu_owned{};       ///< ... not compared: pending GPU writes own the page
     // Pool mirrors (EDEN_NX2_NVN_POOL_MIRROR; Context::Impl::AtomicStats vram_* for the meaning).
     u64 vram_mirrors{};
     u64 vram_mirror_refused{};

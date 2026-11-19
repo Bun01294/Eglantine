@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <tuple>
 #include <utility>
 
@@ -655,7 +656,15 @@ bool SparseBacking::Prepare(Context::Impl& impl, const Storage& s, Uploads& uplo
             result = impl.queue.BindSparse(info, *fence);
         }
         if (result == VK_SUCCESS) {
+            const auto begin = std::chrono::steady_clock::now();
             result = fence.Wait();
+            const auto wait = std::chrono::steady_clock::now() - begin;
+            if (impl.mario_kart_world && wait >= std::chrono::milliseconds{20}) {
+                LOG_INFO(Render_Vulkan,
+                         "[nvn] sparse residency fence: {:.1f} ms, {} image binds, {} opaque binds",
+                         std::chrono::duration<double, std::milli>(wait).count(), image_binds.size(),
+                         opaque_binds.size());
+            }
         }
         if (result != VK_SUCCESS) {
             LOG_ERROR(Render_Vulkan, "[nvn] sparse texture {}x{}x{}: binding {} blocks failed ({})",

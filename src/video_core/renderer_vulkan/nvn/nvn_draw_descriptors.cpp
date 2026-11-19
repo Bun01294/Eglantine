@@ -1383,11 +1383,8 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                                 }
                             }
                         } else {
-                            plan.UseImage(texture->storage, wanted, !is_image);
-                            if (is_image && binding.is_written) {
-                                plan.image_writes = true;
-                                s.contents_valid = true;
-                            }
+                            plan.UseImage(texture->storage, wanted, !is_image,
+                                          is_image && binding.is_written);
                         }
                         if (bound) {
                             if (twin) {
@@ -1936,19 +1933,18 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
             }
             if (use.sample_only) {
                 // Sampled in GENERAL only where the image is (BuildDescriptors): when loading the
-                // contents moved it out, it is sampled read-only. A sampled use never moves an
-                // image into GENERAL, which would note a GPU write it does not make.
+                // contents moved it out, it is sampled read-only.
                 if (use.layout == VK_IMAGE_LAYOUT_GENERAL &&
                     s.current_layout != VK_IMAGE_LAYOUT_GENERAL) {
                     use.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
                 }
                 if (s.current_layout == use.layout) {
-                    continue; // nothing to record, and sampling writes nothing
+                    continue;
                 }
             }
             transition_scratch.emplace_back(&s, use.layout);
         }
-        host->HostTransitionMany(transition_scratch);
+        host->HostTransitionMany(transition_scratch, false);
         for (const DrawPlan::RangeUse& use : plan.ranges) {
             if (use.pool->backing == Pool::Backing::Mirror) {
                 host->HostUploadRange(*use.pool, use.offset, use.size);
@@ -1987,6 +1983,13 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
     }
     if (plan.image_writes) {
         pass_shader_writes = true;
+        // GENERAL also permits reads. Track shader stores even when a pass stays open and
+        // the image needed no transition, so aliases see the latest contents.
+        for (const DrawPlan::ImageUse& use : plan.images) {
+            if (use.write && !use.skip) {
+                host->HostNoteImageWrite(*use.owner);
+            }
+        }
     }
     if (plan.raw_global_writes) {
         pass_buffer_writes = true;

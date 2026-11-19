@@ -12,12 +12,76 @@
 
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
+#include "common/game_presets.h"
 #include "common/logging.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
+#include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_vulkan/nvn/nvn_draw_resources.h"
 #include "video_core/renderer_vulkan/nvn/nvn_sampler_aniso.h"
 #include "video_core/sampler_overrides.h"
+
+VideoCommon::NvnCacheTransition VideoCommon::ClearShaderCachesForNvn(
+    const std::filesystem::path& title_dir, bool mario_kart_world) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const auto title_status = fs::symlink_status(title_dir, ec);
+    if (title_status.type() == fs::file_type::not_found) {
+        return NvnCacheTransition::Unchanged;
+    }
+    if (ec || !fs::is_directory(title_status)) {
+        return NvnCacheTransition::Failed;
+    }
+    std::vector<fs::path> legacy_files;
+    const auto collect = [&](const fs::path& path) {
+        if (fs::exists(path, ec)) {
+            legacy_files.push_back(path);
+        }
+        return !ec;
+    };
+    if (!collect(title_dir / "opengl.bin")) {
+        return NvnCacheTransition::Failed;
+    }
+    const auto collect_vulkan = [&](const fs::path& directory) {
+        return std::ranges::all_of(EMULATED_VULKAN_CACHE_FILES,
+                                   [&](auto name) { return collect(directory / name); });
+    };
+    if (!collect_vulkan(title_dir)) {
+        return NvnCacheTransition::Failed;
+    }
+    if (mario_kart_world) {
+        const auto subdir = title_dir / MKW_EMULATED_CACHE_SUBDIR;
+        if (fs::exists(subdir, ec)) {
+            if (fs::is_symlink(subdir, ec) || ec || !collect_vulkan(subdir)) {
+                return NvnCacheTransition::Failed;
+            }
+        } else if (ec) {
+            return NvnCacheTransition::Failed;
+        }
+    }
+    if (legacy_files.empty()) {
+        return NvnCacheTransition::Unchanged;
+    }
+    // Keep the evidence of an emulated run until every NVN cache file has been removed.
+    const auto remove_file = [&](const fs::path& path) {
+        if (!fs::is_directory(path, ec) && !ec) {
+            fs::remove(path, ec);
+            return !ec;
+        }
+        return false;
+    };
+    std::vector<fs::path> nvn_files;
+    for (fs::directory_iterator it(title_dir, ec), end; !ec && it != end; it.increment(ec)) {
+        if (IsNvnPipelineCacheFile(it->path().filename().string())) {
+            nvn_files.push_back(it->path());
+        }
+    }
+    if (ec || !std::ranges::all_of(nvn_files, remove_file) ||
+        !std::ranges::all_of(legacy_files, remove_file)) {
+        return NvnCacheTransition::Failed;
+    }
+    return NvnCacheTransition::Cleared;
+}
 
 namespace Vulkan::Nvn {
 namespace {
@@ -107,6 +171,7 @@ VkFormat DummyFormat() {
 } // namespace
 
 DrawResources::DrawResources(Context::Impl& impl_) : impl{impl_}, clears{impl_.device} {
+    shader_refresh = Settings::values.nvn_shader_refresh.GetValue();
     dummy_buffer = impl.CreateHostBuffer(DUMMY_BUFFER_SIZE, ARENA_USAGE, MemoryUsage::Upload);
     std::memset(dummy_buffer.Mapped().data(), 0, DUMMY_BUFFER_SIZE);
     dummy_buffer.Flush();
@@ -143,7 +208,8 @@ PipelineCache& DrawResources::Cache() {
     if (!cache_instance) {
         std::scoped_lock lock{cache_mutex};
         PipelineCacheOptions options;
-        options.async_compile = Settings::values.use_asynchronous_shaders.GetValue();
+        options.async_compile =
+            !shader_refresh && Settings::values.use_asynchronous_shaders.GetValue();
         options.graphics_pipeline_library = Settings::values.nvn_pipeline_library.GetValue();
         options.sync_diet = Settings::values.nvn_sync_diet.GetValue();
         options.shader_notify = impl.options.shader_notify;
@@ -167,7 +233,8 @@ void DrawResources::OpenCache(u64 title_id) {
     PipelineCacheOptions options;
     options.title_id = title_id;
     options.revision = Common::g_scm_rev;
-    options.async_compile = Settings::values.use_asynchronous_shaders.GetValue();
+    options.prefetch_graphics = title_id == Settings::MarioKartWorldProgramId && !shader_refresh;
+    options.async_compile = !shader_refresh && Settings::values.use_asynchronous_shaders.GetValue();
     options.graphics_pipeline_library = Settings::values.nvn_pipeline_library.GetValue();
     options.sync_diet = Settings::values.nvn_sync_diet.GetValue();
     options.shader_notify = impl.options.shader_notify;
@@ -184,22 +251,48 @@ void DrawResources::OpenCache(u64 title_id) {
              options.sync_diet ? "one barrier (nvn_sync_diet)"
                                : "barrier plus the render passes' two external dependencies");
     options.driver_cache_file = Settings::values.use_vulkan_driver_pipeline_cache.GetValue();
-    if (!Settings::values.use_disk_shader_cache.GetValue()) {
+    const char* const own_dir = std::getenv("EDEN_NX2_NVN_CACHE_DIR");
+    const bool isolated_cache = own_dir != nullptr && *own_dir != '\0';
+    const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
+    const auto title_dir = shader_dir / fmt::format("{:016x}", title_id);
+    const auto transition =
+        title_id != 0 && !isolated_cache
+            ? VideoCommon::ClearShaderCachesForNvn(title_dir, impl.mario_kart_world)
+            : VideoCommon::NvnCacheTransition::Unchanged;
+    if (transition == VideoCommon::NvnCacheTransition::Cleared) {
+        LOG_INFO(Render_Vulkan, "[nvn] cleared shader caches for {:016x} on the switch from "
+                                "Emulated GPU to VTX-HLE", title_id);
+    }
+    // Isolate MKW's warm-start rendering regression from the opaque NVIDIA cache while keeping
+    // the portable pipeline records available for preload.
+    if (title_id == Settings::MarioKartWorldProgramId && impl.device.IsNvidia() &&
+        options.driver_cache_file && !shader_refresh) {
+        options.driver_cache_file = false;
+        LOG_INFO(Render_Vulkan,
+                 "[nvn] Mario Kart World: start with an empty NVIDIA driver pipeline cache; "
+                 "keep the NVN pipeline records");
+    }
+    if (shader_refresh) {
+        options.driver_cache_file = false;
+        LOG_INFO(Render_Vulkan,
+                 "[nvn] periodic shader refresh on: fresh synchronous compiles every 60 seconds; "
+                 "disk caches are not read or written");
+    } else if (!Settings::values.use_disk_shader_cache.GetValue()) {
         // As on the emulated GPU (no LoadDiskResources, no cache file): nothing is read from or
         // written to the profile's shader directory; every pipeline is translated and compiled
         // when a draw first needs it.
         LOG_INFO(Render_Vulkan,
                  "[nvn] disk shader cache off (use_disk_shader_cache): pipelines are not loaded "
                  "from or saved to disk");
-    } else if (const char* own_dir = std::getenv("EDEN_NX2_NVN_CACHE_DIR");
-               own_dir != nullptr && *own_dir != '\0') {
+    } else if (transition == VideoCommon::NvnCacheTransition::Failed) {
+        LOG_ERROR(Render_Vulkan, "[nvn] could not clear {}; running with an in-memory cache",
+                  title_dir.string());
+    } else if (isolated_cache) {
         // A/B runs that must not share a profile's cache at all (the cache files of one
         // directory are pruned to a few). The cache creates the directory.
         options.directory = own_dir;
         LOG_INFO(Render_Vulkan, "[nvn] pipeline cache directory: {}", options.directory.string());
     } else {
-        const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
-        const auto title_dir = shader_dir / fmt::format("{:016x}", title_id);
         if (Common::FS::CreateDir(shader_dir) && Common::FS::CreateDir(title_dir)) {
             options.directory = title_dir;
         } else {
@@ -211,6 +304,26 @@ void DrawResources::OpenCache(u64 title_id) {
     cache_instance = std::move(cache);
 }
 DrawResources::~DrawResources() = default;
+
+void DrawResources::MaybeRefreshShaders() {
+    if (!shader_refresh || !cache_instance) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (last_shader_refresh == std::chrono::steady_clock::time_point{}) {
+        last_shader_refresh = now;
+    } else if (now - last_shader_refresh >= impl.options.shader_refresh_interval) {
+        try {
+            cache_instance->ClearShaders();
+        } catch (const std::exception& e) {
+            // A failed replacement allocation leaves the old cache usable. The present's GPU
+            // work is already submitted: do not fail its flight because a refresh failed.
+            LOG_WARNING(Render_Vulkan,
+                        "[nvn] shader cache refresh failed; keeping current shaders: {}", e.what());
+        }
+        last_shader_refresh = std::chrono::steady_clock::now();
+    }
+}
 
 void DrawResources::TracePass(u32 width, u32 height) {
     ++frame_trace.passes[{width, height}];

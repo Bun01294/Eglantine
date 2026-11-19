@@ -197,6 +197,8 @@ struct StageArtifact {
 };
 
 struct PendingKey {
+    // Set before publishing the key under pipeline_mutex.
+    bool speculative{};
     std::mutex mutex;
     std::condition_variable cv;
     std::atomic<int> outstanding{0};
@@ -313,10 +315,13 @@ struct PipelineCache::Impl {
     // --- API ----------------------------------------------------------------------------------
     /// `key_hash` receives the `GraphicsKey::hash` of the request (for the shader log hook).
     std::shared_ptr<GraphicsPipeline> GetGraphics(const GraphicsRequest& request, bool* not_ready,
-                                                  u64& key_hash);
+                                                  u64& key_hash,
+                                                  const std::function<void(u64)>& look_ahead = {},
+                                                  std::optional<u64> prefetch_skip = {});
     std::shared_ptr<ComputePipeline> GetCompute(const ComputeRequest& request, bool* not_ready);
     VkRenderPass GetRenderPass(const RenderPassKey& key);
     void Flush();
+    void ClearShaders();
     PipelineCacheStats Stats() const;
     void CollectRows(std::vector<Row>& out) const;
 
@@ -340,6 +345,7 @@ struct PipelineCache::Impl {
 
     // --- translation --------------------------------------------------------------------------
     struct TranslateInput {
+        bool speculative{};
         std::array<const StageProgram*, STAGE_COUNT> programs{};
         /// Graphics: everything the translation reads of the draw's state; null for compute.
         const TranslationState* translation{};
@@ -489,7 +495,8 @@ struct PipelineCache::Impl {
     /// EDEN_NX2_NVN_CACHE_LOG: why a pipeline is compiled at run time.
     void LogRuntimeCompile(const GraphicsKey& key, bool had_variants);
     std::shared_ptr<GraphicsPipeline> CompileGraphics(const GraphicsRequest& request,
-                                                      const GraphicsKey& key, bool had_variants);
+                                                      const GraphicsKey& key, bool had_variants,
+                                                      bool speculative = false);
     std::shared_ptr<ComputePipeline> CompileCompute(const ComputeRequest& request,
                                                     const ComputeKey& key, bool had_variants);
 
@@ -505,6 +512,7 @@ struct PipelineCache::Impl {
         std::unique_ptr<TextureOracle> oracle;
         GraphicsKey key;
         bool had_variants{};
+        bool speculative{};
         std::shared_ptr<PendingKey> pending;
     };
     struct AsyncComputeJob {
@@ -516,7 +524,7 @@ struct PipelineCache::Impl {
         std::shared_ptr<PendingKey> pending;
     };
     [[nodiscard]] bool AsyncEnabled(const bool* not_ready) const noexcept {
-        return not_ready != nullptr && async_workers != nullptr;
+        return options.async_compile && not_ready != nullptr && async_workers != nullptr;
     }
     /// Counts a "not ready" answer and logs the first few with the program hashes.
     void NoteNotReady(std::string_view what, std::span<const u64> hashes);
@@ -596,6 +604,7 @@ struct PipelineCache::Impl {
     std::filesystem::path disk_path;
     std::filesystem::path vk_cache_path;
     vk::PipelineCache vk_cache;
+    std::atomic<u64> shader_generation{};
 
     std::atomic<u64> stat_loaded{};
     mutable std::atomic<u64> logged_loaded{~u64{0}};
@@ -692,6 +701,8 @@ struct PipelineCache::Impl {
     std::unordered_map<TranslationKey, std::shared_ptr<TranslationFlight>, TranslationKeyHash,
                        TranslationKeyEqual>
         translation_flights;
+    std::atomic<u64> stat_prefetch_queued{};
+    std::atomic<u64> stat_prefetch_used{};
     std::atomic<u64> stat_gpl_fast_links{};
     std::atomic<u64> stat_gpl_cached_links{};
     std::atomic<u64> stat_gpl_reused{};

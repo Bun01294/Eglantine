@@ -36,6 +36,7 @@
 #include "video_core/nvn/state_layouts.h"
 #include "video_core/load_progress.h"
 #include "video_core/native_tensor_programs.h"
+#include "video_core/pipeline_cache_files.h"
 #include "video_core/shader_notify.h"
 #include "video_core/renderer_vulkan/nvn/nvn_pipeline_cache.h"
 #include "video_core/renderer_vulkan/nvn/nvn_pipeline_disk.h"
@@ -378,7 +379,7 @@ TEST_CASE("HashProgramStage depends on code and the hashed control bytes only", 
     const u64 base = HashOf(control, code);
     REQUIRE(base != 0);
 
-    SECTION("bytes outside 0x00..0x47 and 0x50..0x6b are ignored") {
+    SECTION("unused bytes are ignored for graphics stages") {
         auto changed = control;
         for (const size_t offset : {size_t{0x48}, size_t{0x4F}, size_t{0x6C}, size_t{0xFF}}) {
             changed[offset] ^= 0xFF;
@@ -387,6 +388,11 @@ TEST_CASE("HashProgramStage depends on code and the hashed control bytes only", 
         // The control section's length differs between containers: a longer section hashes the same
         // as long as the hashed bytes are equal.
         REQUIRE(HashOf(std::vector<u8>(control.begin(), control.begin() + 0x6C), code) == base);
+    }
+    SECTION("the register count matters") {
+        auto changed = control;
+        changed[0x4c] ^= 1;
+        REQUIRE(HashOf(changed, code) != base);
     }
     SECTION("the compute fields at +0x50..+0x6b matter") {
         // Per-warp local memory (0x50), thread group (0x58..0x63) and shared memory (0x64) change
@@ -425,6 +431,37 @@ TEST_CASE("HashProgramStage depends on code and the hashed control bytes only", 
         REQUIRE(HashOf(PatternBytes(0x31, 1), {}) != 0);
         REQUIRE(HashOf(PatternBytes(0x30, 1), code) != 0);
         REQUIRE(HashOf(PatternBytes(0x33, 1), code) != HashOf(PatternBytes(0x30, 1), code));
+    }
+}
+
+TEST_CASE("Shader cache identity includes the compute driver bank layout",
+          "[nvn][shader-refresh]") {
+    std::vector<u8> control(VC::ComputeControlBytes, 0);
+    control[0x56] = static_cast<u8>(VC::ShaderStage::Compute);
+    const std::vector<u8> code = PatternBytes(0x100, 9);
+    const u64 base = HashOf(control, code);
+    for (const size_t offset : {0xa9, 0xb1, 0xb2, 0xb3, 0xb6, 0xba, 0xbb}) {
+        INFO("control offset " << offset);
+        auto changed = control;
+        changed[offset] = 1;
+        CHECK(HashOf(changed, code) != base);
+    }
+    // A missing counts table must not poison a valid program's lowered/pipeline cache entry.
+    CHECK(HashOf(std::vector<u8>(control.begin(), control.begin() + 0x6c), code) != base);
+}
+
+TEST_CASE("Vulkan cache removal includes NVN caches and preserves other files",
+          "[nvn][shader-refresh]") {
+    for (const std::string_view name :
+         {"vulkan.bin", "vulkan_pipelines.bin", "nvn_pipelines.bin", "nvn_pipelines.vkcache",
+          "nvn_pipelines.k0123456789abcdef.bin", "nvn_pipelines.2b7551f137ab.bin"}) {
+        INFO(name);
+        CHECK(VideoCommon::IsVulkanPipelineCacheFile(name));
+    }
+    for (const std::string_view name :
+         {"opengl.bin", "nvn_pipelines.bin.backup", "nvn_pipelines_backup.bin", "unrelated.bin"}) {
+        INFO(name);
+        CHECK_FALSE(VideoCommon::IsVulkanPipelineCacheFile(name));
     }
 }
 
@@ -2206,6 +2243,82 @@ PipelineCacheOptions AsyncOptions(bool async) {
 
 } // Anonymous namespace
 
+TEST_CASE("Compute shader cache separates identical code with different bank layouts",
+          "[nvn][shader-refresh]") {
+    const auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    PipelineCache cache{*vulkan->device, {}};
+    const TestProgram plain = MakeAddProgram(5, 42);
+    TestProgram with_uniform = plain;
+    with_uniform.control[0xb1] = 1;
+    PutWord(with_uniform.control, 0xba, 0x20);
+    with_uniform.hash = HashProgramStage(with_uniform.control, with_uniform.code);
+    REQUIRE(plain.code == with_uniform.code);
+    const auto first = cache.GetCompute(MakeComputeRequest(plain, nullptr));
+    const auto second = cache.GetCompute(MakeComputeRequest(with_uniform, nullptr));
+    REQUIRE(first != nullptr);
+    REQUIRE(second != nullptr);
+    CHECK(first != second);
+    CHECK(cache.Stats().lowered_programs == 2);
+    CHECK(cache.GetCompute(MakeComputeRequest(plain, nullptr)) == first);
+}
+
+TEST_CASE("Shader refresh drops pipelines while retaining existing owners and render passes",
+          "[nvn][shader-refresh]") {
+    const auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    bool async = false;
+    SECTION("synchronous compiles") {}
+    SECTION("queued compiles are drained before refresh") {
+        async = true;
+    }
+    VideoCore::ShaderNotify notify;
+    PipelineCacheOptions options = AsyncOptions(async);
+    options.shader_notify = &notify;
+    PipelineCache cache{*vulkan->device, options};
+    const TestProgram vertex = MakeAddProgram(0, 23);
+    const TestProgram fragment = MakeTexturedFragment();
+    const TestProgram program = MakeAddProgram(5, 42);
+    FreezableOracle oracle;
+    const auto graphics_request = MakeGraphicsRequest(vertex, fragment, &oracle);
+    const auto compute_request = MakeComputeRequest(program, &oracle);
+    const auto graphics = cache.GetGraphics(graphics_request);
+    const auto compute = cache.GetCompute(compute_request);
+    REQUIRE(graphics != nullptr);
+    REQUIRE(compute != nullptr);
+    const VkPipeline graphics_handle = graphics->Handle();
+    const VkPipeline compute_handle = *compute->pipeline;
+    const VkRenderPass pass = cache.GetRenderPass(graphics_request.targets);
+    for (u64 generation = 1; generation <= 3; ++generation) {
+        if (async) {
+            const auto extra = MakeAddProgram(5, 42 + static_cast<u32>(generation));
+            bool not_ready = false;
+            static_cast<void>(cache.GetCompute(MakeComputeRequest(extra, &oracle), &not_ready));
+        }
+        cache.ClearShaders();
+        CHECK(cache.ShaderGeneration() == generation);
+        CHECK(cache.Stats().graphics_pipelines == 0);
+        CHECK(cache.Stats().compute_pipelines == 0);
+        CHECK(cache.Stats().lowered_programs == 0);
+        CHECK(notify.NumBuildingNoReport() == 0);
+        CHECK(graphics->Handle() == graphics_handle);
+        CHECK(*compute->pipeline == compute_handle);
+        CHECK(cache.GetRenderPass(graphics_request.targets) == pass);
+        const auto fresh_graphics = cache.GetGraphics(graphics_request);
+        const auto fresh_compute = cache.GetCompute(compute_request);
+        REQUIRE(fresh_graphics != nullptr);
+        REQUIRE(fresh_compute != nullptr);
+        CHECK(fresh_graphics != graphics);
+        CHECK(fresh_compute != compute);
+        CHECK(fresh_graphics->Handle() != graphics_handle);
+        CHECK(*fresh_compute->pipeline != compute_handle);
+    }
+}
+
 TEST_CASE("TextureOracle cannot be frozen unless it says so", "[nvn]") {
     const UnfreezableOracle oracle;
     REQUIRE(oracle.Freeze(0xFF) == nullptr);
@@ -2385,6 +2498,76 @@ TEST_CASE("Async compile: the shader notifier counts queued and running compiles
     cache.Flush();
     REQUIRE(notify.NumBuildingNoReport() == 0);
     REQUIRE(cache.Stats().async_queued == 2);
+}
+
+TEST_CASE("VTX-HLE clears the title shader caches once after emulated GPU use",
+          "[nvn][vtxhle][shader-cache-transition]") {
+    using namespace VideoCommon;
+    TempDirectory directory;
+    const auto title = directory.path / "0400c3f00006e000";
+    const auto other = directory.path / "other-title";
+    const auto legacy = title / MKW_EMULATED_CACHE_SUBDIR;
+    std::filesystem::create_directories(legacy);
+    std::filesystem::create_directories(other);
+    const auto portable = title / "nvn_pipelines.k1234.bin";
+    const auto driver = title / NVN_DRIVER_CACHE_FILE_NAME;
+    const auto unrelated = title / "notes.txt";
+    std::ofstream(portable) << "nvn";
+    std::ofstream(driver) << "driver";
+    std::ofstream(unrelated) << "notes";
+    std::ofstream(other / "vulkan.bin") << "other";
+    CHECK(ClearShaderCachesForNvn(title, true) == NvnCacheTransition::Unchanged);
+    CHECK(std::filesystem::exists(portable));
+    CHECK(std::filesystem::exists(driver));
+
+    for (auto name : EMULATED_VULKAN_CACHE_FILES) {
+        std::ofstream(legacy / name) << "legacy";
+    }
+    std::ofstream(title / "opengl.bin") << "gl";
+    CHECK(ClearShaderCachesForNvn(title, true) == NvnCacheTransition::Cleared);
+    CHECK_FALSE(std::filesystem::exists(portable));
+    CHECK_FALSE(std::filesystem::exists(driver));
+    CHECK_FALSE(std::filesystem::exists(title / "opengl.bin"));
+    CHECK(std::filesystem::is_empty(legacy));
+    CHECK(std::filesystem::exists(unrelated));
+    CHECK(std::filesystem::exists(other / "vulkan.bin"));
+
+    std::ofstream(portable) << "fresh NVN cache";
+    CHECK(ClearShaderCachesForNvn(title, true) == NvnCacheTransition::Unchanged);
+    CHECK(std::filesystem::exists(portable));
+    CHECK(ClearShaderCachesForNvn(directory.path / "missing", false) ==
+          NvnCacheTransition::Unchanged);
+}
+
+TEST_CASE("Graphics lookahead builds the next pipeline without skipping a draw",
+          "[nvn][pipeline-lookahead]") {
+    const auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    auto options = AsyncOptions(false);
+    options.prefetch_graphics = true;
+    PipelineCache cache{*vulkan->device, options};
+    const auto vertex = MakeAddProgram(0, 12);
+    const auto fragment = MakeTexturedFragment();
+    FreezableOracle oracle;
+    const auto first = MakeGraphicsRequest(vertex, fragment, &oracle);
+    auto next = first;
+    next.targets.color[0] = VK_FORMAT_R32_UINT;
+    REQUIRE(cache.GetGraphics(first, nullptr, [&](u64 current_key) {
+        cache.PrefetchGraphics(first, current_key);
+        cache.PrefetchGraphics(next, current_key);
+        cache.PrefetchGraphics(next, current_key);
+    }));
+    bool waiting = true;
+    REQUIRE(cache.GetGraphics(next, &waiting));
+    CHECK_FALSE(waiting);
+    cache.Flush();
+    const auto stats = cache.Stats();
+    CHECK(stats.compiled_at_runtime == 2);
+    CHECK(stats.prefetch_queued == 1);
+    CHECK(stats.prefetch_used == 1);
+    CHECK(stats.async_not_ready == 0);
 }
 
 TEST_CASE("Async compile off: nothing is counted as building", "[nvn]") {
@@ -2838,6 +3021,35 @@ GraphicsFixedState TrianglesState() {
 }
 
 } // Anonymous namespace
+
+TEST_CASE("Shader refresh rebuilds GPL shader parts and drains optimization workers",
+          "[nvn][shader-refresh]") {
+    const auto vulkan = MakeHeadlessVulkanWithGpl();
+    if (!vulkan || !vulkan->device->IsExtGraphicsPipelineLibrarySupported()) {
+        SKIP("no Vulkan device with VK_EXT_graphics_pipeline_library");
+    }
+    PipelineCache cache{*vulkan->device, GplOptions()};
+    const auto vertex = MakeAddProgram(0, 14);
+    const auto fragment = MakeTexturedFragment();
+    FreezableOracle oracle;
+    const auto request = MakeGraphicsRequest(vertex, fragment, &oracle);
+    const auto first = cache.GetGraphics(request);
+    REQUIRE(first != nullptr);
+    REQUIRE(first->fast_linked);
+    cache.ClearShaders();
+    CHECK(cache.ShaderGeneration() == 1);
+    const auto before = cache.Stats();
+    CHECK(before.graphics_pipelines == 0);
+    CHECK(before.lowered_programs == 0);
+    const auto second = cache.GetGraphics(request);
+    REQUIRE(second != nullptr);
+    REQUIRE(second->fast_linked);
+    CHECK(second != first);
+    CHECK(first->Handle() != VK_NULL_HANDLE);
+    CHECK(cache.Stats().gpl_translations_reused == before.gpl_translations_reused);
+    CHECK(cache.Stats().gpl_cached_links == before.gpl_cached_links);
+    cache.Flush();
+}
 
 TEST_CASE("TranslationState holds the state the translation reads and nothing else", "[nvn]") {
     RenderPassKey targets;

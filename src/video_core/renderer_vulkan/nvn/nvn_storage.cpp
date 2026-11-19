@@ -1241,6 +1241,21 @@ void Context::Impl::TrimStorageCache(bool at_present) {
             }
         }
     }
+    const u64 budget_target = storage_cache_budget / 10 * 9;
+    u64 target = over_budget ? budget_target : storage_cache_bytes;
+    if (trim_device_excess != 0) {
+        // The excess and a margin, so that the next pass does not find the device over at once.
+        const u64 shed = trim_device_excess + device_budget / 32;
+        target = (std::min)(target, storage_cache_bytes - (std::min)(storage_cache_bytes, shed));
+    }
+    const bool trim_for_budget = storage_cache_bytes > target;
+    const bool trim_for_age = !trim_legacy && trim_age_presents != 0;
+    const auto aged = [&](const Storage& storage) {
+        return presents >= storage.last_used_present &&
+               presents - storage.last_used_present >= trim_age_presents;
+    };
+    constexpr VkImageUsageFlags TARGET_USAGE =
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     struct Candidate {
         u64 last_used;
         StorageKey key;
@@ -1252,20 +1267,18 @@ void Context::Impl::TrimStorageCache(bool at_present) {
         if (storage.use_count() != 1 || !storage->image || storage->sparse) {
             continue;
         }
-        if (storage->origin == StorageOrigin::Gpu) {
+        const bool gpu = storage->origin == StorageOrigin::Gpu;
+        if (!trim_for_budget &&
+            (!trim_for_age || !aged(*storage) || (!gpu && (storage->usage & TARGET_USAGE) == 0))) {
+            continue;
+        }
+        if (gpu) {
             gpu_written.push_back({storage->last_used_seq, key});
         } else {
             from_guest.push_back({storage->last_used_seq, key});
         }
     }
     const auto by_age = [](const Candidate& a, const Candidate& b) { return a.last_used < b.last_used; };
-    const u64 budget_target = storage_cache_budget / 10 * 9;
-    u64 target = over_budget ? budget_target : storage_cache_bytes;
-    if (trim_device_excess != 0) {
-        // The excess and a margin, so that the next pass does not find the device over at once.
-        const u64 shed = trim_device_excess + device_budget / 32;
-        target = (std::min)(target, storage_cache_bytes - (std::min)(storage_cache_bytes, shed));
-    }
     enum class Reason { Budget, Superseded, Aged };
     const auto evict = [&](const StorageKey& key, Reason reason) {
         const auto it = storage_cache.find(key);
@@ -1347,13 +1360,7 @@ void Context::Impl::TrimStorageCache(bool at_present) {
     // Under the budget too: render targets nothing used for `trim_age_presents` that cost nothing
     // to rebuild. Ones that hold guest bytes (or nothing) upload them again; GPU-written ones go
     // only when superseded, never with texels no other storage holds.
-    if (!trim_legacy && trim_age_presents != 0) {
-        const auto aged = [&](const Storage& storage) {
-            return presents >= storage.last_used_present &&
-                   presents - storage.last_used_present >= trim_age_presents;
-        };
-        constexpr VkImageUsageFlags TARGET_USAGE =
-            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    if (trim_for_age) {
         for (const Candidate& candidate : from_guest) {
             const auto it = storage_cache.find(candidate.key);
             if (it != storage_cache.end() && (it->second->usage & TARGET_USAGE) != 0 &&

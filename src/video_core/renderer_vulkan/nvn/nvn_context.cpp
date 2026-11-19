@@ -664,10 +664,7 @@ Context::Impl::~Impl() {
     upscaler_fsr.reset();
     mirror_merge_stats = {}; // allocator-owned, like the pool buffers above
     bc_scratch.reset();
-    {
-        std::scoped_lock lock{free_staging_mutex};
-        free_staging.clear();
-    }
+    staging_cache = {};
     quad_indirect.reset();
     allocator.reset();
     command_buffer_allocations.clear();
@@ -1165,6 +1162,21 @@ VkCommandBuffer Context::Impl::AcquireCommandBuffer() {
     return command_buffer_allocations.back()[0];
 }
 
+vk::Buffer Context::Impl::AcquireStaging(u64 size) {
+    if (size == STAGING_CHUNK) {
+        std::scoped_lock lock{staging_cache_mutex};
+        for (auto& buffer : staging_cache) {
+            if (buffer) {
+                stats.staging_chunks_reused.fetch_add(1, std::memory_order_relaxed);
+                return std::move(buffer);
+            }
+        }
+    }
+    // GPU untile and ASTC decode can read the staged GOBs directly.
+    return CreateHostBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                            MemoryUsage::Upload, AllocationKind::Staging);
+}
+
 void Context::Impl::CompleteMain() {
     for (;;) {
         std::shared_ptr<InFlight> flight;
@@ -1179,6 +1191,7 @@ void Context::Impl::CompleteMain() {
             }
             flight = inflight.front();
         }
+        bool gpu_complete = false;
         // After a device loss nothing is waited for: every semaphore reports the loss at once.
         if (flight->semaphore != VK_NULL_HANDLE && !device_lost.load(std::memory_order_acquire)) {
             const VkSemaphore semaphore = flight->semaphore;
@@ -1206,6 +1219,7 @@ void Context::Impl::CompleteMain() {
                     LOG_ERROR(Render_Vulkan, "[nvn] waiting for seq {} failed: {}", flight->seq,
                               static_cast<int>(result));
                 }
+                gpu_complete = result == VK_SUCCESS;
                 break;
             }
         }
@@ -1320,13 +1334,19 @@ void Context::Impl::CompleteMain() {
             free_command_buffers.insert(free_command_buffers.end(), flight->command_buffers.begin(),
                                         flight->command_buffers.end());
         }
-        if (!flight->staging.empty()) {
-            std::scoped_lock lock{free_staging_mutex};
-            for (vk::Buffer& chunk : flight->staging) {
-                if (chunk.Mapped().size() == STAGING_CHUNK_SIZE &&
-                    free_staging.size() < MAX_FREE_STAGING) {
-                    free_staging.push_back(std::move(chunk));
+        if (gpu_complete && !flight->staging.empty() &&
+            !device_lost.load(std::memory_order_acquire)) {
+            std::scoped_lock lock{staging_cache_mutex};
+            auto free = staging_cache.begin();
+            for (auto& buffer : flight->staging) {
+                if (buffer.Mapped().size() != STAGING_CHUNK) {
+                    continue;
                 }
+                free = std::find_if(free, staging_cache.end(), [](const auto& slot) { return !slot; });
+                if (free == staging_cache.end()) {
+                    break;
+                }
+                *free++ = std::move(buffer);
             }
         }
         flight->staging.clear();
@@ -1556,6 +1576,8 @@ ContextStats Context::Stats() const {
         .mirror_ranges_clean = s.mirror_ranges_clean.load(relaxed),
         .mirror_pages_hashed = s.mirror_pages_hashed.load(relaxed),
         .mirror_pages_trusted = s.mirror_pages_trusted.load(relaxed),
+        .staging_chunks_reused = s.staging_chunks_reused.load(relaxed),
+        .mirror_pages_gpu_owned = s.mirror_pages_gpu_owned.load(relaxed),
         .vram_mirrors = s.vram_mirrors.load(relaxed),
         .vram_mirror_refused = s.vram_mirror_refused.load(relaxed),
         .vram_copy_in_runs = s.vram_copy_in_runs.load(relaxed),
@@ -1903,8 +1925,10 @@ std::string Context::DescribeMemory() const {
         std::scoped_lock lock{impl->draw_resources->cache_mutex};
         if (const auto& cache = impl->draw_resources->cache_instance) {
             const PipelineCacheStats p = cache->Stats();
-            text += fmt::format("; pipelines graphics {} compute {}, lowered programs {}",
-                                p.graphics_pipelines, p.compute_pipelines, p.lowered_programs);
+            text += fmt::format(
+                "; pipelines graphics {} compute {}, lowered programs {}, shader refreshes {}",
+                p.graphics_pipelines, p.compute_pipelines, p.lowered_programs,
+                cache->ShaderGeneration());
         }
     }
     return text;
@@ -1986,6 +2010,8 @@ std::string Context::DescribeState() const {
             " mirror(uploads/copies/MiB/clean/pages_hashed/pages_trusted)={}/{}/{}/{}/{}/{}",
             c.mirror_uploads, c.mirror_upload_runs, c.mirror_upload_bytes >> 20,
             c.mirror_ranges_clean, c.mirror_pages_hashed, c.mirror_pages_trusted);
+        text += fmt::format(" mirror_gpu_owned_pages={} staging_chunks_reused={}",
+                            c.mirror_pages_gpu_owned, c.staging_chunks_reused);
         if (impl->draw_resources) {
             const DrawCounters& draw = impl->draw_resources->counters;
             const auto breaks = [&](BreakCause cause) {
@@ -2123,6 +2149,8 @@ void Context::CollectStats(std::vector<VideoCommon::Nvn::SinkStat>& out) const {
     out.push_back({"mirror range uses that needed no copy", s.mirror_ranges_clean});
     out.push_back({"mirror guest pages compared", s.mirror_pages_hashed});
     out.push_back({"mirror guest pages trusted (no write tracked)", s.mirror_pages_trusted});
+    out.push_back({"mirror guest pages not hashed (pending GPU writes)", s.mirror_pages_gpu_owned});
+    out.push_back({"staging chunks reused", s.staging_chunks_reused});
     out.push_back({"pool mirrors (VRAM copies of imported pools)", s.vram_mirrors});
     out.push_back({"pool mirrors: refused (budget, allocation, no CPU write tracking)",
                    s.vram_mirror_refused});

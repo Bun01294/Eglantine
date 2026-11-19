@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -972,6 +973,167 @@ TEST_CASE("NVN storage shadow: a render pass writing a storage range reaches the
     }
 }
 
+TEST_CASE("Raw GPU addresses still resolve after a table rebuild", "[nvn][raw-table-rebuild]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    if (!vulkan->device->IsBufferDeviceAddressSupported() ||
+        !vulkan->device->IsShaderInt64Supported() ||
+        !vulkan->device->IsDescriptorAliasingSupported()) {
+        SKIP("raw-global memory is unsupported on this Vulkan device");
+    }
+    const bool mkw = GENERATE(false, true);
+    ShadowRig rig(*vulkan);
+    rig.context.SetTitleId(mkw ? Settings::MarioKartWorldProgramId : Settings::OcarinaOfTimeProgramId);
+    constexpr u64 source_a = POOL_VA + 128_KiB;
+    constexpr u64 source_b = POOL_VA + 256_KiB;
+    constexpr u32 first = 0x12345678;
+    constexpr u32 second = 0x87654321;
+    std::memcpy(rig.memory.Add(source_a, 64_KiB), &first, sizeof(first));
+    std::memcpy(rig.memory.Add(source_b, 64_KiB), &second, sizeof(second));
+    const auto queue_read = [&](u64 seq, u64 source, u64 destination) {
+        std::vector<u64> list;
+        BindCompute(list, PROGRAM_RAW_READ, destination, 4096);
+        PushRawAddress(list, source);
+        Push(list, VC::Op::Dispatch, VC::DispatchPayload{.x = 1, .y = 1, .z = 1});
+        PushEnd(list);
+        rig.context.Submit(MakeSubmission(seq, std::move(list), {1, PROGRAM_RAW_READ, seq + 1}));
+    };
+    rig.context.CreatePool({.serial = 2, .guest_address = source_a, .size = 64_KiB,
+                            .flags = 1 /* CPU_NO_ACCESS */});
+    queue_read(1, source_a, POOL_VA + 4096);
+    rig.context.CreatePool({.serial = 3, .guest_address = source_b, .size = 64_KiB,
+                            .flags = 1 /* CPU_NO_ACCESS */});
+    queue_read(2, source_b, POOL_VA + 8192);
+    REQUIRE(rig.context.Wait(2, 60s));
+    CHECK(WordAt(rig.data, 4096) == first);
+    CHECK(WordAt(rig.data, 8192) == second);
+    const auto stats = rig.context.Stats();
+    CHECK(stats.ops_failed == 0);
+    CHECK(stats.ops_unsupported == 0);
+    CHECK(stats.raw_global_rebuilds >= 2);
+    CHECK(stats.raw_global_ranges_dropped == 0);
+}
+
+TEST_CASE("MKW first color attachment load preserves channels outside a masked clear",
+          "[nvn][attachment-load]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    const bool cpu_visible = GENERATE(false, true);
+    FakeMemory memory;
+    u8* data = memory.Add(POOL_VA, 64_KiB);
+    u8* texture = memory.Add(TEXTURE_POOL_VA, 1_MiB);
+    std::memset(texture, 0x44, 1_MiB);
+    Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr, {});
+    context.SetTitleId(Settings::MarioKartWorldProgramId);
+    context.SetGuestMemory(&memory);
+    context.CreatePool({.serial = 1, .guest_address = POOL_VA, .size = 64_KiB,
+                        .flags = POOL_CPU_CACHED});
+    context.CreatePool({.serial = 2, .guest_address = TEXTURE_POOL_VA, .size = 1_MiB,
+                        .flags = cpu_visible ? static_cast<u32>(POOL_CPU_CACHED)
+                                             : 1u /* CPU_NO_ACCESS */});
+    context.CreateTexture({.target = 1, .format = 0x25, .width = 16, .height = 16,
+                           .depth = 1, .levels = 1, .serial = 10, .pool_serial = 2});
+    std::vector<u64> list;
+    const VC::RenderTargetRef color{.texture = {.serial = 10}};
+    Push(list, VC::Op::SetRenderTargets, VC::SetRenderTargetsPayload{1, 0},
+         {reinterpret_cast<const u8*>(&color), sizeof(color)});
+    Push(list, VC::Op::ClearColor,
+         VC::ClearColorPayload{.index = 0, .mask = 1, .color = {std::bit_cast<u32>(1.0f)}});
+    VC::CopyBufferTexturePayload readback{};
+    readback.buffer = POOL_VA;
+    readback.texture = {.serial = 10};
+    readback.region = {0, 0, 0, 16, 16, 1};
+    Push(list, VC::Op::CopyTextureToBuffer, readback);
+    PushEnd(list);
+    context.Submit(MakeSubmission(1, std::move(list), {10, 1, 2}));
+    REQUIRE(context.Wait(1, 60s));
+    CHECK(context.Stats().ops_failed == 0);
+    CHECK(context.Stats().ops_unsupported == 0);
+    const u32 expected = cpu_visible ? 0x444444FFu : 0x000000FFu;
+    for (size_t i = 0; i < 16u * 16u; ++i) {
+        REQUIRE(WordAt(data, i * sizeof(u32)) == expected);
+    }
+}
+
+TEST_CASE("MKW graphics lookahead preserves live attachments across passes and lists",
+          "[nvn][pipeline-lookahead]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    FakeMemory memory;
+    u8* data = memory.Add(POOL_VA, 64_KiB);
+    memory.Add(TEXTURE_POOL_VA, 1_MiB);
+    Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr,
+                                 {.early_submit = false});
+    context.SetTitleId(Settings::MarioKartWorldProgramId);
+    context.SetGuestMemory(&memory);
+    context.CreatePool({.serial = 1, .guest_address = POOL_VA, .size = 64_KiB,
+                        .flags = POOL_CPU_CACHED});
+    context.CreatePool({.serial = 2, .guest_address = TEXTURE_POOL_VA, .size = 1_MiB,
+                        .flags = 1 /* CPU_NO_ACCESS */});
+    VC::TextureDesc target{};
+    target.target = 1;
+    target.format = 0x25;
+    target.width = 16;
+    target.height = 16;
+    target.depth = 1;
+    target.levels = 1;
+    target.serial = 10;
+    target.pool_serial = 2;
+    context.CreateTexture(target);
+    target.format = 0x0B; // R32UI
+    target.serial = 11;
+    target.pool_offset = 64_KiB;
+    context.CreateTexture(target);
+    context.CreateProgram(MakeVertexProgram(VERTEX_PROGRAM, StoreProgram(0, 0x1337)));
+
+    const auto bind_target = [](std::vector<u64>& list, u64 serial) {
+        const VC::RenderTargetRef color{.texture = {.serial = serial}};
+        Push(list, VC::Op::SetRenderTargets, VC::SetRenderTargetsPayload{1, 0},
+             {reinterpret_cast<const u8*>(&color), sizeof(color)});
+    };
+    const auto draw = [](std::vector<u64>& list) {
+        Push(list, VC::Op::Draw, VC::DrawPayload{.mode = 4, .count = 3, .instance_count = 1});
+    };
+    std::vector<u64> first;
+    bind_target(first, 10);
+    Push(first, VC::Op::SetRasterizerDiscard, VC::EnablePayload{.enable = 1});
+    Push(first, VC::Op::BindProgram,
+         VC::BindProgramPayload{.program_serial = VERTEX_PROGRAM, .stages = 1});
+    const VC::BufferRange range{POOL_VA + 0x1000, 4096};
+    Push(first, VC::Op::BindStorageBuffers,
+         VC::BindBuffersPayload{.stage = 0, .first = 0, .count = 1},
+         {reinterpret_cast<const u8*>(&range), sizeof(range)});
+    draw(first);
+    PushEnd(first);
+    auto submission = MakeSubmission(1, std::move(first), {VERTEX_PROGRAM, 10, 11, 1, 2});
+
+    auto& next = submission.lists.emplace_back();
+    bind_target(next, 11);
+    Push(next, VC::Op::ClearColor,
+         VC::ClearColorPayload{.index = 0, .mask = 0xF, .is_integer = 1, .color = {0x1234}});
+    draw(next);
+    bind_target(next, 10);
+    draw(next);
+    VC::CopyBufferTexturePayload readback{};
+    readback.buffer = POOL_VA + 0x2000;
+    readback.texture = {.serial = 11};
+    readback.region = {0, 0, 0, 1, 1, 1};
+    Push(next, VC::Op::CopyTextureToBuffer, readback);
+    PushEnd(next);
+    context.Submit(std::move(submission));
+    REQUIRE(context.Wait(1, 60s));
+    CHECK(context.Stats().ops_failed == 0);
+    CHECK(context.Stats().ops_unsupported == 0);
+    CHECK(WordAt(data, 0x1000) == 0x1337);
+    CHECK(WordAt(data, 0x2000) == 0x1234);
+}
+
 TEST_CASE("NVN draw: vertex programs read the draw's base instance from c0[0x644]",
           "[nvn][compute]") {
     // OoT's text vertex program (f1f183d55f7989b9) indexes its glyph records with
@@ -1616,13 +1778,19 @@ TEST_CASE("NVN compute: an R32UI image view of an RGB9E5 texture takes the shade
     FakeMemory memory;
     u8* data = memory.Add(POOL_VA, 64_KiB);
     std::memset(data, 0xCD, 64_KiB);
-    memory.Add(TEXTURE_POOL_VA, 1_MiB);
+    u8* texels = memory.Add(TEXTURE_POOL_VA, 1_MiB);
+    constexpr u32 INITIAL_WORD = 0x80402010;
+    const bool partial = GENERATE(false, true);
+    if (partial) {
+        std::memcpy(texels + 3 * sizeof(u32), &INITIAL_WORD, sizeof(INITIAL_WORD));
+    }
     Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr, {});
     context.SetGuestMemory(&memory);
     context.CreatePool({.serial = 1, .guest_address = POOL_VA, .size = 64_KiB,
                         .flags = POOL_CPU_CACHED});
     context.CreatePool({.serial = 2, .guest_address = TEXTURE_POOL_VA, .size = 1_MiB,
-                        .flags = 1 /* CPU_NO_ACCESS */});
+                        .flags = partial ? static_cast<u32>(POOL_CPU_CACHED)
+                                         : 1u /* CPU_NO_ACCESS */});
     constexpr s32 NVN_FORMAT_RGB9E5F = 0x40;
     constexpr u16 NVN_FORMAT_R32UI = 0x0B;
     constexpr u32 WIDTH = 4;
@@ -1658,7 +1826,8 @@ TEST_CASE("NVN compute: an R32UI image view of an RGB9E5 texture takes the shade
     const u64 handle = IMAGE_ID;
     Push(list, VC::Op::BindImages, VC::BindHandlesPayload{.stage = 5, .first = 0, .count = 1},
          {reinterpret_cast<const u8*>(&handle), sizeof(handle)});
-    Push(list, VC::Op::Dispatch, VC::DispatchPayload{.x = WIDTH, .y = 1, .z = 1});
+    const u32 written = partial ? WIDTH - 1 : WIDTH;
+    Push(list, VC::Op::Dispatch, VC::DispatchPayload{.x = written, .y = 1, .z = 1});
     VC::CopyBufferTexturePayload copy{};
     copy.buffer = POOL_VA + 0x1000;
     copy.texture = {.serial = 10, .level = 0, .layer = 0};
@@ -1678,7 +1847,7 @@ TEST_CASE("NVN compute: an R32UI image view of an RGB9E5 texture takes the shade
     CHECK(stats.ops_unsupported == 0);
     for (u32 x = 0; x < WIDTH; ++x) {
         INFO("texel " << x);
-        CHECK(WordAt(data, 0x1000 + x * 4) == 0x88000000u + x);
+        CHECK(WordAt(data, 0x1000 + x * 4) == (x < written ? 0x88000000u + x : INITIAL_WORD));
     }
 }
 
@@ -3090,16 +3259,31 @@ TEST_CASE("NVN draw: without render targets a draw rasterizes over NVN's no-targ
 }
 
 TEST_CASE("NVN draw: unchanged dynamic state survives a masked clear",
-          "[nvn][compute][pass_state]") {
+          "[nvn][compute][pass_state][shader-refresh]") {
     auto vulkan = MakeHeadlessVulkan();
     if (!vulkan) {
         SKIP("no Vulkan device");
     }
+    bool refresh = false;
+    SECTION("masked clear in the same submission") {}
+    SECTION("shader refresh between submissions") {
+        refresh = true;
+    }
+    struct RestoreRefresh {
+        bool previous = Settings::values.nvn_shader_refresh.GetValue();
+        ~RestoreRefresh() {
+            Settings::values.nvn_shader_refresh.SetValue(previous);
+        }
+    } restore;
+    Settings::values.nvn_shader_refresh.SetValue(refresh);
     FakeMemory memory;
     u8* data = memory.Add(POOL_VA, 64_KiB);
     memory.Add(TEXTURE_POOL_VA, 1_MiB);
     Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr,
-                                 {.early_submit = false});
+                                 {.early_submit = false, .shader_refresh_interval = 0s});
+    if (refresh) {
+        context.SetTitleId(0x1234); // exercise OpenCache with refresh mode, without profile files
+    }
     context.SetGuestMemory(&memory);
     context.CreatePool(
         {.serial = 1, .guest_address = POOL_VA, .size = 64_KiB, .flags = POOL_CPU_CACHED});
@@ -3127,6 +3311,7 @@ TEST_CASE("NVN draw: unchanged dynamic state survives a masked clear",
     Push(list, VC::Op::BindProgram,
          VC::BindProgramPayload{.program_serial = VERTEX_PROGRAM, .stages = 1u << 0});
     Push(list, VC::Op::SetPointSize, VC::F32Payload{.value = 1.0f});
+    u64 seq = 0;
     for (u32 draw = 0; draw < 2; ++draw) {
         if (draw != 0) {
             VC::ClearColorPayload clear{};
@@ -3144,14 +3329,78 @@ TEST_CASE("NVN draw: unchanged dynamic state survives a masked clear",
         Push(list, VC::Op::ReportCounter,
              VC::ReportCounterPayload{.address = POOL_VA + draw * 16,
                                       .counter_type = SAMPLES_PASSED});
+        if (refresh) {
+            PushEnd(list);
+            context.Submit(MakeSubmission(++seq, std::move(list), {VERTEX_PROGRAM, 10, 1, 2}));
+            list.clear();
+            REQUIRE(context.Wait(seq, 60s));
+            CHECK(context.DescribeMemory().find("pipelines graphics 1") != std::string::npos);
+            for (u32 i = 0; i < 2; ++i) {
+                context.Present({.seq = ++seq, .queue = 0});
+            }
+            // A present's GPU completion may precede its cache maintenance on the replay thread.
+            context.Submit(MakeSubmission(++seq, {}, {}));
+            REQUIRE(context.Wait(seq, 60s));
+        }
     }
-    PushEnd(list);
-    context.Submit(MakeSubmission(1, std::move(list), {VERTEX_PROGRAM, 10, 1, 2}));
-    REQUIRE(context.Wait(1, 60s));
+    if (!refresh) {
+        PushEnd(list);
+        context.Submit(MakeSubmission(++seq, std::move(list), {VERTEX_PROGRAM, 10, 1, 2}));
+        REQUIRE(context.Wait(seq, 60s));
+    } else {
+        CHECK(context.DescribeMemory().find("shader refreshes 3") != std::string::npos);
+    }
     CHECK(context.Stats().ops_failed == 0);
     CHECK(context.Stats().ops_unsupported == 0);
     CHECK(WordAt(data, 0) == 1);
     CHECK(WordAt(data, 16) == 1);
+}
+
+TEST_CASE("Shader refresh retains queued compute pipelines until GPU completion",
+          "[nvn][compute][shader-refresh]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    struct RestoreRefresh {
+        bool previous = Settings::values.nvn_shader_refresh.GetValue();
+        ~RestoreRefresh() {
+            Settings::values.nvn_shader_refresh.SetValue(previous);
+        }
+    } restore;
+    Settings::values.nvn_shader_refresh.SetValue(true);
+    FakeMemory memory;
+    u8* data = memory.Add(POOL_VA, 64_KiB);
+    Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr,
+                                 {.early_submit = false, .shader_refresh_interval = 0s});
+    context.SetGuestMemory(&memory);
+    context.SetTitleId(0x1234);
+    context.CreatePool(
+        {.serial = 1, .guest_address = POOL_VA, .size = 64_KiB, .flags = POOL_CPU_CACHED});
+    context.CreateProgram(
+        MakeProgram(PROGRAM, FillProgramBase(0x20, 100), {.uniform = 1, .storage = 1}));
+    constexpr u32 FLIGHTS = 8;
+    constexpr u32 GROUP_COUNT = 16;
+    u64 seq = 0;
+    for (u32 flight = 0; flight < FLIGHTS; ++flight) {
+        std::vector<u64> list;
+        BindCompute(list, PROGRAM, POOL_VA + 0x1000 + flight * 0x100, GROUP_COUNT * sizeof(u32));
+        Push(list, VC::Op::Dispatch, VC::DispatchPayload{.x = GROUP_COUNT, .y = 1, .z = 1});
+        PushEnd(list);
+        context.Submit(MakeSubmission(++seq, std::move(list), {PROGRAM, 1}));
+        context.Present({.seq = ++seq, .queue = 0});
+        context.Present({.seq = ++seq, .queue = 0});
+    }
+    context.Submit(MakeSubmission(++seq, {}, {}));
+    REQUIRE(context.Wait(seq, 60s));
+    CHECK(context.DescribeMemory().find("shader refreshes 15") != std::string::npos);
+    for (u32 flight = 0; flight < FLIGHTS; ++flight) {
+        for (u32 word = 0; word < GROUP_COUNT; ++word) {
+            CHECK(WordAt(data, 0x1000 + flight * 0x100 + word * sizeof(u32)) == 100 + word);
+        }
+    }
+    CHECK(context.Stats().ops_failed == 0);
+    CHECK(context.Stats().ops_unsupported == 0);
 }
 
 TEST_CASE("NVN draw: with asynchronous shaders only the draws the emulated path may skip are "
@@ -3356,6 +3605,104 @@ TEST_CASE("NVN mirror pool: only the guest pages that changed are copied again",
     REQUIRE(stats.mirror_upload_runs == 4);
     REQUIRE(stats.mirror_pages_trusted == 0);
     REQUIRE(stats.ops_failed == 0);
+}
+
+TEST_CASE("NVN mirror pool: pending GPU pages skip hashes without losing later CPU changes",
+          "[nvn][compute][mirror][mirror-owned]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    const u64 written_bytes = GENERATE(u64{16}, u64{4096});
+    FakeMemory memory;
+    memory.tracking = false;
+    u8* data = memory.Add(POOL_VA, 64_KiB);
+    std::memset(data, 0xcd, 64_KiB);
+    constexpr u64 OUTPUT_VA = POOL_VA + 1_MiB;
+    u8* output = memory.Add(OUTPUT_VA, 4096);
+    std::atomic<bool> release{false}, entered{false};
+    std::atomic<u32> phase{};
+    Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr,
+                                 {.allow_host_import = false,
+                                  .early_submit = false,
+                                  .mirror_hash_tracked = false,
+                                  .on_queue_submit = [&] {
+                                      u32 expected = 3;
+                                      if (!phase.compare_exchange_strong(expected, 4)) {
+                                          expected = 5;
+                                          phase.compare_exchange_strong(expected, 6);
+                                      }
+                                  }});
+    struct ReleaseCompletion {
+        std::atomic<bool>& release;
+        ~ReleaseCompletion() {
+            release.store(true);
+        }
+    } unblock{release};
+    const auto await = [](const auto& ready) {
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        while (!ready()) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return false;
+            }
+            std::this_thread::sleep_for(1ms);
+        }
+        return true;
+    };
+    context.SetGuestMemory(&memory);
+    context.CreatePool(
+        {.serial = 1, .guest_address = POOL_VA, .size = 64_KiB, .flags = POOL_CPU_CACHED});
+    context.CreatePool(
+        {.serial = 2, .guest_address = OUTPUT_VA, .size = 4096, .flags = POOL_CPU_CACHED});
+    context.CreateProgram(
+        MakeProgram(PROGRAM, FillProgramBase(0x20, 100), {.uniform = 1, .storage = 1}));
+    const auto copy = [&](u64 seq) {
+        std::vector<u64> list;
+        Push(list, VC::Op::CopyBufferToBuffer,
+             VC::CopyBufferToBufferPayload{.src = STORAGE_VA, .dst = OUTPUT_VA, .size = 4096});
+        PushEnd(list);
+        context.Submit(MakeSubmission(seq, std::move(list), {1, 2}));
+    };
+    copy(1);
+    REQUIRE(context.Wait(1, 20s));
+    context.SetCompletionCallback([&](u64 seq) {
+        if (seq == 2) {
+            entered.store(true);
+            while (!release.load()) {
+                std::this_thread::sleep_for(1ms);
+            }
+        }
+    });
+    context.Submit(MakeSubmission(2, {}, {}));
+    REQUIRE(await([&] { return entered.load(); }));
+    std::vector<u64> writes;
+    BindCompute(writes, PROGRAM, STORAGE_VA, written_bytes);
+    Push(writes, VC::Op::Dispatch, VC::DispatchPayload{.x = 1, .y = 1, .z = 1});
+    PushEnd(writes);
+    phase.store(3);
+    context.Submit(MakeSubmission(3, std::move(writes), {PROGRAM, 1}));
+    REQUIRE(await([&] { return phase.load() == 4; }));
+    const u64 skipped_before = context.Stats().mirror_pages_gpu_owned;
+    const u32 pending_word = 0x12345678;
+    memory.CpuWrite(STORAGE_VA + 2048, &pending_word, sizeof(pending_word));
+    phase.store(5);
+    copy(4);
+    REQUIRE(await([&] { return phase.load() == 6; }));
+    const u64 skipped = context.Stats().mirror_pages_gpu_owned - skipped_before;
+    CHECK(skipped == (written_bytes == 4096 ? 1 : 0));
+    release.store(true);
+    REQUIRE(context.Wait(4, 20s));
+    CHECK(WordAt(output, 0) == 100);
+    CHECK(WordAt(output, 2048) == (written_bytes == 4096 ? 0xcdcdcdcdu : pending_word));
+    // After the GPU write-back ends, another CPU store must reach the mirror.
+    const u32 cpu_word = 0x87654321;
+    memory.CpuWrite(STORAGE_VA + 2048, &cpu_word, sizeof(cpu_word));
+    copy(5);
+    REQUIRE(context.Wait(5, 20s));
+    CHECK(WordAt(output, 0) == 100);
+    CHECK(WordAt(output, 2048) == cpu_word);
+    CHECK(context.Stats().ops_failed == 0);
+    CHECK(context.Stats().ops_unsupported == 0);
 }
 
 TEST_CASE("NVN mirror pool: with the page tracker only the pages written are hashed again",

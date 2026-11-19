@@ -336,6 +336,10 @@ void DrawContext::Dispatch(const VC::DispatchPayload& p) {
         skipped();
         return;
     }
+    if (last_compute_kept != compute.get()) {
+        host->HostFlight().keepalive.push_back(compute);
+        last_compute_kept = compute.get();
+    }
     // nvn_draws / nvn_draw_skip (video_core/nvn_draw_probe.h): a skipped direct dispatch is
     // recorded with zero groups below, a skipped indirect one is not recorded.
     bool probe_skip = false;

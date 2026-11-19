@@ -140,7 +140,7 @@ struct BcUploadTimes {
         u32 layers{};
         u32 levels{};
         s32 format{}; ///< NVN format of the ASTC texture
-        u64 bytes{};  ///< the stand-in's memory
+        u64 bytes{};  ///< compressed bytes copied to the destination
         const char* kind{};
     };
     vk::QueryPool pool;          ///< 2 * CAPACITY timestamps

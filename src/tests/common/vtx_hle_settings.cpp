@@ -49,14 +49,30 @@ TEST_CASE("VTX-HLE settings: settings with a reader on the HLE path are never li
           "[settings][vtxhle]") {
     // Each has a reader the VTX-HLE path reaches (see the comment in vtx_hle_settings.cpp), so
     // greying it would hide a setting that still does something.
-    for (const std::string_view key :
-         {"async_presentation", "frame_pacing_mode", "force_max_clock",
-          "use_video_framerate", "use_disk_shader_cache", "use_vulkan_driver_pipeline_cache",
-          "use_asynchronous_shaders", "dyna_state", "use_reactive_flushing",
-          "enable_buffer_history", "vram_usage_mode", "use_docked_mode",
-          "scaling_filter", "fsr_sharpening_slider", "use_vsync",
-          "max_anisotropy", "astc_recompression", "resolution_setup", "graphics_path",
-          "nvn_in_pass_queries", "nvn_pipeline_library", "nvn_sync_diet", "nvn_smart_bc"}) {
+    for (const std::string_view key : {"async_presentation",
+                                       "frame_pacing_mode",
+                                       "force_max_clock",
+                                       "use_video_framerate",
+                                       "use_disk_shader_cache",
+                                       "use_vulkan_driver_pipeline_cache",
+                                       "use_asynchronous_shaders",
+                                       "dyna_state",
+                                       "use_reactive_flushing",
+                                       "enable_buffer_history",
+                                       "vram_usage_mode",
+                                       "use_docked_mode",
+                                       "scaling_filter",
+                                       "fsr_sharpening_slider",
+                                       "use_vsync",
+                                       "max_anisotropy",
+                                       "astc_recompression",
+                                       "resolution_setup",
+                                       "graphics_path",
+                                       "nvn_in_pass_queries",
+                                       "nvn_pipeline_library",
+                                       "nvn_sync_diet",
+                                       "nvn_smart_bc",
+                                       "nvn_shader_refresh"}) {
         INFO(key);
         REQUIRE(Find(key) == nullptr);
     }
