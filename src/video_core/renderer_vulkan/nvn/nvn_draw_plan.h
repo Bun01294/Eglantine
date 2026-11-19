@@ -26,6 +26,7 @@ struct DrawPlan {
         /// Only sampled (no storage image or attachment use in the plan): an image already in the
         /// layout records nothing and is not noted as written by the GPU.
         bool sample_only{false};
+        bool write{false};
     };
     /// A buffer range the draw (or dispatch) uses. Descriptor bindings carry the index of their
     /// VkDescriptorBufferInfo (`DrawContext::scratch_buffers`), which a storage shadow patches.
@@ -117,17 +118,19 @@ struct DrawPlan {
         rescale_words.Clear();
     }
     void UseImage(const std::shared_ptr<Storage>& storage, VkImageLayout layout,
-                  bool sample_only = false) {
+                  bool sample_only = false, bool write = false) {
+        image_writes |= write;
         for (ImageUse& use : images) {
             if (use.owner == storage) {
                 if (use.layout != layout) {
                     use.layout = VK_IMAGE_LAYOUT_GENERAL;
                 }
                 use.sample_only = use.sample_only && sample_only;
+                use.write |= write;
                 return;
             }
         }
-        images.push_back({storage, layout, false, false, sample_only});
+        images.push_back({storage, layout, false, false, sample_only, write});
     }
     /// The layout the plan puts `storage` in (`fallback` when the plan does not use it).
     [[nodiscard]] VkImageLayout LayoutOf(const Storage* storage, VkImageLayout fallback) const {

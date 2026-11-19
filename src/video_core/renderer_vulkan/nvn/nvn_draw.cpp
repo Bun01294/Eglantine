@@ -12,10 +12,12 @@
 #include "common/boot_counter.h"
 #include "common/diag_request.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "shader_recompiler/stage.h"
 #include "video_core/nvn/state_layouts.h"
 #include "video_core/nvn/timestamp_mode.h"
 #include "video_core/nvn_draw_probe.h"
+#include "video_core/shader_log.h"
 #include "video_core/renderer_vulkan/nvn/nvn_barrier.h"
 #include "video_core/renderer_vulkan/nvn/nvn_draw.h"
 #include "video_core/renderer_vulkan/nvn/nvn_draw_plan.h"
@@ -136,6 +138,8 @@ void DrawContext::BeginSubmission(DrawHost& host_, const VC::Submission& submiss
     set_pool.reset();
     set_pool_used = 0;
     last_kept = nullptr;
+    last_compute_kept = nullptr;
+    last_framebuffer.handle = VK_NULL_HANDLE;
     resources.RefreshSamplerSetting();
 }
 
@@ -861,12 +865,12 @@ void DrawContext::DecideTargetScale() {
 
 namespace {
 
-AttachmentFormat FormatOf(const Device& device, const TargetBinding& target) {
+AttachmentFormat FormatOf(const Device& device, const Texture& texture,
+                          const VC::RenderTargetRef& ref) {
     AttachmentFormat result;
-    const Texture& texture = *target.texture;
     HostFormat host = texture.host;
-    if (target.ref.view.set_format) {
-        if (const auto resolved = ResolveHostFormat(device, target.ref.view.format)) {
+    if (ref.view.set_format) {
+        if (const auto resolved = ResolveHostFormat(device, ref.view.format)) {
             host = *resolved;
         }
     }
@@ -967,7 +971,7 @@ std::string DrawContext::DescribeUnusableTargets() const {
 bool DrawContext::ShapeOf(const TargetBinding& target, bool is_depth, AttachmentShape& out) {
     const Texture& texture = *target.texture;
     const Storage& storage = *texture.storage;
-    const AttachmentFormat format = FormatOf(impl.device, target);
+    const AttachmentFormat format = FormatOf(impl.device, texture, target.ref);
     const bool is_3d = storage.type == VK_IMAGE_TYPE_3D;
     if (!format.attachable || is_depth != format.depth_or_stencil ||
         (is_3d && (storage.create_flags & VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT) == 0)) {
@@ -1154,9 +1158,7 @@ bool DrawContext::BeginPass() {
             // Drawing at the guest size into an image whose twin may be the newer one.
             host->HostMakeNativeCurrent(*attachment.storage);
         }
-        // A render target is written before it is read in nearly every case: its stale guest bytes
-        // are not uploaded (this also creates the lazy image).
-        if (!host->HostEnsureContents(*attachment.storage, true)) {
+        if (!host->HostEnsureAttachmentContents(*attachment.storage)) {
             host->HostFailed("SetRenderTargets", fmt::format("no image for render target {:#x}",
                                                              attachment.texture->serial));
             return false;
@@ -1226,22 +1228,31 @@ bool DrawContext::BeginPass() {
         views[i] = attachments[i].view;
     }
     try {
-        auto framebuffer = std::make_shared<vk::Framebuffer>(device.GetLogical().CreateFramebuffer({
-            .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .renderPass = render_pass,
-            .attachmentCount = attachment_count,
-            .pAttachments = views.data(),
-            .width = extent.width,
-            .height = extent.height,
-            .layers = layers,
-        }));
+        VkFramebuffer framebuffer = last_framebuffer.handle;
+        if (!framebuffer || last_framebuffer.pass != render_pass ||
+            last_framebuffer.extent.width != extent.width ||
+            last_framebuffer.extent.height != extent.height || last_framebuffer.layers != layers ||
+            last_framebuffer.views != views) {
+            auto created = std::make_shared<vk::Framebuffer>(device.GetLogical().CreateFramebuffer({
+                .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .renderPass = render_pass,
+                .attachmentCount = attachment_count,
+                .pAttachments = views.data(),
+                .width = extent.width,
+                .height = extent.height,
+                .layers = layers,
+            }));
+            framebuffer = **created;
+            host->HostFlight().keepalive.push_back(std::move(created));
+            last_framebuffer = {render_pass, framebuffer, extent, layers, views};
+        }
         const VkRenderPassBeginInfo begin{
             .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
             .pNext = nullptr,
             .renderPass = render_pass,
-            .framebuffer = **framebuffer,
+            .framebuffer = framebuffer,
             .renderArea = {{0, 0}, extent},
             .clearValueCount = 0,
             .pClearValues = nullptr,
@@ -1250,7 +1261,6 @@ bool DrawContext::BeginPass() {
             ProfBeginPass(key, extent, layers, samples);
         }
         host->HostCmd().BeginRenderPass(begin, VK_SUBPASS_CONTENTS_INLINE);
-        host->HostFlight().keepalive.push_back(std::move(framebuffer));
     } catch (const vk::Exception& exception) {
         host->HostFailed("SetRenderTargets", fmt::format("framebuffer: {}", exception.what()));
         return false;
@@ -1985,21 +1995,75 @@ RenderPassKey DrawContext::MakePassKey() const {
     const Device& device = impl.device;
     for (u32 slot = 0; slot < color_target_count; ++slot) {
         if (color_targets[slot].texture) {
-            key.color[slot] = static_cast<s32>(FormatOf(device, color_targets[slot]).format);
+            const auto& target = color_targets[slot];
+            key.color[slot] = static_cast<s32>(FormatOf(device, *target.texture, target.ref).format);
             key.samples = static_cast<u32>(color_targets[slot].texture->storage->samples);
         }
     }
     if (depth_target.texture) {
-        key.depth = static_cast<s32>(FormatOf(device, depth_target).format);
+        key.depth = static_cast<s32>(FormatOf(device, *depth_target.texture, depth_target.ref).format);
         key.samples = static_cast<u32>(depth_target.texture->storage->samples);
     }
     return key;
 }
 
+std::optional<RenderPassKey> DrawContext::LookaheadPassKey(const VC::RecordHeader* header) const {
+    if (header->size < sizeof(*header) + sizeof(VC::SetRenderTargetsPayload)) {
+        return std::nullopt;
+    }
+    const auto* p = VC::RecordPayload<VC::SetRenderTargetsPayload>(header);
+    if (p->color_count > MAX_COLOR_TARGETS || p->has_depth > 1) {
+        return std::nullopt;
+    }
+    const u32 total = p->color_count + p->has_depth;
+    const auto refs = Array<VC::SetRenderTargetsPayload, VC::RenderTargetRef>(header, p, total);
+    if (refs.size() != total) {
+        return std::nullopt;
+    }
+    RenderPassKey key{};
+    for (u32 slot = 0; slot < total; ++slot) {
+        const auto& ref = refs[slot];
+        if (ref.texture.serial == 0) {
+            continue;
+        }
+        const auto it = impl.textures.find(ref.texture.serial);
+        if (it == impl.textures.end() || !it->second->storage) {
+            return std::nullopt;
+        }
+        const Texture& texture = *it->second;
+        const Storage& storage = *texture.storage;
+        // Replay can replace this attachment with an alias, which may not exist yet.
+        if (storage.image_failed ||
+            IsBlockView(storage.desc.format, RenderTargetFormat(texture, ref))) {
+            return std::nullopt;
+        }
+        const bool depth = slot == p->color_count;
+        const auto format = FormatOf(impl.device, texture, ref);
+        if (!format.attachable || format.depth_or_stencil != depth) {
+            return std::nullopt;
+        }
+        (depth ? key.depth : key.color[slot]) = static_cast<s32>(format.format);
+        key.samples = static_cast<u32>(storage.samples);
+    }
+    return key;
+}
+
 std::shared_ptr<GraphicsPipeline> DrawContext::ResolvePipeline(u32 mode, u32 element_count,
-                                                               bool& awaiting_async) {
+    bool& awaiting_async, const PipelineLookahead* lookahead) {
+    const u64 generation = resources.Cache().ShaderGeneration();
+    if (!lookahead && shader_generation != generation) {
+        pipeline.reset();
+        pipeline_memo = {};
+        pipeline_memo_next = 0;
+        pipeline_dirty = true;
+        bound_pipeline = VK_NULL_HANDLE;
+        bound_state.Reset();
+        last_kept = nullptr;
+        shader_generation = generation;
+    }
     const DrawOracle oracle{*this};
-    if (!pipeline_dirty && pipeline && mode == last_mode && pipeline->QueriesMatch(oracle)) {
+    if (!lookahead && !pipeline_dirty && pipeline && mode == last_mode &&
+        pipeline->QueriesMatch(oracle)) {
         ++counters.pipeline_state_reuses;
         return pipeline;
     }
@@ -2029,13 +2093,13 @@ std::shared_ptr<GraphicsPipeline> DrawContext::ResolvePipeline(u32 mode, u32 ele
                            ? static_cast<u32>(Debug::Get().depth_mode)
                            : impl.device_depth_mode.load(std::memory_order_relaxed);
     input.window_origin = impl.device_window_origin.load(std::memory_order_relaxed);
-    const RenderPassKey targets = MakePassKey();
+    const RenderPassKey targets = lookahead ? lookahead->targets : MakePassKey();
     std::array<u64, GRAPHICS_STAGE_COUNT> programs;
     for (u32 stage = 0; stage < GRAPHICS_STAGE_COUNT; ++stage) {
         programs[stage] = ((stage_mask >> stage) & 1) != 0 ? stages[stage].program_serial : 0;
     }
     size_t memo_slot = pipeline_memo.size();
-    for (size_t i = 0; i < pipeline_memo.size(); ++i) {
+    for (size_t i = 0; !lookahead && i < pipeline_memo.size(); ++i) {
         const PipelineMemo& memo = pipeline_memo[i];
         if (memo.pipeline && memo.programs == programs && memo.targets == targets &&
             std::memcmp(&memo.state, &input, sizeof(input)) == 0) {
@@ -2070,8 +2134,10 @@ std::shared_ptr<GraphicsPipeline> DrawContext::ResolvePipeline(u32 mode, u32 ele
                                  &program_it->second->code[stage]};
     }
     if (mesh ? request.stages[STAGE_MESH].hash == 0 : request.stages[0].hash == 0) {
-        host->HostUnsupported(mesh ? "DrawMeshTasks" : "Draw",
-                              mesh ? "no mesh program bound" : "no vertex program bound");
+        if (!lookahead) {
+            host->HostUnsupported(mesh ? "DrawMeshTasks" : "Draw",
+                                  mesh ? "no mesh program bound" : "no vertex program bound");
+        }
         return nullptr;
     }
     request.state = input;
@@ -2089,11 +2155,17 @@ std::shared_ptr<GraphicsPipeline> DrawContext::ResolvePipeline(u32 mode, u32 ele
     request.targets = targets;
     request.oracle = &oracle;
     request.inputs = &oracle;
+    if (lookahead) {
+        resources.Cache().PrefetchGraphics(request, lookahead->skip_key);
+        return nullptr;
+    }
     // Only a draw that may be skipped asks without waiting for a compile on a worker.
-    const bool may_skip = MaySkipUnbuiltDraw(StoresGlobalMemory(request),
+    const bool may_skip = !impl.mario_kart_world &&
+                          MaySkipUnbuiltDraw(StoresGlobalMemory(request),
                                              depth_target.texture != nullptr, element_count);
     std::shared_ptr<GraphicsPipeline> result =
-        resources.Cache().GetGraphics(request, may_skip ? &awaiting_async : nullptr);
+        resources.Cache().GetGraphics(request, may_skip ? &awaiting_async : nullptr,
+                                      [this, mode](u64 key) { PrefetchUpcomingGraphics(mode, key); });
     if (!result) {
         return nullptr;
     }
@@ -2111,6 +2183,129 @@ std::shared_ptr<GraphicsPipeline> DrawContext::ResolvePipeline(u32 mode, u32 ele
         memo.pipeline = result;
     }
     return result;
+}
+
+void DrawContext::PrefetchUpcomingGraphics(u32 current_mode, u64 current_key) {
+    auto records = host->HostRecordsAhead();
+    if (records.empty() || VideoCommon::ShaderLog::Enabled()) {
+        return;
+    }
+
+    // Reuse the same state decoding as replay. Only the binding and fixed-state commands below
+    // may run in the scan; every other command is a boundary.
+    const auto saved_fixed = fixed;
+    const auto saved_stages = stages;
+    const auto saved_handles = handle_gen;
+    const u64 saved_clock = bank_clock;
+    const bool saved_pipeline_dirty = pipeline_dirty;
+    const bool saved_layout_dirty = vertex_layout_dirty;
+    SCOPE_EXIT {
+        fixed = saved_fixed;
+        stages = saved_stages;
+        handle_gen = saved_handles;
+        bank_clock = saved_clock;
+        pipeline_dirty = saved_pipeline_dirty;
+        vertex_layout_dirty = saved_layout_dirty;
+    };
+
+    constexpr size_t MAX_COMMANDS = 192;
+    constexpr size_t MAX_DRAWS = 8;
+    size_t draws = 0;
+    u32 previous_mode = current_mode;
+    bool changed = false;
+    PipelineLookahead lookahead{current_key, MakePassKey()};
+    auto following = host->HostFollowingLists();
+    using VC::Op;
+    for (size_t i = 0; i < MAX_COMMANDS && draws < MAX_DRAWS && !records.empty(); ++i) {
+        const auto* header = reinterpret_cast<const VC::RecordHeader*>(records.data());
+        const size_t words = header->size / sizeof(u64);
+        if (header->size < sizeof(*header) || header->size % sizeof(u64) != 0 ||
+            words > records.size()) {
+            return;
+        }
+        records = records.subspan(words);
+        const size_t bytes = header->size - sizeof(*header);
+        u32 mode{};
+        switch (static_cast<Op>(header->op)) {
+        case Op::End:
+            if (following.empty()) {
+                return;
+            }
+            records = following.front();
+            following = following.subspan(1);
+            continue;
+        case Op::SetRenderTargets: {
+            const auto targets = LookaheadPassKey(header);
+            if (!targets) {
+                return;
+            }
+            changed |= lookahead.targets != *targets;
+            lookahead.targets = *targets;
+            continue;
+        }
+        case Op::BindProgram:
+        case Op::BindState:
+        case Op::BindVertexAttribs:
+        case Op::BindVertexStreams:
+        case Op::BindUniformBuffers:
+        case Op::BindTextures:
+        case Op::BindSeparateTextures:
+        case Op::BindSeparateSamplers:
+        case Op::BindImages:
+        case Op::SetPrimitiveRestart:
+        case Op::SetRasterizerDiscard:
+        case Op::SetSampleMask:
+        case Op::SetProvokingVertex:
+        case Op::SetPointSize:
+        case Op::SetDepthClamp:
+        case Op::SetAlphaRef:
+            Handle(header);
+            changed = true;
+            continue;
+        case Op::SetViewports:
+        case Op::SetScissors:
+        case Op::SetDepthRanges:
+        case Op::SetStencil:
+        case Op::SetPolygonOffset:
+        case Op::SetLineWidth:
+        case Op::SetBlendColor:
+        case Op::PushConstants:
+        case Op::BindVertexBuffers:
+        case Op::BindStorageBuffers:
+        case Op::ClearColor:
+        case Op::ClearDepthStencil:
+        case Op::Barrier:
+        case Op::SetRenderCondition:
+            continue;
+        case Op::Draw:
+            if (bytes < sizeof(VC::DrawPayload)) {
+                return;
+            }
+            mode = VC::RecordPayload<VC::DrawPayload>(header)->mode;
+            break;
+        case Op::DrawIndexed:
+            if (bytes < sizeof(VC::DrawIndexedPayload)) {
+                return;
+            }
+            mode = VC::RecordPayload<VC::DrawIndexedPayload>(header)->mode;
+            break;
+        case Op::DrawMeshTasks:
+            if (bytes < sizeof(VC::DrawMeshTasksPayload)) {
+                return;
+            }
+            mode = MESH_DRAW_MODE;
+            break;
+        default:
+            return;
+        }
+        ++draws;
+        if ((changed || mode != previous_mode) && mode != 14) {
+            bool unused = false;
+            (void)ResolvePipeline(mode, 0, unused, &lookahead);
+            changed = false;
+            previous_mode = mode;
+        }
+    }
 }
 
 void DrawContext::ApplyDynamicState(const GraphicsPipeline& active) {

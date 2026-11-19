@@ -36,6 +36,7 @@
 #include "video_core/renderer_vulkan/nvn/nvn_context.h"
 #include "video_core/renderer_vulkan/nvn/nvn_format.h"
 #include "video_core/renderer_vulkan/nvn/nvn_impl.h"
+#include "video_core/renderer_vulkan/nvn/nvn_pool_mirror.h"
 #include "video_core/renderer_vulkan/nvn/nvn_sparse.h"
 #include "video_core/renderer_vulkan/nvn/nvn_texture_layout.h"
 #include "video_core/renderer_vulkan/nvn/nvn_upload.h"
@@ -65,6 +66,24 @@ constexpr u32 NVN_FORMAT_D24S8 = 0x35;
 constexpr u32 POOL_CPU_CACHED = 4;
 constexpr u32 POOL_VIRTUAL = 0x200;
 constexpr u32 POOL_CPU_NO_ACCESS = 1;
+
+TEST_CASE("Mirror page ownership requires complete coverage of the actual page",
+          "[nvn][mirror][mirror-owned]") {
+    using Nvn::ClassifyMirrorWrites;
+    using Nvn::MirrorWriteCoverage;
+    const std::array<std::pair<u64, u64>, 2> full{{{0, 8192}, {16384, 32768}}};
+    CHECK(ClassifyMirrorWrites(0, 4096, full) == MirrorWriteCoverage::Full);
+    CHECK(ClassifyMirrorWrites(4096, 8192, full) == MirrorWriteCoverage::Full);
+    CHECK(ClassifyMirrorWrites(8192, 12288, full) == MirrorWriteCoverage::None);
+    CHECK(ClassifyMirrorWrites(4096, 12288, full) == MirrorWriteCoverage::Partial);
+    CHECK(ClassifyMirrorWrites(32768, 36864, full) == MirrorWriteCoverage::None);
+    CHECK(ClassifyMirrorWrites(8192, 8192, full) == MirrorWriteCoverage::None);
+    CHECK(ClassifyMirrorWrites(16384, 16512, full) == MirrorWriteCoverage::Full);
+    const std::array<std::pair<u64, u64>, 2> hole{{{4096, 5000}, {6000, 8192}}};
+    CHECK(ClassifyMirrorWrites(4096, 8192, hole) == MirrorWriteCoverage::Partial);
+    CHECK(ClassifyMirrorWrites(5000, 6000, hole) == MirrorWriteCoverage::None);
+    CHECK(ClassifyMirrorWrites(4096, 8192, {}) == MirrorWriteCoverage::None);
+}
 
 // --- helpers ----------------------------------------------------------------------------------
 
@@ -1997,6 +2016,14 @@ public:
         return &frame;
     }
 
+    void ReleaseFrame(Vulkan::Frame*) override {
+        ++returned;
+    }
+
+    u32 ReturnedFrames() const {
+        return returned;
+    }
+
     void PresentFrame(Vulkan::Frame*) override {
         using namespace Vulkan;
         const auto& device = *vulkan.device;
@@ -2069,9 +2096,73 @@ private:
     Vulkan::vk::RenderPass pass;
     Vulkan::vk::Buffer download;
     std::promise<std::vector<u8>> result;
+    u32 returned{};
 };
 
 } // namespace
+
+TEST_CASE("NVN present keeps the previous picture until the new source has pixels",
+          "[nvn][present-filter]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    auto target = std::make_unique<FilterReadbackTarget>(*vulkan, VK_FORMAT_R8G8B8A8_UNORM);
+    auto* readback = target.get();
+    Rig rig(*vulkan, false, POOL_CPU_CACHED, {}, {}, {}, {}, std::move(target));
+    constexpr u64 LATE_POOL = 3;
+    constexpr u64 LATE_VA = 0x3500'0000;
+    constexpr u32 WIDTH = 32;
+    constexpr u32 HEIGHT = 24;
+    rig.context.CreatePool({.serial = LATE_POOL, .guest_address = LATE_VA, .size = 64_KiB,
+                            .flags = POOL_CPU_CACHED});
+    rig.context.CreateTexture(MakeTexture(10, LATE_POOL, 0, NVN_FORMAT_RGBA8, WIDTH, HEIGHT));
+    const auto present = [&] {
+        rig.context.Present({.seq = ++rig.seq, .queue = 0, .texture_serial = 10,
+                             .present_interval = 1});
+    };
+    auto missing = readback->Next();
+    present();
+    REQUIRE(rig.context.Wait(rig.seq, 20s));
+    CHECK(readback->ReturnedFrames() == 1);
+    CHECK(missing.wait_for(0ms) == std::future_status::timeout);
+
+    const auto source = MakeStorage(NVN_FORMAT_RGBA8, WIDTH, HEIGHT, 1,
+                                    PixelFormat::A8B8G8R8_UNORM, VK_FORMAT_A8B8G8R8_UNORM_PACK32);
+    const auto rgb = Gradient(WIDTH, HEIGHT, 63);
+    const auto bytes = SwizzleLevel0(source, rgb, 4, WIDTH, HEIGHT);
+    std::memcpy(rig.memory.Add(LATE_VA, 64_KiB), bytes.data(), bytes.size());
+    auto ready = readback->Next();
+    present();
+    REQUIRE(ready.wait_for(20s) == std::future_status::ready);
+    const auto pixels = ready.get();
+    CHECK_FALSE(std::ranges::all_of(pixels, [](u8 value) { return value == 0 || value == 255; }));
+    CHECK(rig.context.Wait(rig.seq, 20s));
+    CHECK(readback->ReturnedFrames() == 1);
+}
+
+TEST_CASE("NVN completed bulk uploads reuse staging without keeping the old bytes",
+          "[nvn][staging-reuse]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    Rig rig(*vulkan, false);
+    constexpr u32 WIDTH = 32;
+    constexpr u32 HEIGHT = 24;
+    const auto source = MakeStorage(NVN_FORMAT_RGBA8, WIDTH, HEIGHT, 1,
+                                    PixelFormat::A8B8G8R8_UNORM, VK_FORMAT_A8B8G8R8_UNORM_PACK32);
+    for (const u32 index : {0u, 1u}) {
+        const u64 offset = index * 64_KiB;
+        const auto expected = Gradient(WIDTH, HEIGHT, static_cast<u8>(63 + index));
+        const auto bytes = SwizzleLevel0(source, expected, 4, WIDTH, HEIGHT);
+        std::memcpy(rig.texture_bytes + offset, bytes.data(), bytes.size());
+        rig.context.CreateTexture(
+            MakeTexture(10 + index, Rig::TEXTURE_POOL, offset, NVN_FORMAT_RGBA8, WIDTH, HEIGHT));
+        REQUIRE(rig.Read(10 + index, WIDTH, HEIGHT) == expected);
+    }
+    CHECK(rig.context.Stats().staging_chunks_reused == 1);
+}
 
 TEST_CASE("NVN window filters change actual presented pixels on every title and colour format",
           "[nvn][present-filter]") {
@@ -2262,7 +2353,9 @@ TEST_CASE("MKW window filters process a saved gameplay image at display resoluti
                      << (100.0 * static_cast<double>(changed_over_1) / static_cast<double>(count))
                      << "% pixels differ by >1 from bilinear; mean RGB delta " << mean);
             }
-            if (size.width == width && filter == ScalingFilter::NearestNeighbor) {
+            if (size.width == width &&
+                (filter == ScalingFilter::NearestNeighbor ||
+                 (filter == ScalingFilter::ScaleForce && source_format == 0x25))) {
                 u32 identity_error = 0;
                 for (size_t i = 0; i < pixels.size(); i += 4) {
                     for (size_t c = 0; c < 3; ++c) {

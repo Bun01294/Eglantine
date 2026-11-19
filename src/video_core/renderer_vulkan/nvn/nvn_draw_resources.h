@@ -367,6 +367,10 @@ struct DrawResources {
     /// Thread-safe (the stats thread calls it): rows of the cache if it exists.
     void CollectCacheRows(std::vector<PipelineCache::Row>& rows);
     std::mutex cache_mutex;
+    bool shader_refresh{};
+    std::chrono::steady_clock::time_point last_shader_refresh{};
+    /// Called at present boundaries; existing flights keep their pipelines until GPU completion.
+    void MaybeRefreshShaders();
     ClearPipelines clears;
     DrawCounters counters;
     /// Called once per present (replay thread): logs the draws skipped awaiting an asynchronous

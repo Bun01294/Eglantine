@@ -54,7 +54,6 @@ namespace {
 constexpr VkPipelineStageFlags ALL_STAGES = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
 constexpr VkAccessFlags ALL_WRITES = VK_ACCESS_MEMORY_WRITE_BIT;
 constexpr VkAccessFlags ALL_ACCESS = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-constexpr u64 STAGING_CHUNK = u64{8} << 20;
 /// Tiled uploads below this many linear bytes untile on the CPU: a few dozen microseconds there,
 /// less than a buffer allocation, a dispatch and a barrier more (switch2-recomp's GPU untile uses
 /// the same 64 KiB floor).
@@ -188,8 +187,8 @@ public:
     /// EDEN_NX2_NVN_WATCH: copies the watched range back for a log line at completion (outside a
     /// pass).
     void WatchSnapshot(std::string tag, u64 peek_address = 0, u32 size_override = 0);
-    void RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>& generated,
-                       const VideoCommon::Nvn::PresentCrop& window_crop);
+    [[nodiscard]] bool RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>& generated,
+                                     const VideoCommon::Nvn::PresentCrop& window_crop);
     /// Copies the present source into the context's scratch image in its raw (UNORM) format. On
     /// return the image is in the TRANSFER_SRC layout, or in GENERAL with a sampled view
     /// (`sampled`: the presentation passes read it).
@@ -290,10 +289,14 @@ public:
         const std::pair<Storage*, VkImageLayout> image{&storage, layout};
         PrepareImagesSpan(std::span{&image, 1}, {}, true, true);
     }
-    void HostTransitionMany(std::span<const std::pair<Storage*, VkImageLayout>> images) override {
+    void HostTransitionMany(std::span<const std::pair<Storage*, VkImageLayout>> images,
+                            bool note_writes) override {
         // Every caller flushes the pending barrier itself after the transitions (before the
         // dispatch: HostFlushBarrierBeforeDispatch), so images already in layout record nothing.
-        PrepareImagesSpan(images, {}, false, true);
+        PrepareImagesSpan(images, {}, false, true, note_writes);
+    }
+    void HostNoteImageWrite(Storage& storage) override {
+        NoteGpuWrite(storage);
     }
     void HostNoteTouched(const std::shared_ptr<Storage>& storage) override {
         NoteTouched(storage);
@@ -301,6 +304,7 @@ public:
     bool HostEnsureContents(Storage& storage, bool will_overwrite) override {
         return EnsureContents(storage, will_overwrite);
     }
+    bool HostEnsureAttachmentContents(Storage& storage) override;
     bool HostNeedsCommands(Storage& storage, bool will_overwrite) override {
         storage.last_used_seq = flight.seq;
         storage.last_used_present = impl.stats.presents.load(std::memory_order_relaxed);
@@ -324,6 +328,12 @@ public:
     std::span<const u64> HostRecordsAhead() override {
         return next_record < current_list.size() ? current_list.subspan(next_record)
                                                  : std::span<const u64>{};
+    }
+    std::span<const std::vector<u64>> HostFollowingLists() override {
+        if (lookahead_submission == nullptr) {
+            return {};
+        }
+        return std::span{lookahead_submission->lists}.subspan(lookahead_list + 1);
     }
     void HostUploadRange(Pool& pool, u64 offset, u64 size) override {
         UploadRange(pool, offset, size);
@@ -614,7 +624,7 @@ private:
     /// barrier. When none needs one: the pending barrier alone, unless `flush_if_none` is false.
     void PrepareImagesSpan(std::span<const std::pair<Storage*, VkImageLayout>> images,
                            std::span<const VkImageMemoryBarrier> extra = {},
-                           bool flush_if_none = true, bool defer = false);
+                           bool flush_if_none = true, bool defer = false, bool note_writes = true);
 
     StagingRange AllocStaging(u64 size, u64 alignment);
     void UploadRange(Pool& pool, u64 offset, u64 size);
@@ -624,10 +634,8 @@ private:
     /// pages the guest CPU wrote since the last call into untrusted ones. False: no tracking (every
     /// page is hashed, nothing is trusted).
     bool MirrorTakeCpuWrites(Pool& pool);
-    /// Whether no unfinished submission writes `page` of a mirror pool (its write-back, which the
-    /// tracker does not see, is done). `pending` caches the pool's GPU-written ranges.
-    bool MirrorPageSettled(Pool& pool, u64 page,
-                           std::optional<std::vector<std::pair<u64, u64>>>& pending);
+    /// Classify the page against the pending GPU writes sampled at the first page check.
+    MirrorWriteCoverage MirrorPageWrites(Pool& pool, u64 page, bool& pending_read);
     /// The replay wrote a pool range on the GPU (through the pool's own buffer unless
     /// `invalidate_mirror` is false: a pool mirror's write-back, after which the mirror and the
     /// guest bytes agree).
@@ -865,6 +873,7 @@ private:
     u32 early_pieces{0};
     size_t flushed_arena{0};   ///< flight.arena chunks before this index were flushed already
     size_t flushed_staging{0}; ///< the same for flight.staging
+    std::vector<std::pair<u64, u64>> mirror_pending_writes;
     std::vector<std::pair<VkBuffer, u64>> deferred_zero; ///< (buffer, offset) of 8-byte zero-fills
     const VC::Submission* lookahead_submission{};
     size_t lookahead_list{0};
@@ -1071,11 +1080,11 @@ void Recorder::NoteTouched(const std::shared_ptr<Storage>& storage) {
 
 void Recorder::PrepareImagesSpan(std::span<const std::pair<Storage*, VkImageLayout>> images,
                                  std::span<const VkImageMemoryBarrier> extra, bool flush_if_none,
-                                 bool defer) {
+                                 bool defer, bool note_writes) {
     std::vector<VkImageMemoryBarrier>& barriers = image_barriers;
     barriers.assign(extra.begin(), extra.end());
     for (const auto& [storage, layout] : images) {
-        if (track_writes && (layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL ||
+        if (note_writes && track_writes && (layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL ||
                              layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL ||
                              layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL ||
                              layout == VK_IMAGE_LAYOUT_GENERAL)) {
@@ -1148,12 +1157,8 @@ void Recorder::PrepareImagesSpan(std::span<const std::pair<Storage*, VkImageLayo
 StagingRange Recorder::AllocStaging(u64 size, u64 alignment) {
     chunk_used = (chunk_used + alignment - 1) / alignment * alignment;
     if (flight.staging.empty() || chunk_used + size > chunk_size) {
-        const u64 new_size = (std::max)(size, STAGING_CHUNK);
-        // GPU untile and ASTC decode can read the staged GOBs directly.
-        vk::Buffer chunk = impl.CreateHostBuffer(
-            new_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            MemoryUsage::Upload, AllocationKind::Staging);
-        flight.staging.push_back(std::move(chunk));
+        const u64 new_size = (std::max)(size, Context::Impl::STAGING_CHUNK);
+        flight.staging.push_back(impl.AcquireStaging(new_size));
         chunk_size = new_size;
         chunk_pointer = flight.staging.back().Mapped().data();
         chunk_used = 0;
@@ -1243,22 +1248,20 @@ bool Recorder::MirrorTakeCpuWrites(Pool& pool) {
     return true;
 }
 
-bool Recorder::MirrorPageSettled(Pool& pool, u64 page,
-                                 std::optional<std::vector<std::pair<u64, u64>>>& pending) {
-    if (!pending) {
+MirrorWriteCoverage Recorder::MirrorPageWrites(Pool& pool, u64 page, bool& pending_read) {
+    if (!pending_read) {
         // Taken before the page is hashed: the completion writes a range back before it drops it
         // from gpu_dirty, so a range missing here is in the guest bytes the hash reads.
-        pending.emplace();
+        mirror_pending_writes.clear();
         std::scoped_lock lock{pool.dirty_mutex};
         for (const Pool::Dirty& dirty : pool.gpu_dirty) {
-            pending->emplace_back(dirty.begin, dirty.end);
+            mirror_pending_writes.emplace_back(dirty.begin, dirty.end);
         }
+        pending_read = true;
     }
     const u64 begin = page * Pool::MIRROR_PAGE;
-    const u64 end = begin + Pool::MIRROR_PAGE;
-    return std::none_of(pending->begin(), pending->end(), [&](const auto& range) {
-        return range.first < end && range.second > begin;
-    });
+    const u64 end = (std::min)(begin + Pool::MIRROR_PAGE, pool.size);
+    return ClassifyMirrorWrites(begin, end, mirror_pending_writes);
 }
 
 bool Recorder::MirrorNeedsUpload(Pool& pool, u64 offset, u64 size) {
@@ -1266,12 +1269,13 @@ bool Recorder::MirrorNeedsUpload(Pool& pool, u64 offset, u64 size) {
         return false;
     }
     const bool tracked = MirrorTakeCpuWrites(pool);
-    std::optional<std::vector<std::pair<u64, u64>>> pending;
+    bool pending_read = false;
     const u32 stamp = static_cast<u32>(flight.seq) + 1;
     const u64 first = offset / Pool::MIRROR_PAGE;
     const u64 last = (std::min)(offset + size, pool.size) - 1;
     u64 hashed = 0;
     u64 trusted = 0;
+    u64 gpu_owned = 0;
     bool dirty = false;
     for (u64 index = first; index <= last / Pool::MIRROR_PAGE; ++index) {
         Pool::MirrorPage& page = pool.mirror_pages[static_cast<size_t>(index)];
@@ -1284,7 +1288,12 @@ bool Recorder::MirrorNeedsUpload(Pool& pool, u64 offset, u64 size) {
             ++trusted;
             continue;
         }
-        const bool settled = tracked && MirrorPageSettled(pool, index, pending);
+        const auto coverage = MirrorPageWrites(pool, index, pending_read);
+        if (coverage == MirrorWriteCoverage::Full) {
+            ++gpu_owned;
+            continue;
+        }
+        const bool settled = tracked && coverage == MirrorWriteCoverage::None;
         ++hashed;
         if (page.valid && page.hash == GuestPageHash(pool, index)) {
             page.checked = stamp;
@@ -1301,6 +1310,9 @@ bool Recorder::MirrorNeedsUpload(Pool& pool, u64 offset, u64 size) {
     if (trusted != 0) {
         impl.stats.mirror_pages_trusted.fetch_add(trusted, std::memory_order_relaxed);
     }
+    if (gpu_owned != 0) {
+        impl.stats.mirror_pages_gpu_owned.fetch_add(gpu_owned, std::memory_order_relaxed);
+    }
     return dirty;
 }
 
@@ -1312,12 +1324,13 @@ void Recorder::UploadRange(Pool& pool, u64 offset, u64 size) {
     // time), as runs of consecutive pages. The mirror is made equal to these pages from here on,
     // so the bookkeeping is updated now.
     const bool tracked = MirrorTakeCpuWrites(pool);
-    std::optional<std::vector<std::pair<u64, u64>>> pending;
+    bool pending_read = false;
     const u32 stamp = static_cast<u32>(flight.seq) + 1;
     const u64 first = offset / Pool::MIRROR_PAGE;
     const u64 last = (std::min)(offset + size, pool.size) - 1;
     u64 hashed = 0;
     u64 trusted = 0;
+    u64 gpu_owned = 0;
     std::vector<std::pair<u64, u64>> parts;
     for (u64 index = first; index <= last / Pool::MIRROR_PAGE; ++index) {
         Pool::MirrorPage& page = pool.mirror_pages[static_cast<size_t>(index)];
@@ -1330,7 +1343,12 @@ void Recorder::UploadRange(Pool& pool, u64 offset, u64 size) {
             ++trusted;
             continue;
         }
-        const bool settled = tracked && MirrorPageSettled(pool, index, pending);
+        const auto coverage = MirrorPageWrites(pool, index, pending_read);
+        if (coverage == MirrorWriteCoverage::Full) {
+            ++gpu_owned;
+            continue; // UploadRange would discard this whole page while the GPU owns it.
+        }
+        const bool settled = tracked && coverage == MirrorWriteCoverage::None;
         ++hashed;
         const u64 hash = GuestPageHash(pool, index);
         const bool changed = !page.valid || page.hash != hash;
@@ -1356,31 +1374,32 @@ void Recorder::UploadRange(Pool& pool, u64 offset, u64 size) {
     if (trusted != 0) {
         impl.stats.mirror_pages_trusted.fetch_add(trusted, std::memory_order_relaxed);
     }
+    if (gpu_owned != 0) {
+        impl.stats.mirror_pages_gpu_owned.fetch_add(gpu_owned, std::memory_order_relaxed);
+    }
     if (parts.empty()) {
         impl.stats.mirror_ranges_clean.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    // The GPU's version is newer than the guest's wherever an unfinished submission wrote.
-    {
-        std::scoped_lock lock{pool.dirty_mutex};
-        for (const Pool::Dirty& dirty : pool.gpu_dirty) {
-            std::vector<std::pair<u64, u64>> next;
-            for (const auto& [begin, end] : parts) {
-                if (dirty.end <= begin || dirty.begin >= end) {
-                    next.emplace_back(begin, end);
-                    continue;
-                }
-                if (dirty.begin > begin) {
-                    next.emplace_back(begin, dirty.begin);
-                }
-                if (dirty.end < end) {
-                    next.emplace_back(dirty.end, end);
-                }
+    // Keep the same ownership snapshot for the hashes and copies. Completion can remove a range
+    // after the snapshot, but those bytes already have the GPU's value in the mirror.
+    for (const auto& [dirty_begin, dirty_end] : mirror_pending_writes) {
+        std::vector<std::pair<u64, u64>> next;
+        for (const auto& [begin, end] : parts) {
+            if (dirty_end <= begin || dirty_begin >= end) {
+                next.emplace_back(begin, end);
+                continue;
             }
-            parts = std::move(next);
-            if (parts.empty()) {
-                return;
+            if (dirty_begin > begin) {
+                next.emplace_back(begin, dirty_begin);
             }
+            if (dirty_end < end) {
+                next.emplace_back(dirty_end, end);
+            }
+        }
+        parts = std::move(next);
+        if (parts.empty()) {
+            return;
         }
     }
     u64 copied = 0;
@@ -1438,7 +1457,7 @@ void Recorder::NotePoolWrite(Pool& pool, u64 offset, u64 size, bool invalidate_m
             pool.gpu_dirty.push_back({offset, offset + size, flight.seq});
         }
         // The write-back (and a report's timestamp) reaches the guest bytes untracked: the pages
-        // are hashed again once it is done (MirrorPageSettled).
+        // are hashed again once it is done (MirrorPageWrites).
         if (size != 0 && offset < pool.size) {
             const u64 end = (std::min)(offset + size, pool.size);
             for (u64 page = offset / Pool::MIRROR_PAGE; page * Pool::MIRROR_PAGE < end; ++page) {
@@ -1764,6 +1783,38 @@ bool LegacyFirstUpload() {
 }
 
 } // Anonymous namespace
+
+bool Recorder::HostEnsureAttachmentContents(Storage& s) {
+    const bool fresh_color = impl.mario_kart_world && !s.contents_valid && !s.scale_owner &&
+                             !s.sparse && s.aspect == VK_IMAGE_ASPECT_COLOR_BIT &&
+                             (s.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0;
+    if (!EnsureContents(s, true)) {
+        return false;
+    }
+    if (!fresh_color) {
+        return true;
+    }
+    const auto block = FormatBlockInfo(s.desc.format);
+    if (block.width != 1 || block.height != 1) {
+        return true;
+    }
+    // The render pass loads the attachment. Preserve available guest contents and copy any newer
+    // GPU aliases over them. A fresh GPU-only image needs defined pixels under a partial draw.
+    if (CpuReadablePoolOf(impl, s) != nullptr) {
+        UploadStorage(s);
+    }
+    if (s.origin == StorageOrigin::None) {
+        const bool saved = std::exchange(track_writes, false);
+        PrepareImages({{&s, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
+        track_writes = saved;
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0,
+                                            VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+        Cmd().ClearColorImage(*s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, {}, range);
+        barrier_pending = true;
+    }
+    ResolveOverlaps(s);
+    return true;
+}
 
 void Recorder::NoteGpuWrite(Storage& s) {
     if (Storage* const owner = s.scale_owner) {
@@ -2617,7 +2668,6 @@ bool Recorder::RecordBcUpload(Storage& s, std::span<const BcChunk> chunks, bool 
             .layers = s.layers,
             .levels = s.levels,
             .format = s.desc.format,
-            .bytes = s.vram_bytes,
             .kind = AstcStandinName(kind),
         });
         Cmd().WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *times->pool, query);
@@ -2701,6 +2751,9 @@ bool Recorder::RecordBcUpload(Storage& s, std::span<const BcChunk> chunks, bool 
         };
         Cmd().CopyBufferToImage(*scratch->blocks, *s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                 region);
+        if (times) {
+            times->uploads[query / 2].bytes += blocks_size;
+        }
         recorded = true;
     }
     if (times) {
@@ -5282,7 +5335,11 @@ bool Recorder::RecordWindowFilter(Texture& texture, VkFormat source_format, cons
     Storage& source = *texture.storage;
     using Settings::ScalingFilter;
     const auto filter = Settings::values.scaling_filter.GetValue();
-    if (filter == ScalingFilter::NearestNeighbor || filter == ScalingFilter::Bilinear ||
+    // ScaleForce shifts sampling positions even at native size. Use the plain blit when it
+    // preserves the source bits without an intermediate sRGB-to-UNORM copy.
+    const bool native_size = crop.width == picture.width && crop.height == picture.height;
+    if ((filter == ScalingFilter::ScaleForce && native_size && source_format == source.host.format) ||
+        filter == ScalingFilter::NearestNeighbor || filter == ScalingFilter::Bilinear ||
         !frame.framebuffer || source.type != VK_IMAGE_TYPE_2D ||
         !impl.device.IsFormatSupported(source_format,
                                        VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT,
@@ -5445,7 +5502,7 @@ GpuProf::Tag Recorder::ProfTexture(GpuProf::Kind kind, u64 serial, u32 count) co
     return tag;
 }
 
-void Recorder::RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>& generated,
+bool Recorder::RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>& generated,
                              const VideoCommon::Nvn::PresentCrop& window_crop) {
     VideoCommon::NvnDrawProbe::OnPresent();
     if (impl.vtxcov_diag) {
@@ -5481,11 +5538,20 @@ void Recorder::RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>
     const bool image_ready = twin_only || EnsureContents(guest, false, true);
     Storage& s = image_ready ? PresentSource(guest) : guest;
     const Rescale::Factor present_scale = &s != &guest ? impl.RescaleFactor() : Rescale::Factor{};
-    const bool blittable =
-        image_ready && s.samples == VK_SAMPLE_COUNT_1_BIT && !s.host.depth && !s.host.stencil;
-    if (!blittable) {
-        Unsupported("Present", image_ready ? "multisampled or depth/stencil source"
-                                           : "the source image could not be created");
+    if (!image_ready || !s.image) {
+        Unsupported("Present", "the source image could not be created");
+        return false;
+    }
+    if (s.samples != VK_SAMPLE_COUNT_1_BIT || s.host.depth || s.host.stencil) {
+        Unsupported("Present", "multisampled or depth/stencil source");
+        return false;
+    }
+    if (!s.sparse && s.origin == StorageOrigin::None) {
+        // A failed initial upload can leave an allocated image with no pixels. Try the upload
+        // again on the next use, and leave the last complete picture on screen in the meantime.
+        s.contents_valid = false;
+        Unsupported("Present", "the source image has no contents");
+        return false;
     }
     const VkImageMemoryBarrier frame_in{
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -5545,17 +5611,14 @@ void Recorder::RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>
     const VkFormat filter_format = raw_copy ? raw_format : texture_format;
     const auto filter_twin = &s != &guest ? impl.ScaledTextureOf(texture) : nullptr;
     Texture& filter_texture = filter_twin ? *filter_twin : texture;
-    if (blittable &&
-        RecordWindowFilter(filter_texture, filter_format, frame, crop_rect, picture_rect)) {
+    if (RecordWindowFilter(filter_texture, filter_format, frame, crop_rect, picture_rect)) {
         through_passes = true;
         picture_source = *s.image;
         picture_layout = VK_IMAGE_LAYOUT_GENERAL;
         frame.source_encoding = PresentEncoding(texture_format);
     }
-    if (blittable) {
-        WarnUnsupportedPresentPasses(through_passes);
-    }
-    if (blittable && !through_passes) {
+    WarnUnsupportedPresentPasses(through_passes);
+    if (!through_passes) {
         // The game renders to an sRGB texture, whose raw bytes are already encoded. A blit reads
         // an sRGB source as linear and writes the (UNORM) frame as is, which darkens the picture:
         // blit from a UNORM copy of the bytes instead. A texture can also be a different
@@ -5627,8 +5690,6 @@ void Recorder::RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>
         Cmd().BlitImage(source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, *frame.image,
                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, blit, present_filter);
         picture_source = source;
-    } else if (!blittable) {
-        Cmd().PipelineBarrier(ALL_STAGES, ALL_STAGES, 0, frame_in);
     }
     // The present manager expects the frame image in GENERAL.
     const VkImageMemoryBarrier frame_out{
@@ -5894,6 +5955,7 @@ void Recorder::RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>
             }
         }
     }
+    return true;
 }
 
 Recorder::PictureReadback Recorder::CreatePictureReadback(const Frame& frame, u32 width,
@@ -6430,7 +6492,7 @@ void Context::Impl::ProcessSubmit(CmdSubmit&& submit) {
 
 void Context::Impl::ProcessPresent(CmdPresent&& present) {
     const u64 presented = stats.presents.fetch_add(1, std::memory_order_relaxed);
-    if (presented % 900 == 899) {
+    if (presented % 900 == 899 && Debug::Get().storage_census) {
         LogStorageCensus();
     }
     if ((bc_timing || smart_bc.enabled) && presented % 60 == 59) {
@@ -6468,14 +6530,7 @@ void Context::Impl::ExecutePresent(const VC::PresentRequest& request, InFlight& 
     if (const auto it = textures.find(request.texture_serial); it != textures.end()) {
         texture = it->second.get();
     }
-    // (A texture the Resolution setting drew has its newest pixels in the twin, which may be the
-    // only image it has.)
-    const bool displayable =
-        texture && texture->storage &&
-        (texture->storage->image ||
-         (texture->storage->scaled && Rescale::TwinIsCurrent(texture->storage->scale_state) &&
-          texture->storage->scaled->image)) &&
-        present_target;
+    const bool displayable = texture && texture->storage && present_target;
     Frame* frame = nullptr;
     /// Frames FSR3 / Lossless Scaling generated, presented before `frame`.
     std::vector<Frame*> generated;
@@ -6504,8 +6559,8 @@ void Context::Impl::ExecutePresent(const VC::PresentRequest& request, InFlight& 
         Recorder recorder(*this, request.queue, flight, true);
         recorder.gpu_capture_png = std::move(gpu_capture_png);
         replay_stage.store("present: record", std::memory_order_relaxed);
-        if (frame) {
-            recorder.RecordPresent(*texture, *frame, generated, request.crop);
+        if (frame && !recorder.RecordPresent(*texture, *frame, generated, request.crop)) {
+            present_target->ReleaseFrame(std::exchange(frame, nullptr));
         }
         replay_stage.store("present: finish", std::memory_order_relaxed);
         {
@@ -6544,6 +6599,7 @@ void Context::Impl::ExecutePresent(const VC::PresentRequest& request, InFlight& 
         if (draw_resources) {
             draw_resources->NoteAsyncSkips(presents_recorded);
             draw_resources->CheckSink(presents_recorded);
+            draw_resources->MaybeRefreshShaders();
             if (VideoCommon::Nvn::TimestampTraceEnabled()) {
                 draw_resources->TracePresent(presents_recorded);
             }

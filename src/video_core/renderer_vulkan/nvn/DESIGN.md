@@ -365,10 +365,10 @@ The guest memory stays the CPU truth.
   ranges unchanged keeps its render pass (`HostMirrorNeedsUpload`, no commands recorded); only a
   changed page ends the pass for the copy (`render_pass_break: mirror upload`).
   `NotifyCpuWrite` (FlushMappedRange) makes the pages it names get compared again within the same
-  submission. The first use of a page copies it. Ranges that an unfinished submission writes
-  (`Pool::gpu_dirty`) are skipped: the mirror is newer than the guest there. The bytes a GPU write
-  puts back into the guest differ from the page's recorded hash, so that page is copied once more
-  at its next use (same bytes).
+  submission. The first CPU upload copies the page. The upload clips out ranges owned by an
+  unfinished submission (`Pool::gpu_dirty`). A page covered by one pending range also skips the
+  hash without caching a comparison. Both decisions use the same per-lookup snapshot. Partial
+  coverage still requires hashing so CPU changes outside the write can reach the mirror.
 - **Page tracker gate** (default; `EDEN_NX2_NVN_MIRROR_HASH_ALWAYS=1` or no `GuestMemory::Track`:
   every page is hashed as above). At its first check a mirror pool is registered with the page
   tracker (`Pool::mirror_track`, every page armed). A page hashed after that, with no GPU write of
@@ -598,9 +598,9 @@ range of its own (`0x7D00...`, 2 MiB aligned) and `nvnMemoryPoolMapVirtual` reac
   `vkCreateImage` make `EnsureImage` fall back to the ordinary whole-storage path. Smaller sparse
   textures stay ordinary images. Single-aspect depth (D16, D32F) is tiled like colour (the shadow
   arrays of Mario Kart World); depth+stencil is not. The log line `nx2:gpu map path` counts tiles
-  bound/unbound/uploaded/verified; `[nvn] storage census` (every 900 presents) lists the device memory
-  of the storages by kind and the largest ones, and the `[nvn] replay stage` status line has
-  `commit_MB` (process private bytes) next to the device heap usage.
+  bound/unbound/uploaded/verified. `EDEN_NX2_NVN_STORAGE_CENSUS=1` enables a replay-side inventory
+  of the storages by kind and the largest ones every 900 presents. The `[nvn] replay stage`
+  status line has `commit_MB` (process private bytes) next to the device heap usage.
 
 ### Storage cache budget
 
@@ -1811,6 +1811,22 @@ Per-call, per-draw, per-submit and per-present cost with every debug switch unse
 
 ## Pipeline cache (`nvn_pipeline_cache.h`, tests `src/tests/nvn/pipeline_cache.cpp`)
 
+`HashProgramStage` includes the register count and the compute driver-bank layout (control
+`0xa9`, `0xb1..0xb3`, `0xb6`, `0xba..0xbb`), in addition to the instruction/code bytes and
+the control prefix. Identical compute code with different descriptor table offsets must not
+share a lowered program or pipeline. Truncated compute controls have a distinct identity.
+
+The opt-in `nvn_shader_refresh` setting starts without disk caches or asynchronous draw skips.
+At present boundaries, after 60 seconds, `ClearShaders` drains preload, asynchronous, preparation
+and optimization workers and the disk writer, then clears graphics/compute pipelines, lowered
+programs, failed entries, translated shader sets, GPL parts and the driver compilation cache.
+It keeps render passes (framebuffers reference them), textures and GPU-written results. Existing
+flights retain pipeline shared pointers until completion. `ShaderGeneration` invalidates each
+queue's local pipeline and memo before its next draw, including its binding-state tracking.
+The diagnostic memory summary and log expose the refresh count. `ContextOptions` can shorten
+the interval for headless tests; the UI mode uses 60 seconds. Disk files remain untouched in
+this mode. The game-list Vulkan cache removal includes the emulated and NVN cache file names.
+
 Files: `nvn_pipeline_cache.cpp` (lookups, translation: lower -> `NvnEnvironment` + `TranslateNvnStage`
 -> `ConvertLegacyToGeneric` + `EmitSPIRV`), `nvn_pipeline_vk.cpp` (render passes, descriptor and
 pipeline layouts, `VkPipeline` assembly), `nvn_pipeline_state.*` (NVN enum -> Vulkan, profile,
@@ -2285,7 +2301,9 @@ texture/buffer a draw bound, by reason.
   `ImportedChunk::address_buffer`, priority 0), one per pool with its own buffer (CPU_NO_ACCESS,
   priority 1, they cut the chunk ranges around them) and per virtual run, then uploads it to a
   device-local buffer (`RawTableBuffer`, a new one per rebuild; a draw keeps the one it used alive
-  through `InFlight::keepalive`, once per submission). DK has ~300 small GPU-only pools inside
+  through `InFlight::keepalive`, once per submission). Mario Kart World uses a mapped device-local
+  allocation when available, writes and flushes it before submission, and falls back to a staged
+  copy. This also applies to the raw store alias table. DK has ~300 small GPU-only pools inside
   chunk windows: 615 entries, no drops (`raw_global_ranges_dropped` is 0; it counts the entries of
   a table that could not be uploaded). Accesses outside every range are dropped (loads return 0).
   Pool buffers have SHADER_DEVICE_ADDRESS usage and imports allocate with

@@ -3161,8 +3161,6 @@ void MainWindow::OnGameListRemoveFile(u64 program_id, QtCommon::Game::GameListRe
 
     switch (target) {
     case QtCommon::Game::GameListRemoveTarget::VkShaderCache:
-        QtCommon::Game::RemoveVulkanDriverPipelineCache(program_id);
-        [[fallthrough]];
     case QtCommon::Game::GameListRemoveTarget::GlShaderCache:
         QtCommon::Game::RemoveTransferableShaderCache(program_id, target);
         break;

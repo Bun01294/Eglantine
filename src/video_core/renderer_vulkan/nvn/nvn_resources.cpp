@@ -1325,6 +1325,10 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
     // ranges around such pools.
     RawGlobalTable table;
     std::vector<RawGlobalSource> sources;
+    sources.reserve(raw_table.entries.size());
+    table.pool_serials.reserve(raw_table.pool_serials.size());
+    const u64 rebuilds = stats.raw_global_rebuilds.load(std::memory_order_relaxed) + 1;
+    const bool log_rebuild = rebuilds <= 8 || rebuilds % 64 == 0;
     u64 skipped = 0;
     u64 split_pools = 0;
     u64 own_pools = 0;
@@ -1375,14 +1379,16 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
         if (pool->backing == Pool::Backing::Imported) {
             table.imported_pool = pool.get();
         }
-        ++own_pools;
-        own_bytes += pool->size;
-        if (pool->size < (u64{1} << 20)) {
-            ++own_small;
-        }
-        if (const u8* host = GuestPointer(pool->address, pool->size);
-            host && InImportedChunk(host, pool->size)) {
-            ++own_in_chunk;
+        if (log_rebuild) {
+            ++own_pools;
+            own_bytes += pool->size;
+            if (pool->size < (u64{1} << 20)) {
+                ++own_small;
+            }
+            if (const u8* host = GuestPointer(pool->address, pool->size);
+                host && InImportedChunk(host, pool->size)) {
+                ++own_in_chunk;
+            }
         }
     }
     // A virtual pool's mapped runs resolve to ranges of physical pools.
@@ -1477,21 +1483,25 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
     // A gauge: the pools the current table leaves out (mirror or unbacked), not a running sum.
     stats.raw_global_pools_skipped.store(skipped, std::memory_order_relaxed);
     table.generation = pool_generation;
-    const u64 rebuilds = stats.raw_global_rebuilds.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (rebuilds <= 8 || rebuilds % 64 == 0) {
+    stats.raw_global_rebuilds.fetch_add(1, std::memory_order_relaxed);
+    if (log_rebuild) {
         u64 bytes = 0;
         for (const RawGlobalRange& entry : table.entries) {
             bytes += entry.size;
+        }
+        const char* upload = "unavailable";
+        if (table.device) {
+            upload = table.device->buffer.IsHostVisible() ? "mapped device-local" : "staged";
         }
         LOG_INFO(Render_Vulkan,
                  "[nvn] raw global memory table #{}: {} ranges ({:.1f} MiB): {} chunks, {} pools "
                  "with their own buffer, {} split-imported pools, {} virtual pools; {} pools in "
                  "chunks, {} backed now, {} skipped (mirror/unbacked), {:.1f} ms; own buffers: "
-                 "{:.1f} MiB, {} under 1 MiB, {} inside chunks",
+                 "{:.1f} MiB, {} under 1 MiB, {} inside chunks; upload {}",
                  rebuilds, total_ranges, bytes / 1048576.0, chunk_ranges, own_pools, split_pools,
                  virtual_pools.size(), covered_by_chunk, backed_now, skipped,
                  std::chrono::duration<double, std::milli>(Clock::now() - begin).count(),
-                 own_bytes / 1048576.0, own_small, own_in_chunk);
+                 own_bytes / 1048576.0, own_small, own_in_chunk, upload);
     }
     raw_table = std::move(table);
     return raw_table;
@@ -1568,6 +1578,37 @@ std::shared_ptr<RawTableBuffer> Context::Impl::UploadRawTable(
         auto table = std::make_shared<RawTableBuffer>();
         const VkDeviceSize bytes = entries.size() * sizeof(RawGlobalRange);
         table->count = static_cast<u32>(entries.size());
+        if (mario_kart_world) {
+            const VkPhysicalDeviceMemoryProperties* properties{};
+            vmaGetMemoryProperties(vma, &properties);
+            constexpr VkMemoryPropertyFlags mapped_local =
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+            const auto types = std::span{properties->memoryTypes, properties->memoryTypeCount};
+            if (std::ranges::any_of(types, [&](const auto& type) {
+                    return (type.propertyFlags & mapped_local) == mapped_local;
+                })) {
+                try {
+                    auto buffer = CreateHostBuffer(bytes, VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                                   MemoryUsage::Stream);
+                    const auto type = buffer.Location().memory_type;
+                    if (buffer.IsHostVisible() &&
+                        (types[type].propertyFlags & mapped_local) == mapped_local) {
+                        // Each generation owns its buffer. Flush before any submission can
+                        // reference it, and let the flight retain it until the GPU is done.
+                        std::memcpy(buffer.Mapped().data(), entries.data(), bytes);
+                        buffer.Flush();
+                        table->address = device.GetLogical().GetBufferDeviceAddress(*buffer);
+                        table->buffer = std::move(buffer);
+                        return table;
+                    }
+                } catch (const vk::Exception& exception) {
+                    if (exception.GetResult() == VK_ERROR_DEVICE_LOST) {
+                        throw;
+                    }
+                    // Continue with the staged device-local upload on allocation failure.
+                }
+            }
+        }
         table->buffer = CreateHostBuffer(
             bytes, VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             MemoryUsage::DeviceLocal);

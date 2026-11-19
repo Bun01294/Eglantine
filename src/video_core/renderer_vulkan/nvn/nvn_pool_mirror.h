@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <memory>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -13,6 +14,27 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan::Nvn {
+
+enum class MirrorWriteCoverage { None, Partial, Full };
+
+/// Pending GPU writes own these mirror bytes until completion writes them back to the guest.
+[[nodiscard]] inline MirrorWriteCoverage ClassifyMirrorWrites(
+    u64 begin, u64 end, std::span<const std::pair<u64, u64>> pending) {
+    if (begin >= end) {
+        return MirrorWriteCoverage::None;
+    }
+    auto coverage = MirrorWriteCoverage::None;
+    for (const auto& [lo, hi] : pending) {
+        if (lo >= end || hi <= begin) {
+            continue;
+        }
+        if (lo <= begin && hi >= end) {
+            return MirrorWriteCoverage::Full;
+        }
+        coverage = MirrorWriteCoverage::Partial;
+    }
+    return coverage;
+}
 
 /// Which 4 KiB pages of a pool mirror hold the pool's bytes (DESIGN.md "Pool mirrors"). A valid
 /// page holds what the guest page held when it was copied in, plus what the GPU wrote there since

@@ -34,6 +34,7 @@
 #include <atomic>
 #include <cstddef>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -78,9 +79,9 @@ inline constexpr u32 STAGE_COUNT = 8;
 /// Highest constant buffer bank + 1 a translated shader can use (Shader::Info::MAX_CBUFS).
 inline constexpr u32 LOG_MAX_CBUFS = static_cast<u32>(Shader::Info::MAX_CBUFS);
 
-/// Content hash of one program stage: CityHash64 over control[0:0x48] with the u32 at +0x30 zeroed
-/// (the control section's own length differs between containers), then the code bytes. 0 is never
-/// returned (0 means "stage absent" in requests).
+/// Content hash of the code and control fields used by ParseControl, excluding the section's own
+/// length and unused bytes. Includes compute descriptor counts and offsets. Never returns 0
+/// (0 means "stage absent" in requests).
 [[nodiscard]] u64 HashProgramStage(std::span<const u8> control, std::span<const u8> code);
 
 /// How a pipeline receives the vertex layout. Chosen once per cache from the device
@@ -353,6 +354,7 @@ struct GraphicsPipeline : PipelineBase {
     /// `optimized_handle`, and draws recorded from then on bind it. `pipeline` stays alive (draws
     /// in flight may use it) until the pipeline is destroyed.
     bool fast_linked{};
+    std::atomic<bool> prefetched_unused{};
     vk::Pipeline optimized;
     std::atomic<VkPipeline> optimized_handle{VK_NULL_HANDLE};
 
@@ -400,6 +402,8 @@ struct PipelineCacheOptions {
     /// GetCompute get "not ready" until the compile finished and skip the draw/dispatch, and a
     /// lookup that meets a preload still in flight does not wait for it either.
     bool async_compile{false};
+    /// Compile upcoming graphics state on workers while replay builds the current pipeline.
+    bool prefetch_graphics{false};
     /// The nvn_pipeline_library setting: graphics pipelines are built from
     /// VK_EXT_graphics_pipeline_library parts (vertex input, pre-rasterization shaders, fragment
     /// shader, fragment output) that are compiled once and fast-linked, then compiled whole in
@@ -441,6 +445,8 @@ struct PipelineCacheStats {
     u64 async_not_ready{};     ///< lookups answered "not ready" (a draw/dispatch was skipped)
     u64 preload_waits{};       ///< synchronous lookups that waited for the preload or a pending key
     u64 preload_wait_ns{};     ///< ... and the total time they waited
+    u64 prefetch_queued{};
+    u64 prefetch_used{};
     u64 gpl_fast_links{};      ///< GPL path: pipelines fast-linked from libraries
     u64 gpl_cached_links{};    ///< ... of which every library was compiled already
     u64 gpl_translations_reused{}; ///< GPL path: pipelines built from an earlier translation
@@ -448,9 +454,9 @@ struct PipelineCacheStats {
     u64 gpl_optimized{};       ///< whole compiles published in place of a fast-linked pipeline
     u64 gpl_shader_sets_warmed{}; ///< GPL path: shader sets whose library parts the preload compiled
     u64 programs_prepared{};   ///< program stages lowered when the game created the program
-    u64 graphics_pipelines{};  ///< pipelines held now (never evicted)
+    u64 graphics_pipelines{};  ///< pipelines held now
     u64 compute_pipelines{};
-    u64 lowered_programs{};    ///< lowered stage programs held now (never evicted)
+    u64 lowered_programs{}; ///< lowered stage programs held now
 };
 
 /// Thread-safety: see the file comment.
@@ -474,7 +480,9 @@ public:
     /// path (`UsesGraphicsPipelineLibrary`) too: it translates, compiles the missing library
     /// parts and fast-links on the calling thread.
     [[nodiscard]] std::shared_ptr<GraphicsPipeline> GetGraphics(const GraphicsRequest& request,
-                                                                bool* not_ready = nullptr);
+                                                                bool* not_ready = nullptr,
+                const std::function<void(u64)>& look_ahead = {});
+    void PrefetchGraphics(const GraphicsRequest& request, u64 current_key);
     [[nodiscard]] std::shared_ptr<ComputePipeline> GetCompute(const ComputeRequest& request,
                                                               bool* not_ready = nullptr);
     /// Shader log only (call when `ShaderLog::Enabled()`): the compute program of `request` was
@@ -511,6 +519,14 @@ public:
     /// Blocks until the preload and the asynchronous compiles finished and the queued disk writes
     /// are on disk (shutdown, tests).
     void Flush();
+
+    /// Replay thread only, with no concurrent lookups: waits for cache workers, then drops all
+    /// shader translations, pipelines, rejections, library parts and driver compilation data.
+    /// Render passes and disk files stay valid. In-flight work must retain its pipeline
+    /// shared_ptrs.
+    void ClearShaders();
+    /// Changes after ClearShaders; local pipeline memos must be invalidated before another draw.
+    [[nodiscard]] u64 ShaderGeneration() const noexcept;
 
     [[nodiscard]] PipelineCacheStats Stats() const;
 
