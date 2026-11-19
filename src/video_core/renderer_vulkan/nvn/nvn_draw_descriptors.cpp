@@ -525,17 +525,25 @@ std::unique_ptr<TextureOracle> DrawContext::FreezeOracle(
             }
             uniform.bytes.resize(size);
             uniform.readable.assign((size + FROZEN_CHUNK - 1) / FROZEN_CHUNK, 0);
-            if (ReadSnapshotBytes(binding.address, uniform.bytes.data(), size) ||
-                memory->Read(binding.address, uniform.bytes.data(), size)) {
+            if (ReadSnapshotBytes(binding.address, uniform.bytes.data(), size)) {
                 std::fill(uniform.readable.begin(), uniform.readable.end(), u8{1});
             } else {
-                for (u64 chunk = 0; chunk < uniform.readable.size(); ++chunk) {
-                    const u64 begin = chunk * FROZEN_CHUNK;
-                    const u64 length = (std::min)(FROZEN_CHUNK, size - begin);
-                    uniform.readable[chunk] =
-                        memory->Read(binding.address + begin, uniform.bytes.data() + begin, length)
-                            ? 1
-                            : 0;
+                if (memory->Read(binding.address, uniform.bytes.data(), size)) {
+                    std::fill(uniform.readable.begin(), uniform.readable.end(), u8{1});
+                } else {
+                    for (u64 chunk = 0; chunk < uniform.readable.size(); ++chunk) {
+                        const u64 begin = chunk * FROZEN_CHUNK;
+                        const u64 length = (std::min)(FROZEN_CHUNK, size - begin);
+                        uniform.readable[chunk] =
+                            memory->Read(binding.address + begin, uniform.bytes.data() + begin,
+                                         length)
+                                ? 1
+                                : 0;
+                    }
+                }
+                if (host != nullptr) {
+                    impl.ApplyPendingInlineWrites(binding.address, uniform.bytes.data(), size,
+                                                  host->HostFlight().seq);
                 }
             }
             // Inline updates of this submission are newer than guest memory; the last one wins.
@@ -1037,11 +1045,23 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
             }
         }
         const bool misaligned = resolved && uniform && (ref.offset % 256) != 0;
+        const u64 current_seq = host->HostFlight().seq;
+        bool flush_inline_to_pool = false;
+        if (overlaps && !misaligned && resolved && !write &&
+            snapshot_range == UniformSnapshotView::npos) {
+            if (!pass_open || ref.pool->backing == Pool::Backing::DeviceLocal ||
+                HasOverlappingShadow(*ref.pool, ref.pool_offset, ref.pool_offset + size) ||
+                impl.NeedsGpuFlushForUniform(binding.address, binding.address + size, current_seq)) {
+                flush_inline_to_pool = true;
+                plan.flush_inline = true;
+            }
+        }
+        const bool use_private_copy = (overlaps && !flush_inline_to_pool) || misaligned;
         if (cs_mode != CostSplit::Mode::Count) [[unlikely]] {
             CostSplitNote(uniform ? CostSplit::Data::Uniform : CostSplit::Data::Storage, ref, size,
-                          overlaps || misaligned);
+                          use_private_copy);
         }
-        if (overlaps || misaligned) {
+        if (use_private_copy) {
             if (write) {
                 host->HostUnsupported("Draw", "storage buffer under an inline uniform update");
             }
@@ -1049,13 +1069,16 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
             u8* pointer = nullptr;
             const BufferRef copy = AllocArena(size, 256, &pointer);
             if (copy.buffer) {
-                const u8* source = snapshot_range != UniformSnapshotView::npos
-                                       ? usnap.Bytes(snapshot_range, binding.address)
-                                       : impl.GuestPointer(binding.address, size);
-                if (source) {
-                    std::memcpy(pointer, source, size);
+                if (snapshot_range != UniformSnapshotView::npos) {
+                    std::memcpy(pointer, usnap.Bytes(snapshot_range, binding.address), size);
                 } else {
-                    std::memset(pointer, 0, size);
+                    if (const u8* source = impl.GuestPointer(binding.address, size)) {
+                        std::memcpy(pointer, source, size);
+                    } else if (VC::GuestMemory* memory = impl.guest.load(std::memory_order_acquire);
+                               !memory || !memory->Read(binding.address, pointer, size)) {
+                        std::memset(pointer, 0, size);
+                    }
+                    impl.ApplyPendingInlineWrites(binding.address, pointer, size, current_seq);
                 }
                 for (const InlineUpdate& update : inline_updates) {
                     const u64 begin = (std::max)(update.address, binding.address);
@@ -1760,6 +1783,12 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
             need = true;
         }
     }
+    if (plan.flush_inline && !inline_updates.empty()) {
+        if (!need) {
+            cause = BreakCause::InlineUpdate;
+        }
+        need = true;
+    }
     // Storage shadows: a use of the plan that the live shadows cannot serve ends the pass (the
     // shadow is copied back outside it).
     ShadowDecision shadow;
@@ -1791,6 +1820,9 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
         EndPass(cause);
     }
     if (!pass_open) {
+        if (plan.flush_inline && !inline_updates.empty()) {
+            FlushInlineUpdates();
+        }
         RecordFeedbackCopies(plan);
         transition_scratch.clear();
         for (DrawPlan::ImageUse& use : plan.images) {

@@ -359,6 +359,7 @@ public:
                                             flight.seq);
     }
     void HostNoteShadowedWrite(const Pool& pool, u64 offset, u64 size) override {
+        impl.NoteNonInlinePoolWrite(pool.address + offset, size, flight.seq);
         // The pool bytes take these writes when the shadow is copied back; a later condition on
         // them would copy it back first (ResolvePoolRange), a predicate computed now would not.
         condition_prefetch.Invalidate(pool, offset, size);
@@ -1017,6 +1018,7 @@ void Recorder::Abort() {
     for (const auto& storage : touched) {
         storage->current_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     }
+    impl.ErasePendingPoolWritesForSeq(flight.seq);
     // Pool mirror pages this submission was to copy in (and GPU writes it was to make there and
     // merge back) never happened: no mirror page is known to be current.
     impl.MirrorInvalidateAll();
@@ -1363,14 +1365,21 @@ void Recorder::UploadRange(Pool& pool, u64 offset, u64 size) {
             continue; // UploadRange would discard this whole page while the GPU owns it.
         }
         const bool settled = tracked && coverage == MirrorWriteCoverage::None;
+        const bool partial_gpu = coverage == MirrorWriteCoverage::Partial;
         ++hashed;
         const u64 hash = GuestPageHash(pool, index);
         const bool changed = !page.valid || page.hash != hash;
-        page.hash = hash;
-        page.valid = true;
-        page.checked = stamp;
-        page.raw_epoch = pool.split_raw_epoch_seen;
-        page.trusted = settled;
+        if (!partial_gpu) {
+            page.hash = hash;
+            page.valid = true;
+            page.checked = stamp;
+            page.raw_epoch = pool.split_raw_epoch_seen;
+            page.trusted = settled;
+        } else {
+            page.valid = false;
+            page.checked = 0;
+            page.trusted = false;
+        }
         if (!changed) {
             continue;
         }
@@ -1446,6 +1455,7 @@ void Recorder::UploadRange(Pool& pool, u64 offset, u64 size) {
 }
 
 void Recorder::NotePoolWrite(Pool& pool, u64 offset, u64 size, bool invalidate_mirror) {
+    impl.NoteNonInlinePoolWrite(pool.address + offset, size, flight.seq);
     if (impl.invalidate_wait_ms != 0) {
         // Where a guest invalidate has to wait for this submission (nvn_gpu_writes.h).
         impl.gpu_writes.Note(pool.address + offset, pool.address + offset + size, flight.seq,
@@ -1475,7 +1485,10 @@ void Recorder::NotePoolWrite(Pool& pool, u64 offset, u64 size, bool invalidate_m
         if (size != 0 && offset < pool.size) {
             const u64 end = (std::min)(offset + size, pool.size);
             for (u64 page = offset / Pool::MIRROR_PAGE; page * Pool::MIRROR_PAGE < end; ++page) {
-                pool.mirror_pages[static_cast<size_t>(page)].trusted = false;
+                Pool::MirrorPage& mirror_page = pool.mirror_pages[static_cast<size_t>(page)];
+                mirror_page.trusted = false;
+                mirror_page.valid = false;
+                mirror_page.checked = 0;
             }
         }
         dirty_pool_set.insert(&pool);
@@ -6369,7 +6382,8 @@ void Recorder::FlushAndWait() {
 
 void Recorder::MaybeSubmitEarly() {
     const Debug::Config& config = Debug::Get();
-    if (config.early_interval_us == 0 || !impl.options.early_submit || finished || condition_open) {
+    if (config.early_interval_us == 0 || !impl.options.early_submit || finished || condition_open ||
+        (!draw.PassOpen() && draw.HasInlineUpdates())) {
         return;
     }
     if (impl.mkw_coalesce_early_submit && early_pieces >= 2) {

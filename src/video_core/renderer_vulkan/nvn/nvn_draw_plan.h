@@ -99,6 +99,8 @@ struct DrawPlan {
     bool raw_stores_written_through{false};
     /// The pipeline writes a bound storage image.
     bool image_writes{false};
+    /// An overlapping inline uniform update must flush to the GPU pool before the draw.
+    bool flush_inline{false};
     /// Resolution scaling: which texture and storage image descriptors (in the order of the
     /// pipeline's stages) the draw binds the scaled twin of (Rescale::Words).
     Rescale::Words rescale_words;
@@ -115,6 +117,7 @@ struct DrawPlan {
         raw_global = false;
         shadow_candidates = false;
         image_writes = false;
+        flush_inline = false;
         rescale_words.Clear();
     }
     void UseImage(const std::shared_ptr<Storage>& storage, VkImageLayout layout,

@@ -186,6 +186,10 @@ std::string DrawContext::DescribeInputs(const PipelineBase* logged_pipeline, boo
                     memory->Read(binding.address + begin, bytes.data() + begin, length) ? 1 : 0;
             }
         }
+        if (host != nullptr) {
+            impl.ApplyPendingInlineWrites(binding.address, bytes.data(), want,
+                                          host->HostFlight().seq);
+        }
         for (const InlineUpdate& update : inline_updates) {
             const u64 lo = (std::max)(update.address, binding.address);
             const u64 hi = (std::min)(update.address + update.size, binding.address + want);

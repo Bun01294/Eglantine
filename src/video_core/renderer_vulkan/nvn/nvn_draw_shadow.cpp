@@ -864,6 +864,15 @@ void DrawContext::FlushShadowsOverlapping(const Pool& pool, u64 offset, u64 size
     }
 }
 
+bool DrawContext::HasOverlappingShadow(const Pool& pool, u64 begin, u64 end) const noexcept {
+    for (const Shadow& shadow : shadows) {
+        if (shadow.pool == &pool && Overlaps(begin, end, shadow.begin, shadow.end)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void DrawContext::NoteExtraRead(const BufferRef& ref, u64 size) {
     if (ref.pool != nullptr && ref.pool->backing == Pool::Backing::Imported &&
         (Debug::Get().shadow_storage || impl.pool_mirror_mode != 0)) {

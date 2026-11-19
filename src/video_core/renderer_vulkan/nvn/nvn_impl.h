@@ -846,6 +846,9 @@ struct Context::Impl {
     std::mutex failure_mutex; ///< Held while failure_callback runs (and while it is replaced).
     bool stopping{false};
     std::atomic<u64> completed_seq{0};
+    /// Newest submission whose GPU commands and mirror readbacks have finished (published right
+    /// before `completion_callback`, whereas `completed_seq` is published right after it).
+    std::atomic<u64> gpu_completed_seq{0};
     /// What the replay thread is doing (diagnostics only).
     std::atomic<const char*> replay_stage{"starting"};
     std::atomic<u64> replay_seq{0};
@@ -1011,6 +1014,27 @@ struct Context::Impl {
     /// GPU writes against the submit-time uniform copies (nvn_uniform_snapshot.h). Replay thread
     /// only; declared before the draw contexts and streams that refer to it.
     UniformSnapshotTracker uniform_snapshots;
+    /// Uncompleted GPU buffer writes recorded on the replay thread, kept until `gpu_completed_seq`
+    /// passes their submission. When `inline_bytes` is non-empty, it holds the exact bytes copied
+    /// by `DrawContext::FlushInlineUpdates` so same-submission in-pass private uniform copies can
+    /// overlay them without breaking the render pass; when empty, the write is non-inline (or
+    /// invalidated by a CPU write / WaitEvent) and overlapping uniform draws flush on the GPU.
+    struct PendingPoolWrite {
+        u64 begin;
+        u64 end;
+        u64 seq;
+        std::vector<u8> inline_bytes;
+    };
+    std::vector<PendingPoolWrite> pending_pool_writes;
+    bool noting_inline_pool_write{false};
+    void PrunePendingPoolWrites();
+    void NoteFlushedInlinePoolWrite(u64 address, const u8* data, u64 size, u64 seq);
+    void NoteNonInlinePoolWrite(u64 address, u64 size, u64 seq);
+    void InvalidatePendingInlineBytes(u64 seq);
+    void InvalidatePendingInlineBytesOverlapping(u64 address, u64 size);
+    void ErasePendingPoolWritesForSeq(u64 seq);
+    [[nodiscard]] bool NeedsGpuFlushForUniform(u64 begin, u64 end, u64 current_seq);
+    void ApplyPendingInlineWrites(u64 base_address, u8* dst, u64 size, u64 current_seq) const;
     /// Draw state per NVN queue index (it persists across submissions on a queue).
     std::map<u32, std::unique_ptr<DrawContext>> draw_contexts;
     std::map<u32, QueueState> queues;

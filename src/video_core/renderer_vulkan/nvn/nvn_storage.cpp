@@ -846,6 +846,7 @@ void Context::Impl::NotifyCpuWriteNow(u64 address, u64 size, bool host_write) {
     }
     // Live storage shadows are normally authoritative until their segment ends. Refresh only the
     // CPU-written overlap before either a whole-shadow copy-back or a mirror word-merge.
+    InvalidatePendingInlineBytesOverlapping(address, size);
     for (const auto& [run_begin, run_end] : runs) {
         for (auto& [owner_queue, draw] : draw_contexts) {
             static_cast<void>(owner_queue);
