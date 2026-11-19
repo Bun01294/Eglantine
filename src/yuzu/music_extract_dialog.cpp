@@ -44,7 +44,9 @@ QString Sanitized(std::string_view name) {
 }
 
 std::vector<u8> ReadImageBytes(const QString& path) {
-    std::ifstream in(path.toStdString(), std::ios::binary);
+    // std::filesystem::path carries the Unicode form through; a narrow string
+    // would go through the ANSI code page on Windows.
+    std::ifstream in(std::filesystem::path{path.toStdU16String()}, std::ios::binary);
     return {std::istreambuf_iterator<char>(in), {}};
 }
 
@@ -228,7 +230,7 @@ void MusicExtractDialog::UpdateOkEnabled() {
 }
 
 std::filesystem::path MusicExtractDialog::OutDir() const {
-    return std::filesystem::path{out_edit->text().trimmed().toStdString()};
+    return std::filesystem::path{out_edit->text().trimmed().toStdU16String()};
 }
 
 FileSys::Music::Layout MusicExtractDialog::Layout() const {

@@ -16,6 +16,7 @@
 #include <set>
 #include <span>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 #include <fmt/format.h>
@@ -101,11 +102,16 @@ std::optional<std::filesystem::path> FindChildCI(const std::filesystem::path& pa
     if (!std::filesystem::is_directory(parent, ec)) {
         return std::nullopt;
     }
+    // Walk with explicit error codes: the range-for's increment throws on an I/O
+    // error, and nothing above catches filesystem_error.
     const auto lower = Lower(name);
-    for (const auto& entry : std::filesystem::directory_iterator(parent, ec)) {
-        if (entry.is_directory(ec) &&
-            Lower(Common::FS::PathToUTF8String(entry.path().filename())) == lower) {
-            return entry.path();
+    const std::filesystem::directory_iterator end{};
+    for (auto it = std::filesystem::directory_iterator(parent, ec); !ec && it != end;
+         it.increment(ec)) {
+        std::error_code dir_ec;
+        if (it->is_directory(dir_ec) && !dir_ec &&
+            Lower(Common::FS::PathToUTF8String(it->path().filename())) == lower) {
+            return it->path();
         }
     }
     return std::nullopt;
@@ -135,7 +141,7 @@ void CollectFromStreamDir(const VirtualDir& stream_dir, std::map<std::string, En
 }
 
 bool CollectLoose(const std::filesystem::path& dump_root, RealVfsFilesystem& vfs,
-                  Collected& collected) {
+                  Collected& collected, std::string& error) {
     // base/romfs (or a bare romfs/), then every updates/<version>/romfs in ascending
     // order so newer trees override older ones by file name.
     std::vector<std::filesystem::path> romfs_dirs;
@@ -149,15 +155,24 @@ bool CollectLoose(const std::filesystem::path& dump_root, RealVfsFilesystem& vfs
     std::vector<std::pair<u64, std::filesystem::path>> updates;
     if (const auto updates_dir = FindChildCI(dump_root, "updates")) {
         std::error_code ec;
-        for (const auto& entry : std::filesystem::directory_iterator(*updates_dir, ec)) {
+        const std::filesystem::directory_iterator end{};
+        for (auto it = std::filesystem::directory_iterator(*updates_dir, ec); !ec && it != end;
+             it.increment(ec)) {
             u64 version{};
-            const auto name = Common::FS::PathToUTF8String(entry.path().filename());
+            const auto name = Common::FS::PathToUTF8String(it->path().filename());
             const auto [ptr, err] =
                 std::from_chars(name.data(), name.data() + name.size(), version);
-            if (err != std::errc{} || ptr != name.data() + name.size() || !entry.is_directory(ec)) {
+            std::error_code dir_ec;
+            if (err != std::errc{} || ptr != name.data() + name.size() ||
+                !it->is_directory(dir_ec) || dir_ec) {
                 continue;
             }
-            updates.emplace_back(version, entry.path());
+            updates.emplace_back(version, it->path());
+        }
+        if (ec) {
+            error = fmt::format("cannot list {}: {}", Common::FS::PathToUTF8String(*updates_dir),
+                                ec.message());
+            return false;
         }
     }
     std::sort(updates.begin(), updates.end(),
@@ -168,6 +183,7 @@ bool CollectLoose(const std::filesystem::path& dump_root, RealVfsFilesystem& vfs
         }
     }
     if (romfs_dirs.empty()) {
+        error = "no romfs in the dump";
         return false;
     }
 
@@ -178,9 +194,8 @@ bool CollectLoose(const std::filesystem::path& dump_root, RealVfsFilesystem& vfs
                                  merged);
         }
     }
-    if (merged.empty()) {
-        return false;
-    }
+    // No music streams is a valid, recognized dump: the caller reports "no
+    // music" rather than "unsupported source".
     collected.entries.reserve(merged.size());
     for (auto& [name, entry] : merged) {
         collected.entries.push_back(std::move(entry));
@@ -239,15 +254,11 @@ bool CollectNup(const std::string& game_path, RealVfsFilesystem& vfs, Collected&
     const auto resource = FindSubdirCI(sound, "Resource");
     const auto stream = FindSubdirCI(resource, "Stream");
     if (stream == nullptr) {
-        error = "no Sound/Resource/Stream folder in the RomFS";
-        return false;
+        // A valid archive; this game just stores no stream music.
+        return true;
     }
     std::map<std::string, Entry> merged_files;
     CollectFromStreamDir(stream, merged_files);
-    if (merged_files.empty()) {
-        error = "no music streams in the RomFS";
-        return false;
-    }
     collected.entries.reserve(merged_files.size());
     for (auto& [name, entry] : merged_files) {
         collected.entries.push_back(std::move(entry));
@@ -285,11 +296,10 @@ bool Collect(const std::string& game_path, RealVfsFilesystem& vfs, Collected& co
         error = "not a NUP archive or a loose dump";
         return false;
     }
-    if (!CollectLoose(*root, vfs, collected)) {
-        error = "no music streams in the dump (looked for BGM_/Dm_/ExampleMelody_ .bwav "
-                "under Sound/Resource/Stream)";
+    if (!CollectLoose(*root, vfs, collected, error)) {
+        return false;
     }
-    return !collected.entries.empty();
+    return true;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -369,6 +379,58 @@ constexpr std::array<std::string_view, KindCount> KindFolders{
     "Music", "Cutscenes", "Title", "Segments", "Stems",
 };
 
+bool SafeComponent(std::string_view name) {
+    return !name.empty() && name != "." && name != ".." &&
+           name.find('/') == std::string_view::npos &&
+           name.find('\\') == std::string_view::npos;
+}
+
+// The output folder is kind/area components joined with '/', the file name one
+// component. Both trace back to the game's stream names, so both are checked
+// before anything is written below the chosen output directory.
+bool SafeOutputPath(const std::string& folder, const std::string& file_name) {
+    if (!SafeComponent(file_name)) {
+        return false;
+    }
+    std::size_t start = 0;
+    for (std::size_t i = 0; i <= folder.size(); ++i) {
+        if (i != folder.size() && folder[i] != '/') {
+            continue;
+        }
+        if (i > start && !SafeComponent(std::string_view{folder}.substr(start, i - start))) {
+            return false;
+        }
+        start = i + 1;
+    }
+    return true;
+}
+
+// Walks a folder's components below the output root once and remembers the
+// folders proven clean; true only when a component turns out to be a symlink.
+bool FolderHasSymlink(const std::filesystem::path& out_dir, const std::string& folder,
+                      std::set<std::string>& clean_folders) {
+    if (clean_folders.count(folder) != 0) {
+        return false;
+    }
+    std::filesystem::path acc = out_dir;
+    std::size_t start = 0;
+    for (std::size_t i = 0; i <= folder.size(); ++i) {
+        if (i != folder.size() && folder[i] != '/') {
+            continue;
+        }
+        if (i > start) {
+            acc /= std::string{std::string_view{folder}.substr(start, i - start)};
+            std::error_code ec;
+            if (std::filesystem::is_symlink(std::filesystem::symlink_status(acc, ec)) && !ec) {
+                return true;
+            }
+        }
+        start = i + 1;
+    }
+    clean_folders.insert(folder);
+    return false;
+}
+
 // ---------------------------------------------------------------------------------------------
 // BWAV (NintendoWare wave), laid out as vgmstream reads it:
 //   0x00 "BWAV", 0x04 BOM, 0x0e channel count, then a 0x4C block per channel from 0x10.
@@ -378,6 +440,11 @@ constexpr std::size_t ChannelBlockSize = 0x4C;
 constexpr u16 CodecPcm16 = 0;
 constexpr u16 CodecDsp = 1;
 constexpr u16 CodecNxOpus = 2;
+
+// Cap on one track's decoded PCM: far past anything a real game ships (the
+// longest known track decodes to ~60 MB), small enough that a corrupt header
+// claiming billions of samples cannot exhaust the machine before it is caught.
+constexpr u64 kMaxPcmBytes = 1ull << 30;
 
 struct BwavChannel {
     u16 codec{};
@@ -578,18 +645,21 @@ u32 ReadU32BE(std::span<const u8> data, std::size_t offset) {
 
 bool ParseNxOpus(std::span<const u8> data, u32 stream_start, NxOpusStream& stream,
                  std::string& note) {
-    if (stream_start + 0x28 > data.size()) {
+    // The offsets and sizes come straight from the file, so widen before adding:
+    // a crafted chunk must not wrap a 32-bit sum past the bounds checks below.
+    const std::size_t start = static_cast<std::size_t>(stream_start);
+    if (start + 0x28 > data.size()) {
         note = "NXOpus header out of range";
         return false;
     }
-    if (ReadU32(data, stream_start + 0x00) != 0x80000001) {
+    if (ReadU32(data, start + 0x00) != 0x80000001) {
         note = "NXOpus: missing basic info chunk";
         return false;
     }
-    stream.channels = data[stream_start + 0x09];
-    stream.sample_rate = ReadU32(data, stream_start + 0x0c);
-    const u32 data_offset = ReadU32(data, stream_start + 0x10);
-    stream.skip = Read16(data, stream_start + 0x1c);
+    stream.channels = data[start + 0x09];
+    stream.sample_rate = ReadU32(data, start + 0x0c);
+    const u32 data_offset = ReadU32(data, start + 0x10);
+    stream.skip = Read16(data, start + 0x1c);
     if (stream.channels == 0 || stream.channels > 8) {
         note = fmt::format("NXOpus: bad channel count {}", stream.channels);
         return false;
@@ -598,15 +668,15 @@ bool ParseNxOpus(std::span<const u8> data, u32 stream_start, NxOpusStream& strea
     if (stream.sample_rate != 48000) {
         stream.sample_rate = 48000;
     }
-    const u32 data_chunk = stream_start + data_offset;
+    const std::size_t data_chunk = start + static_cast<std::size_t>(data_offset);
     if (data_offset == 0 || data_chunk + 8 > data.size() ||
         ReadU32(data, data_chunk) != 0x80000004) {
         note = "NXOpus: missing data info chunk";
         return false;
     }
-    stream.data_start = data_chunk + 8;
+    stream.data_start = static_cast<u32>(data_chunk + 8);
     stream.data_size = ReadU32(data, data_chunk + 4);
-    if (stream.data_start + stream.data_size > data.size()) {
+    if (static_cast<std::size_t>(stream.data_start) + stream.data_size > data.size()) {
         note = "NXOpus: packet data out of range";
         return false;
     }
@@ -672,6 +742,23 @@ bool DecodeBwav(std::span<const u8> data, DecodedTrack& out, std::string& note) 
     const s32 num_samples = info.channel[0].num_samples;
     if (num_samples == 0) {
         note = "no samples";
+        return false;
+    }
+    // The header's sample count drives every allocation below, so bound it
+    // before trusting it: PCM16 and DSP samples must physically fit in the
+    // stream (which also rejects truncated tracks), and no track may ask for
+    // more than a gigabyte of decoded audio.
+    u64 needed = 0;
+    for (const BwavChannel& channel : info.channel) {
+        if (channel.codec == CodecPcm16) {
+            needed += static_cast<u64>(num_samples) * 2;
+        } else if (channel.codec == CodecDsp) {
+            needed += (static_cast<u64>(num_samples) + 13) / 14 * 8;
+        }
+    }
+    if (static_cast<u64>(num_samples) * info.channels * 2 > kMaxPcmBytes ||
+        needed > data.size()) {
+        note = "declared sample count exceeds the stream data";
         return false;
     }
     out.sample_rate = static_cast<u32>(info.channel[0].sample_rate);
@@ -896,7 +983,9 @@ bool WriteWav(const std::filesystem::path& path, const DecodedTrack& track,
     const std::string id3 = MakeId3v2(tags);
     const u32 id3_chunk = static_cast<u32>(id3.size()) + (id3.size() % 2);
     const u32 data_size = static_cast<u32>(track.pcm.size() * sizeof(s16));
-    const u32 riff_size = 4 + 8 + data_size + 8 + id3_chunk;
+    // Everything after the RIFF header: "WAVE", the fmt chunk, the data chunk
+    // and the id3 chunk.
+    const u32 riff_size = 4 + (8 + 16) + (8 + data_size) + (8 + id3_chunk);
     const u32 byte_rate = track.sample_rate * track.channels * 2;
     const u16 block_align = track.channels * 2;
     constexpr u16 format = 1;
@@ -926,6 +1015,8 @@ bool WriteWav(const std::filesystem::path& path, const DecodedTrack& track,
             out.write("\0", 1);
         }
     }
+    // The final flush can still fail (disk full); check it, not just the writes.
+    out.close();
     return out.good();
 }
 
@@ -1306,7 +1397,10 @@ bool WriteOpus(const std::filesystem::path& path, const DecodedTrack& track,
             return false;
         }
     }
-    return writer.Finish();
+    const bool ok = writer.Finish();
+    // The final flush can still fail (disk full); check it, not just the writes.
+    out.close();
+    return ok && out.good();
 }
 
 bool WriteEncoded(const std::filesystem::path& path, const DecodedTrack& track,
@@ -1350,6 +1444,12 @@ u64 TrackDigest(const std::vector<s16>& pcm) {
                               pcm.size() * sizeof(s16));
 }
 
+// Duplicate detection keys on the PCM plus the playback shape: the same bytes
+// at a different sample rate or channel count are not the same track.
+std::tuple<u64, u32, u16> TrackKey(const DecodedTrack& track) {
+    return {TrackDigest(track.pcm), track.sample_rate, track.channels};
+}
+
 } // namespace
 
 std::string_view KindName(Kind kind) {
@@ -1370,27 +1470,38 @@ std::string_view KindName(Kind kind) {
 }
 
 bool ScanMusic(const std::string& game_path, SourceInfo& info) {
-    RealVfsFilesystem vfs;
-    Collected collected;
-    std::string error;
-    if (!Collect(game_path, vfs, collected, error)) {
-        LOG_WARNING(Loader, "Music scan of {} failed: {}", game_path, error);
+    // The UI calls this on its own thread; no filesystem error may escape it.
+    try {
+        RealVfsFilesystem vfs;
+        Collected collected;
+        std::string error;
+        if (!Collect(game_path, vfs, collected, error)) {
+            LOG_WARNING(Loader, "Music scan of {} failed: {}", game_path, error);
+            return false;
+        }
+        info.game_title = collected.game_title;
+        info.stream_count = collected.entries.size();
+        info.cover = collected.icon;
+        // Replace, not accumulate: the caller may reuse one SourceInfo.
+        info.kind_counts.fill(0);
+        info.stream_bytes = 0;
+        for (const auto& entry : collected.entries) {
+            info.kind_counts[static_cast<std::size_t>(KindOf(entry.name))]++;
+            info.stream_bytes += entry.file != nullptr ? entry.file->GetSize() : 0;
+        }
+        return true;
+    } catch (const std::exception& ex) {
+        LOG_WARNING(Loader, "Music scan of {} failed: {}", game_path, ex.what());
         return false;
     }
-    info.game_title = collected.game_title;
-    info.stream_count = collected.entries.size();
-    info.cover = collected.icon;
-    for (const auto& entry : collected.entries) {
-        info.kind_counts[static_cast<std::size_t>(KindOf(entry.name))]++;
-        info.stream_bytes += entry.file != nullptr ? entry.file->GetSize() : 0;
-    }
-    return true;
 }
 
-Result ExtractMusic(const std::string& game_path, const Options& options,
-                    const std::function<void(const Progress&)>& progress,
-                    const std::atomic_bool* cancel, Summary* summary_out,
-                    std::string* error_out) {
+// The body behind the public entrypoint; static so it stays internal to this
+// translation unit.
+static Result ExtractMusicChecked(const std::string& game_path, const Options& options,
+                                   const std::function<void(const Progress&)>& progress,
+                                   const std::atomic_bool* cancel, Summary* summary_out,
+                                   std::string* error_out) {
     RealVfsFilesystem vfs;
     Collected collected;
     std::string error;
@@ -1427,6 +1538,12 @@ Result ExtractMusic(const std::string& game_path, const Options& options,
                          "segments, stems)";
         }
         return Result::NoMusic;
+    }
+
+    // Bail before touching the destination: an already-cancelled run must not
+    // truncate an existing manifest or overwrite earlier tracks.
+    if (cancel != nullptr && cancel->load()) {
+        return Result::Cancelled;
     }
 
     std::error_code ec;
@@ -1474,7 +1591,9 @@ Result ExtractMusic(const std::string& game_path, const Options& options,
         }
         out.title = std::move(clean.title);
         out.cue = std::move(clean.cue);
-        ++name_groups[{out.folder, out.title}];
+        // Case-folded keys: on a case-insensitive volume two spellings of one
+        // name are the same file, so the collision logic must see them as one.
+        ++name_groups[{Lower(out.folder), Lower(out.title)}];
         cleans.push_back(std::move(out));
     }
     std::map<std::pair<std::string, std::string>, u32> name_seen;
@@ -1484,22 +1603,29 @@ Result ExtractMusic(const std::string& game_path, const Options& options,
     for (const auto& [folder, title, cue] : cleans) {
         OutputPlan plan;
         plan.folder = folder;
+        const auto key = std::make_pair(Lower(folder), Lower(title));
         std::string display = title;
-        if (name_groups[{folder, title}] > 1) {
+        if (name_groups[key] > 1) {
             // Collisions fold the stream's own cue id back in when it has one;
             // a plain counter only when nothing distinguishes the names.
-            display = cue.empty() ? fmt::format("{} {}", title, ++name_seen[{folder, title}])
+            display = cue.empty() ? fmt::format("{} {}", title, ++name_seen[key])
                                   : fmt::format("{} {}", title, cue);
         }
         // Differently-marked streams can still clean to the same display name in
         // Flat mode; number whatever is left.
         const std::string base = display;
         u32 extra = 1;
-        while (!used_names.emplace(folder, display).second) {
+        while (!used_names.emplace(std::make_pair(Lower(folder), Lower(display))).second) {
             display = fmt::format("{} {}", base, ++extra);
         }
         plan.title = display;
-        plan.file_name = fmt::format("{}{}", display, extension);
+        if (SafeOutputPath(plan.folder, display)) {
+            plan.file_name = fmt::format("{}{}", display, extension);
+        } else {
+            // The dump controls its stream names; refuse anything that could
+            // escape the output folder instead of writing it.
+            plan.file_name.clear();
+        }
         plans.push_back(std::move(plan));
     }
 
@@ -1516,13 +1642,31 @@ Result ExtractMusic(const std::string& game_path, const Options& options,
     ImageInfo(base_tags.cover, base_tags.cover_mime, cover_width, cover_height);
 
     Summary summary;
-    std::ofstream manifest(options.out_dir / "manifest.csv", std::ios::binary | std::ios::trunc);
-    const bool have_manifest = manifest.good();
+    // manifest.csv is a fresh regular file or the run fails: an unopenable or
+    // linked path must not silently drop the extraction record.
+    std::string manifest_error;
+    std::error_code manifest_link_ec;
+    const auto manifest_path = options.out_dir / "manifest.csv";
+    if (std::filesystem::is_symlink(
+            std::filesystem::symlink_status(manifest_path, manifest_link_ec)) &&
+        !manifest_link_ec) {
+        manifest_error = "manifest.csv exists as a symlink; refusing to overwrite it";
+    }
+    std::ofstream manifest;
+    if (manifest_error.empty()) {
+        manifest.open(manifest_path, std::ios::binary | std::ios::trunc);
+    }
+    const bool have_manifest = manifest_error.empty() && manifest.good();
+    if (!have_manifest && manifest_error.empty()) {
+        manifest_error =
+            fmt::format("cannot create {}", Common::FS::PathToUTF8String(manifest_path));
+    }
     if (have_manifest) {
         manifest << "file,output,kind,channels,sample_rate,duration_seconds,loop_start_seconds,"
                     "loop_end_seconds,digest,duplicate_of,note\n";
     }
-    std::map<u64, std::string> seen_digests;
+    std::map<std::tuple<u64, u32, u16>, std::string> seen_digests;
+    std::set<std::string> verified_folders;
 
     for (std::size_t index = 0; index < collected.entries.size(); ++index) {
         const Entry& entry = collected.entries[index];
@@ -1539,7 +1683,9 @@ Result ExtractMusic(const std::string& game_path, const Options& options,
         std::string note;
         u64 digest{};
         bool decoded = false;
-        if (entry.file == nullptr) {
+        if (plan.file_name.empty()) {
+            note = "unsafe output name (the stream name is not a valid file name)";
+        } else if (entry.file == nullptr) {
             note = "file could not be opened";
         } else {
             const auto data = entry.file->ReadAllBytes();
@@ -1553,35 +1699,52 @@ Result ExtractMusic(const std::string& game_path, const Options& options,
 
         const std::string_view kind = KindName(KindOf(entry.name));
         const std::string output_rel =
-            plan.folder.empty() ? plan.file_name : plan.folder + "/" + plan.file_name;
+            plan.folder.empty()
+                ? plan.file_name
+                : plan.folder + "/" + (plan.file_name.empty() ? plan.title : plan.file_name);
 
         std::string duplicate_of;
         if (decoded) {
+            ec.clear();
             const auto sub = plan.folder.empty()
                                  ? options.out_dir
                                  : options.out_dir / std::filesystem::path{plan.folder};
-            if (!plan.folder.empty()) {
-                std::filesystem::create_directories(sub, ec);
-            }
-            if (ec) {
+            if (!plan.folder.empty() && FolderHasSymlink(options.out_dir, plan.folder,
+                                                         verified_folders)) {
+                // A link inside the output tree could send the writes somewhere
+                // else entirely; refuse instead of following it.
                 decoded = false;
-                note = fmt::format("cannot create {}: {}", Common::FS::PathToUTF8String(sub),
-                                   ec.message());
+                note = "the output folder passes through a symlink";
             } else {
-                TrackTags tags = base_tags;
-                tags.title = plan.title;
-                if (!WriteEncoded(sub / plan.file_name, track, options.encoding, tags)) {
+                std::error_code link_ec;
+                if (!plan.folder.empty()) {
+                    std::filesystem::create_directories(sub, ec);
+                }
+                if (ec) {
                     decoded = false;
-                    note = "write failed (is the disk full?)";
+                    note = fmt::format("cannot create {}: {}",
+                                       Common::FS::PathToUTF8String(sub), ec.message());
+                } else if (std::filesystem::is_symlink(
+                               std::filesystem::symlink_status(sub / plan.file_name, link_ec)) &&
+                           !link_ec) {
+                    decoded = false;
+                    note = "an existing symlink sits at the output path";
+                } else {
+                    TrackTags tags = base_tags;
+                    tags.title = plan.title;
+                    if (!WriteEncoded(sub / plan.file_name, track, options.encoding, tags)) {
+                        decoded = false;
+                        note = "write failed (is the disk full?)";
+                    }
                 }
             }
             if (decoded) {
-                const auto seen = seen_digests.find(digest);
+                const auto seen = seen_digests.find(TrackKey(track));
                 if (seen != seen_digests.end()) {
                     ++summary.duplicates;
                     duplicate_of = seen->second;
                 } else {
-                    seen_digests.emplace(digest, output_rel);
+                    seen_digests.emplace(TrackKey(track), output_rel);
                 }
             }
         }
@@ -1608,6 +1771,9 @@ Result ExtractMusic(const std::string& game_path, const Options& options,
                              : "")
                      << ',' << fmt::format("{:016x}", digest) << ','
                      << CsvEscape(duplicate_of) << ',' << CsvEscape(note) << '\n';
+            if (!manifest.good() && manifest_error.empty()) {
+                manifest_error = "failed writing manifest.csv";
+            }
         }
 
         state.files_done++;
@@ -1617,6 +1783,12 @@ Result ExtractMusic(const std::string& game_path, const Options& options,
         }
     }
 
+    if (have_manifest) {
+        manifest.close();
+        if (!manifest.good() && manifest_error.empty()) {
+            manifest_error = "failed writing manifest.csv";
+        }
+    }
     if (summary_out != nullptr) {
         *summary_out = summary;
     }
@@ -1625,11 +1797,37 @@ Result ExtractMusic(const std::string& game_path, const Options& options,
     }
     if (summary.files_ok == 0) {
         if (error_out != nullptr) {
-            *error_out = "every stream failed to decode (see manifest.csv)";
+            *error_out = manifest_error.empty()
+                             ? "every stream failed to decode (see manifest.csv)"
+                             : manifest_error;
+        }
+        return Result::IoError;
+    }
+    if (!manifest_error.empty()) {
+        if (error_out != nullptr) {
+            *error_out = manifest_error;
         }
         return Result::IoError;
     }
     return Result::Success;
+}
+
+Result ExtractMusic(const std::string& game_path, const Options& options,
+                    const std::function<void(const Progress&)>& progress,
+                    const std::atomic_bool* cancel, Summary* summary_out,
+                    std::string* error_out) {
+    // The UI runs this inside a thread pool, where an uncaught exception
+    // terminates the app; the checked body may still see one from allocation
+    // or anything the error-code conversions above missed.
+    try {
+        return ExtractMusicChecked(game_path, options, progress, cancel, summary_out,
+                                   error_out);
+    } catch (const std::exception& ex) {
+        if (error_out != nullptr) {
+            *error_out = ex.what();
+        }
+        return Result::IoError;
+    }
 }
 
 } // namespace FileSys::Music

@@ -429,6 +429,17 @@ TEST_CASE("FileSys::Music round-trips through a loose dump", "[core][music]") {
     std::memcpy(&rate, main_pcm.data() + 24, sizeof(rate));
     REQUIRE(rate == 32000);
 
+    // The declared RIFF size covers every chunk through the end of the file.
+    u32 riff_size{};
+    std::memcpy(&riff_size, main_pcm.data() + 4, sizeof(riff_size));
+    REQUIRE(riff_size == main_pcm.size() - 8);
+
+    // A second scan replaces the first's totals instead of accumulating them.
+    FileSys::Music::SourceInfo again;
+    REQUIRE(FileSys::Music::ScanMusic(main.string(), again));
+    REQUIRE(again.stream_count == info.stream_count);
+    REQUIRE(again.stream_bytes == info.stream_bytes);
+
     // Embedded metadata: clean title plus "<game> - Original OST".
     REQUIRE(main_pcm.find("TIT2") != std::string::npos);
     REQUIRE(main_pcm.find("Main") != std::string::npos);
@@ -632,13 +643,82 @@ TEST_CASE("FileSys::Music reports cancellation and per-file failures", "[core][m
     REQUIRE(manifest.find("BGM_Bad.bwav,Music/Bad.wav,bgm,,,") != std::string::npos);
     REQUIRE(manifest.find("missing BWAV magic") != std::string::npos);
 
-    // Cancellation stops before the first file.
+    // Cancellation stops before touching the destination: an existing manifest
+    // survives a cancelled rerun untouched.
+    Put(out_dir.path / "manifest.csv", "sentinel\n");
     std::atomic_bool cancel{true};
     FileSys::Music::Summary cancelled;
     REQUIRE(FileSys::Music::ExtractMusic((dump_dir.path / "base/exefs/main").string(), options,
                                          {}, &cancel, &cancelled, &error) ==
             FileSys::Music::Result::Cancelled);
     REQUIRE(cancelled.files_ok == 0);
+    REQUIRE(ReadAll(out_dir.path / "manifest.csv") == "sentinel\n");
+}
+
+TEST_CASE("FileSys::Music tells a music-free dump apart from a bad source",
+          "[core][music]") {
+    TempDir dump_dir;
+    Put(dump_dir.path / "base/exefs/main", "main");
+    Put(dump_dir.path / "base/exefs/main.npdm", Npdm(TitleId));
+    Put(dump_dir.path / "base/romfs/credits.txt", "no audio here");
+
+    const fs::path main = dump_dir.path / "base/exefs/main";
+    FileSys::Music::SourceInfo info;
+    // A valid dump that stores no stream music is recognized; it just has none.
+    REQUIRE(FileSys::Music::ScanMusic(main.string(), info));
+    REQUIRE(info.stream_count == 0);
+
+    FileSys::Music::Options options;
+    options.out_dir = dump_dir.path / "out";
+    FileSys::Music::Summary summary;
+    std::string error;
+    REQUIRE(FileSys::Music::ExtractMusic(main.string(), options, {}, nullptr, &summary,
+                                         &error) == FileSys::Music::Result::NoMusic);
+
+    // A plain folder is still not a music source at all.
+    FileSys::Music::SourceInfo bad;
+    REQUIRE(!FileSys::Music::ScanMusic((dump_dir.path / "base").string(), bad));
+}
+
+TEST_CASE("FileSys::Music refuses unsafe and linked output destinations",
+          "[core][music]") {
+    TempDir dump_dir;
+    TempDir out_dir;
+    TempDir link_target;
+    const fs::path stream = dump_dir.path / "base/romfs/Sound/Resource/Stream";
+    Put(dump_dir.path / "base/exefs/main", "main");
+    Put(dump_dir.path / "base/exefs/main.npdm", Npdm(TitleId));
+    // A stream whose cleaned folder is "..", one whose kind folder someone
+    // replaced with a symlink, and a healthy cutscene track beside them.
+    Put(stream / "BGM_.._Escape.bwav",
+        MakeDspBwav(NibblePattern(1, 28), NibblePattern(9, 28)));
+    Put(stream / "BGM_Linked.bwav", MakeDspBwav(NibblePattern(2, 28), NibblePattern(10, 28)));
+    Put(stream / "Dm_Good.bwav", MakeDspBwav(NibblePattern(3, 28), NibblePattern(11, 28)));
+    std::error_code link_ec;
+    std::filesystem::create_directory_symlink(link_target.path, out_dir.path / "Music");
+    const fs::path main = dump_dir.path / "base/exefs/main";
+
+    FileSys::Music::Options options;
+    options.out_dir = out_dir.path;
+    options.layout = FileSys::Music::Layout::ByKind;
+    options.encoding = FileSys::Music::Encoding::Wav;
+
+    FileSys::Music::Summary summary;
+    std::string error;
+    REQUIRE(FileSys::Music::ExtractMusic(main.string(), options, {}, nullptr, &summary,
+                                         &error) == FileSys::Music::Result::Success);
+    REQUIRE(summary.files_ok == 1);
+    REQUIRE(summary.files_failed == 2);
+    REQUIRE(fs::exists(out_dir.path / "Cutscenes/Good.wav"));
+    // Neither refusal wrote anything: no escape out of Music/, nothing through
+    // the link.
+    REQUIRE(!fs::exists(out_dir.path / "Escape.wav"));
+    REQUIRE(fs::is_empty(link_target.path));
+    const auto manifest = ReadAll(out_dir.path / "manifest.csv");
+    REQUIRE(manifest.find("BGM_.._Escape.bwav,Music/../Escape,bgm,,,") != std::string::npos);
+    REQUIRE(manifest.find("unsafe output name") != std::string::npos);
+    REQUIRE(manifest.find("BGM_Linked.bwav,Music/Linked.wav,bgm,,,") != std::string::npos);
+    REQUIRE(manifest.find("the output folder passes through a symlink") != std::string::npos);
 }
 
 // Opt-in run against a real game archive: set EDEN_MUSIC_TEST_NUP to a .nup file and
@@ -829,6 +909,47 @@ TEST_CASE("FileSys::Music decodes NXOpus BWAV streams", "[core][music]") {
     REQUIRE(wav.substr(44, 2 * kSamples * 2) ==
             PcmPayload(Interleave(expected_left, expected_right)));
 }
+
+TEST_CASE("FileSys::Music rejects hostile BWAV headers without wild allocations",
+          "[core][music]") {
+    TempDir dump_dir;
+    TempDir out_dir;
+    const fs::path stream = dump_dir.path / "base/romfs/Sound/Resource/Stream";
+    Put(dump_dir.path / "base/exefs/main", "main");
+    Put(dump_dir.path / "base/exefs/main.npdm", Npdm(TitleId));
+
+    // An NXOpus chunk whose data offset would wrap 32-bit arithmetic before the
+    // bounds checks.
+    std::string wrap_stream(0x2C, '\0');
+    Put32(wrap_stream, 0x00, 0x80000001);
+    wrap_stream[0x09] = 1;
+    Put32(wrap_stream, 0x0c, 48000);
+    Put32(wrap_stream, 0x10, 0xFFFFFFF0);
+    Put(stream / "BGM_Wrap.bwav", MakeNxOpusBwav(wrap_stream, wrap_stream, 0, 28));
+
+    // A declared sample count that would ask for gigabytes of decoded audio.
+    std::string huge = MakeDspBwav(NibblePattern(1, 28), NibblePattern(9, 28));
+    Put32(huge, 0x10 + 0x0c, 0x20000000);
+    Put(stream / "BGM_Huge.bwav", huge);
+
+    FileSys::Music::Options options;
+    options.out_dir = out_dir.path;
+    options.layout = FileSys::Music::Layout::ByKind;
+    options.encoding = FileSys::Music::Encoding::Wav;
+
+    FileSys::Music::Summary summary;
+    std::string error;
+    REQUIRE(FileSys::Music::ExtractMusic((dump_dir.path / "base/exefs/main").string(), options,
+                                         {}, nullptr, &summary, &error) ==
+            FileSys::Music::Result::IoError);
+    REQUIRE(summary.files_ok == 0);
+    REQUIRE(summary.files_failed == 2);
+    const auto manifest = ReadAll(out_dir.path / "manifest.csv");
+    REQUIRE(manifest.find("BGM_Wrap.bwav,Music/Wrap.wav,bgm,,,") != std::string::npos);
+    REQUIRE(manifest.find("NXOpus: missing data info chunk") != std::string::npos);
+    REQUIRE(manifest.find("declared sample count exceeds the stream data") != std::string::npos);
+}
+
 TEST_CASE("FileSys::Music embeds a chosen cover into every track", "[core][music]") {
     TempDir dump_dir;
     TempDir out_dir;
