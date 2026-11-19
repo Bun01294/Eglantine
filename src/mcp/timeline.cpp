@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -10,7 +13,7 @@
 namespace Mcp {
 
 namespace {
-constexpr std::array<std::pair<EventKind, std::string_view>, 10> kKindNames{{
+constexpr std::array<std::pair<EventKind, std::string_view>, 11> kKindNames{{
     {EventKind::Log, "log"},
     {EventKind::State, "state"},
     {EventKind::Input, "input"},
@@ -21,9 +24,11 @@ constexpr std::array<std::pair<EventKind, std::string_view>, 10> kKindNames{{
     {EventKind::Watch, "watch"},
     {EventKind::Crash, "crash"},
     {EventKind::Frame, "frame"},
+    {EventKind::Break, "break"},
 }};
 } // namespace
 
+/// Short name of an event kind ("log", "crash", ...), or "unknown".
 std::string_view EventKindName(EventKind kind) {
     for (const auto& [k, name] : kKindNames) {
         if (k == kind) {
@@ -33,6 +38,7 @@ std::string_view EventKindName(EventKind kind) {
     return "unknown";
 }
 
+/// Event kind for a short name, or nullopt if the name is unknown.
 std::optional<EventKind> EventKindFromName(std::string_view name) {
     for (const auto& [k, n] : kKindNames) {
         if (n == name) {
@@ -42,54 +48,13 @@ std::optional<EventKind> EventKindFromName(std::string_view name) {
     return std::nullopt;
 }
 
+/// Creates a ring holding `capacity` events (at least one).
 Timeline::Timeline(size_t capacity, FrameSource frame_source_)
     : frame_source{std::move(frame_source_)}, start{std::chrono::steady_clock::now()},
       ring(capacity == 0 ? 1 : capacity) {}
 
-std::string SanitizeText(std::string_view text, size_t max_bytes) {
-    // Guest-controlled text (debug strings, names) is arbitrary bytes: JSON serialization throws
-    // on invalid UTF-8, which on a streaming thread would end the process. Keep valid sequences,
-    // replace every other byte with U+FFFD, and stop at a character boundary under max_bytes.
-    constexpr std::string_view kReplacement = "\xEF\xBF\xBD";
-    std::string out;
-    out.reserve(std::min(text.size(), max_bytes));
-    size_t i = 0;
-    while (i < text.size()) {
-        const auto c = static_cast<unsigned char>(text[i]);
-        size_t length = 0;
-        if (c < 0x80) {
-            length = 1;
-        } else if (c >= 0xC2 && c <= 0xDF) {
-            length = 2;
-        } else if (c >= 0xE0 && c <= 0xEF) {
-            length = 3;
-        } else if (c >= 0xF0 && c <= 0xF4) {
-            length = 4;
-        }
-        bool valid = length != 0 && i + length <= text.size();
-        for (size_t k = 1; valid && k < length; ++k) {
-            valid = (static_cast<unsigned char>(text[i + k]) & 0xC0) == 0x80;
-        }
-        if (valid && length == 3) {
-            const auto c1 = static_cast<unsigned char>(text[i + 1]);
-            valid = !(c == 0xE0 && c1 < 0xA0) && !(c == 0xED && c1 > 0x9F); // overlong, surrogates
-        } else if (valid && length == 4) {
-            const auto c1 = static_cast<unsigned char>(text[i + 1]);
-            valid = !(c == 0xF0 && c1 < 0x90) && !(c == 0xF4 && c1 > 0x8F); // overlong, > U+10FFFF
-        }
-        const std::string_view piece = valid ? text.substr(i, length) : kReplacement;
-        if (out.size() + piece.size() > max_bytes) {
-            break;
-        }
-        out += piece;
-        i += valid ? length : 1;
-    }
-    return out;
-}
-
+/// Stores an event stamped with time and frame, wakes waiters, and returns its sequence number.
 u64 Timeline::Push(EventKind kind, u8 level, std::string source, std::string message) {
-    source = SanitizeText(source, kMaxSourceBytes);
-    message = SanitizeText(message, kMaxMessageBytes);
     const u64 time_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
                                              std::chrono::steady_clock::now() - start)
                                              .count());
@@ -113,6 +78,7 @@ u64 Timeline::Push(EventKind kind, u8 level, std::string source, std::string mes
     return seq;
 }
 
+/// True if the event passes the query's kind, level, source and text filters.
 bool Timeline::Matches(const Event& event, const Query& query) {
     if (!query.kinds.empty() &&
         std::find(query.kinds.begin(), query.kinds.end(), event.kind) == query.kinds.end()) {
@@ -130,6 +96,7 @@ bool Timeline::Matches(const Event& event, const Query& query) {
     return true;
 }
 
+/// Matching events after `since_seq`, up to the limit, with dropped and truncated counts.
 Timeline::QueryResult Timeline::Read(const Query& query) const {
     QueryResult result;
     std::scoped_lock lock{mutex};
@@ -160,6 +127,7 @@ Timeline::QueryResult Timeline::Read(const Query& query) const {
     return result;
 }
 
+/// Blocks until an event after `since_seq` matches the query, or the timeout passes.
 std::optional<Event> Timeline::WaitFor(const Query& query, std::chrono::milliseconds timeout) const {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     u64 cursor = query.since_seq;

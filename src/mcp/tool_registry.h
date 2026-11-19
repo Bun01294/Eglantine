@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -47,5 +50,24 @@ std::optional<std::string> ValidateArguments(const json& schema, const json& val
 
 /// True for names made of lowercase letters, digits and underscores, starting with a letter.
 bool IsValidToolName(std::string_view name);
+
+/// Each tool file registers its tools through one of these; RegisterAllTools calls them all.
+void RegisterCoreTools(ToolRegistry& registry);
+void RegisterEmulationTools(ToolRegistry& registry);
+void RegisterInputTools(ToolRegistry& registry);
+void RegisterDebugTools(ToolRegistry& registry);
+void RegisterControlTools(ToolRegistry& registry);
+void RegisterActTools(ToolRegistry& registry);
+void RegisterTasTools(ToolRegistry& registry);
+void RegisterPerfTools(ToolRegistry& registry);
+void RegisterProcessTools(ToolRegistry& registry);
+void RegisterMemoryTools(ToolRegistry& registry);
+void RegisterTraceTools(ToolRegistry& registry);
+void RegisterSettingsTools(ToolRegistry& registry);
+void RegisterGameStateTools(ToolRegistry& registry);
+void RegisterTimelineTools(ToolRegistry& registry);
+void RegisterDebuggerTools(ToolRegistry& registry);
+void RegisterArtifactTools(ToolRegistry& registry);
+void RegisterAbTestTools(ToolRegistry& registry);
 
 } // namespace Mcp

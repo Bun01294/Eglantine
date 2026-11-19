@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -76,19 +79,20 @@ auto BreadthFirstSearch(Value value, Pred&& pred, Resolve&& resolve = {})
     return std::nullopt;
 }
 
-/// BreadthFirstSearch for many searches with the same predicate over IR that does not change.
-/// `exhausted` holds instructions from which nothing reachable matches the predicate: a failed
-/// search adds everything it visited, later searches skip them. The result is the same as
-/// BreadthFirstSearch's: skipped instructions and everything reachable from them never match, and
-/// an instruction that is not reachable from them is only queued by instructions that are not
-/// either, so those are visited in the same order as without skipping.
+/// BreadthFirstSearch for many searches with the same predicate and resolver over IR that does
+/// not change. `exhausted` holds instructions from which nothing reachable matches: a failed
+/// search adds everything it visited and later searches skip them. The result is
+/// BreadthFirstSearch's: skipped instructions and all they reach never match, and an instruction
+/// not reachable from them is only queued by instructions that are not either, so those are
+/// visited in the same order.
 /// `expand(inst)` returns false for instructions whose arguments are not searched (the NVN raw
 /// global memory search does not walk through memory loads); the default searches everything.
-template <typename Pred, typename Expand = bool (*)(const Inst*)>
-auto BreadthFirstSearchPruned(Value value, Pred&& pred,
-                              std::unordered_set<const Inst*>& exhausted,
-                              Expand&& expand = [](const Inst*) { return true; })
+template <typename Pred, typename Expand = bool (*)(const Inst*), typename Resolve = std::identity>
+auto BreadthFirstSearchPruned(Value value, Pred&& pred, std::unordered_set<const Inst*>& exhausted,
+                              Expand&& expand = [](const Inst*) { return true; },
+                              Resolve&& resolve = {})
     -> std::invoke_result_t<Pred, const Inst*> {
+    value = resolve(value);
     if (value.IsImmediate()) {
         return std::nullopt;
     }
@@ -111,7 +115,7 @@ auto BreadthFirstSearchPruned(Value value, Pred&& pred,
         }
         // Visit the right most arguments first
         for (size_t arg = inst->NumArgs(); arg--;) {
-            const Value arg_value{inst->Arg(arg)};
+            const Value arg_value{resolve(inst->Arg(arg))};
             if (arg_value.IsImmediate()) {
                 continue;
             }

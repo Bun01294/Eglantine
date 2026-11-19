@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -29,6 +32,7 @@ enum class EventKind : u8 {
     Watch,
     Crash,
     Frame,
+    Break, ///< Debugger breakpoint/watchpoint hits and other debugger stops.
 };
 
 /// Short lowercase name of a kind ("log", "unimpl", ...), or "unknown".
@@ -49,14 +53,6 @@ struct Event {
 
 /// Bounded, sequence-numbered record of everything the emulator did, readable with a cursor so
 /// a turn-based agent misses nothing between calls. Producers may run on any thread.
-/// Longest event message and source kept (bytes): guest strings can be any size.
-inline constexpr size_t kMaxMessageBytes = 16 * 1024;
-inline constexpr size_t kMaxSourceBytes = 128;
-
-/// `text` as valid UTF-8 (every invalid byte becomes U+FFFD) cut at a character boundary under
-/// `max_bytes`. Timeline::Push applies it to every event, so events always serialize to JSON.
-[[nodiscard]] std::string SanitizeText(std::string_view text, size_t max_bytes);
-
 class Timeline {
 public:
     /// Returns the current guest frame number; called on every Push.

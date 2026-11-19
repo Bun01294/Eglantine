@@ -1,9 +1,13 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
 
 #include <atomic>
+#include <stop_token>
 #include <string>
 
 namespace Core {
@@ -24,14 +28,10 @@ struct ToolContext {
     bool writes_allowed = false;
     ControlLease* control = nullptr;
     std::string session_id; ///< MCP session making the call.
-    /// The server's live Allow Writes flag (null in unit tests: `writes_allowed` is used).
+    /// The server's live Allow Writes flag, for work that outlasts the call (background routes).
     const std::atomic<bool>* live_writes = nullptr;
-
-    /// Allow Writes right now, for work that outlasts the call (background routes) and handlers
-    /// that wait for a lock: `writes_allowed` is only a copy taken when the call arrived.
-    [[nodiscard]] bool WritesAllowed() const {
-        return live_writes != nullptr ? live_writes->load(std::memory_order_relaxed) : writes_allowed;
-    }
+    /// Set for background work (routes, A/B tests): input steps end early when it is requested.
+    std::stop_token stop;
 
     /// True when a system is set, powered on and not shutting down.
     [[nodiscard]] bool GameRunning() const;

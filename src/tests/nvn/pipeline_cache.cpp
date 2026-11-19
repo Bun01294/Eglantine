@@ -453,8 +453,9 @@ TEST_CASE("Shader cache identity includes the compute driver bank layout",
 TEST_CASE("Vulkan cache removal includes NVN caches and preserves other files",
           "[nvn][shader-refresh]") {
     for (const std::string_view name :
-         {"vulkan.bin", "vulkan_pipelines.bin", "nvn_pipelines.bin", "nvn_pipelines.vkcache",
-          "nvn_pipelines.k0123456789abcdef.bin", "nvn_pipelines.2b7551f137ab.bin"}) {
+         {"vulkan.bin", "vulkan_pipelines.bin", "vulkan.mythos.bin", "vulkan_pipelines.mythos.bin",
+          "nvn_pipelines.bin", "nvn_pipelines.vkcache", "nvn_pipelines.k0123456789abcdef.bin",
+          "nvn_pipelines.2b7551f137ab.bin"}) {
         INFO(name);
         CHECK(VideoCommon::IsVulkanPipelineCacheFile(name));
     }

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -16,6 +19,7 @@
 #include <type_traits>
 // TODO: find out which don't require stable iters
 #include <unordered_map>
+#include "video_core/page_filter.h"
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
 #include <vector>
@@ -129,6 +133,8 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 gc_deletes{};
     u64 gc_costly_deletes{};
     u64 gc_download_deletes{}; ///< Evictions that downloaded the image first (a full GPU wait)
+    u64 stale_deletes{}; ///< BadOverlap images collected early (TC_STALE_AGE)
+    u64 stale_upload_skips{}; ///< Render targets made without uploading stale bytes
     u64 async_decodes_queued{};
     u64 images_created{};
     u64 images_uploaded{};   ///< Image contents uploaded from guest memory (last 600 frames)
@@ -148,12 +154,17 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     std::vector<u8> astc_scan_buffer;
     u64 images_deleted{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
-    bool debug_stats{true}; ///< Collect what only the debug statistics lines use
+    std::unordered_map<GPUVAddr, u32> created_addresses;
+    u64 creations_at_existing_address{};
+    u64 creations_with_join{};
+    u64 creations_with_gpu_join{};
+    u64 creations_with_full_gpu_join{};
+    bool debug_stats{}; ///< Collect what only the debug statistics lines use
 
     static constexpr s64 DEFAULT_EXPECTED_MEMORY = 1_GiB + 125_MiB;
     static constexpr s64 DEFAULT_CRITICAL_MEMORY = 1_GiB + 625_MiB;
-    /// The most device memory the collector lets the cache fill before it collects in earnest,
-    /// on every GPU (ApplyThresholdOverrides).
+    /// The most device memory the collector lets the cache fill before it collects in earnest on
+    /// cards up to 8 GiB; larger ones 5/8 of the driver's budget (ApplyThresholdOverrides).
     static constexpr u64 MaxCriticalMemory = 5_GiB;
     static constexpr size_t GC_EMERGENCY_COUNTS = 2;
 
@@ -178,6 +189,9 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     /// Records the layers a write of [cpu_addr, +size) touches.
     void MarkLayersWritten(Image& image, ImageId image_id, DAddr cpu_addr, size_t size);
 
+    /// Records the layers a GPU remap of [gpu_addr, +size) touches.
+    void MarkLayersRemapped(Image& image, GPUVAddr gpu_addr, size_t size);
+
     /// SparseTiles images: notes a written range, uploaded with the next refresh.
     void MarkRangeWritten(Image& image, ImageId image_id, DAddr cpu_addr, size_t size);
 
@@ -187,6 +201,9 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
 
     /// SparseTiles images: binds and uploads the parts written since the last upload.
     void RefreshSparseTiles(Image& image);
+
+    /// Brings a SparseTilesUnmapped image up to date with the tiles mapped now (see the flag).
+    void RefreshUnmappedSparseTiles(Image& image, ImageId image_id);
 
     /// Image::BindTiles, counting what it binds in total_used_memory.
     bool BindSparseTiles(Image& image, std::span<const LevelRect> rects);
@@ -225,6 +242,9 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     };
 
 public:
+    /// Device pages this cache ever registered objects on (InnerInvalidation skips the rest).
+    VideoCommon::PageFilter page_filter;
+
     explicit TextureCache(Runtime&, Tegra::MaxwellDeviceMemoryManager&);
 
     /// Notify the cache that a new frame has been queued
@@ -232,6 +252,21 @@ public:
 
     /// Return a constant reference to the given image view id
     [[nodiscard]] const ImageView& GetImageView(ImageViewId id) const noexcept;
+
+    /// Diagnostic state, not a complete producer history or an asynchronous-queue safety proof.
+    [[nodiscard]] std::pair<bool, bool> Nx2ViewWrittenState(ImageViewId id) const noexcept {
+        if (id == NULL_IMAGE_VIEW_ID) {
+            return {};
+        }
+        const auto& view = slot_image_views[id];
+        if (view.IsBuffer() || !view.image_id) {
+            return {};
+        }
+        const ImageBase& image = slot_images[view.image_id];
+        const bool gpu_modified = True(image.flags & ImageFlagBits::GpuModified);
+        return {gpu_modified,
+                gpu_modified && image.modification_tick > frame_start_modification_tick};
+    }
 
     /// Return a reference to the given image view id
     [[nodiscard]] ImageView& GetImageView(ImageViewId id) noexcept;
@@ -248,8 +283,13 @@ public:
     /// Fill image_view_ids with the graphics/compute images in indices
     void FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist = true);
 
+    /// Points sampled views of the draw's own colour targets at copies taken before the draw.
+    void ReplaceColorFeedbackViews(std::span<ImageViewInOut> views);
+
     /// Handle feedback loops during draws.
     void CheckFeedbackLoop(std::span<const ImageViewInOut> views);
+
+    [[nodiscard]] bool SamplesRenderTarget(std::span<const ImageViewInOut> views);
 
     /// Get the sampler from the graphics/compute descriptor table in the specified index
     Sampler* GetSampler(u32 index, bool compute);
@@ -277,6 +317,18 @@ public:
     /// Find a framebuffer with the currently bound render targets
     /// UpdateRenderTargets should be called before this
     Framebuffer* GetFramebuffer();
+
+    /// True when the current draw's color target 0 already holds an earlier frame's output and
+    /// was not fully cleared this frame (P2.1 stale_target_skip).
+    [[nodiscard]] bool ColorTargetHasPriorFrameOutput() noexcept;
+    /// Whether render target 0 was first written in an earlier frame (cleared this frame or not):
+    /// a target the title draws every frame rather than one it fills once.
+    [[nodiscard]] bool ColorTargetWrittenBeforeThisFrame() noexcept;
+
+private:
+    [[nodiscard]] bool ColorTargetWrittenBefore(bool require_uncleared) noexcept;
+
+public:
 
     [[nodiscard]] const RenderTargets& GetRenderTargets() const noexcept {
         return render_targets;
@@ -308,6 +360,17 @@ public:
                          const Tegra::Engines::Fermi2D::Surface& motion_vectors,
                          const Tegra::Texture::TICEntry* depth, std::array<f32, 2> jitter,
                          std::array<f32, 2> motion_scale);
+
+    /// NVIDIA DLSS (DLAA or Super Resolution) on src into dst with the scene depth at
+    /// depth_address and motion from the camera (see the runtime's UpscaleWithCameraMotion).
+    /// render_size is the scene's size in host pixels. False when it can't run; the caller keeps
+    /// its native dispatch.
+    bool CameraMotionUpscale(const Tegra::Engines::Fermi2D::Surface& dst,
+                             const Tegra::Engines::Fermi2D::Surface& src,
+                             const ImageInfo& depth_info, GPUVAddr depth_address,
+                             std::array<u32, 2> render_size,
+                             const std::array<f32, 16>& reprojection, std::array<f32, 2> jitter,
+                             bool reset);
 
     /// Health check of a game's DLSS network output (dst) against its input (src); see the
     /// runtime's ProbeGameDlssOutput. Returns an earlier check's result when one is ready.
@@ -427,7 +490,8 @@ private:
 
     /// Create a new image and join perfectly matching existing images
     /// Remove joined images from the cache
-    [[nodiscard]] ImageId JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DAddr cpu_addr);
+    [[nodiscard]] ImageId JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DAddr cpu_addr,
+                                    RelaxedOptions options);
 
     [[nodiscard]] ImageId FindDMAImage(const ImageInfo& info, GPUVAddr gpu_addr);
 
@@ -572,6 +636,7 @@ private:
     u64 minimum_memory;
     u64 expected_memory;
     u64 critical_memory;
+    u64 native_heap_budget{};
     size_t gpu_unswizzle_maxsize = 0;
     size_t swizzle_chunk_size = 0;
     u32 swizzle_slices_per_batch = 0;
@@ -639,7 +704,9 @@ private:
     Common::ScratchBuffer<u8> unswizzle_data_buffer;
 
     u64 modification_tick = 0;
+    u64 frame_start_modification_tick = 0;
     u64 frame_tick = 0;
+    u64 sparse_tiles_refreshed = 0; ///< SparseTilesUnmapped images brought up to date
 
     Common::ThreadWorker texture_decode_worker{1, "TextureDecoder", {},
                                                Common::ThreadPlacement::Efficiency};
@@ -649,6 +716,12 @@ private:
 
     std::deque<PendingUnswizzle> unswizzle_queue;
     u8 current_unswizzle_frame;
+
+    struct FeedbackShadow {
+        ImageId id;
+        u64 last_frame;
+    };
+    std::vector<FeedbackShadow> feedback_shadows;
 
     // Join caching
     boost::container::small_vector<ImageId, 4> join_overlap_ids;

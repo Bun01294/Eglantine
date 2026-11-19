@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -7,68 +10,23 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cctype>
 #include <chrono>
-#include <filesystem>
-#include <functional>
 #include <optional>
+#include <stop_token>
 #include <string>
-#include <string_view>
 #include <thread>
 #include <vector>
 
 #include "mcp/timeline.h"
 #include "mcp/tool.h"
 
-namespace Core {
-class System;
+namespace Settings {
+class BasicSetting;
 }
 
 namespace Mcp {
 
-class Host;
 struct ToolContext;
-
-// act_tools.cpp
-/// Gate for tools (or tool arguments) that change state but are annotated read_only so they do
-/// not hold the global mutating-tools mutex: returns an error when Allow Writes is off right now
-/// or another session holds the control lease, otherwise renews the caller's lease and returns
-/// nullopt. Long-running handlers call it before every further input they send.
-std::optional<ToolResult> RequireWritesAndControl(ToolContext& ctx);
-/// Same check as a message ("" when allowed; the lease is renewed).
-std::string WriteGateError(ToolContext& ctx);
-/// Refusal text for a tool argument that needs writes (`what` e.g. "remove").
-ToolResult NeedsWritesError(std::string_view what);
-/// Called when Allow Writes is switched off: stops background routes and route recording, TAS
-/// playback/recording, and releases every virtual button and stick, so nothing keeps sending
-/// input after the user revokes writes.
-/// Call it on the frontend's UI thread: it touches the TAS engine directly (the thread its
-/// hotkeys run on) and only asks worker threads to stop, it never waits for them.
-void StopWriteWork(Host& host, Core::System& system);
-/// `path` relative to the Eden data directory with forward slashes (e.g. "config/mcp/routes/x.json"),
-/// or just the file name when it lies elsewhere. Tool output uses it instead of absolute paths,
-/// which contain the OS user name.
-std::string DataRelativePath(const std::filesystem::path& path);
-
-// server.cpp
-/// Masks key material, serials and similar secrets in a message before it leaves the server.
-std::string RedactKeys(std::string_view message);
-
-/// True for Windows reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9), case-insensitive,
-/// with or without an extension ("nul.txt"): files with these names open the device, not a file.
-inline bool IsReservedDeviceName(std::string_view name) {
-    std::string stem{name.substr(0, name.find('.'))};
-    while (!stem.empty() && (stem.back() == ' ')) {
-        stem.pop_back();
-    }
-    std::transform(stem.begin(), stem.end(), stem.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-    if (stem == "CON" || stem == "PRN" || stem == "AUX" || stem == "NUL") {
-        return true;
-    }
-    return stem.size() == 4 && (stem.starts_with("COM") || stem.starts_with("LPT")) &&
-           stem[3] >= '0' && stem[3] <= '9';
-}
 
 // input_tools.cpp
 /// Schema of the `player` argument (1-8 = P1-P8, 9 = handheld).
@@ -79,9 +37,6 @@ json InputStepsSchema();
 size_t NpadIndex(const json& args);
 /// Runs input_sequence steps on the virtual gamepad. Returns an error message, or "" on success.
 std::string RunInputSteps(ToolContext& ctx, size_t npad, const json& steps);
-/// Error text when `steps` is not a valid input step list (types, ranges, known buttons), or "".
-/// For route steps from hand-editable files; RunInputSteps checks again before sending anything.
-std::string ValidateInputSteps(const json& steps);
 /// Buttons and sticks as the game sees them.
 json ControllerStateJson(ToolContext& ctx, size_t npad);
 
@@ -97,31 +52,40 @@ Timeline::Query ParseQuery(const json& args);
 /// or no valid sample yet.
 json PerfJson(ToolContext& ctx);
 
-// memory_tools.cpp
+// game_state_tools.cpp
+/// {screen, scores} for the current frame, or null (error set).
+json GameScreenState(ToolContext& ctx, std::string& error);
+/// Waits until the screen is one of `labels`; returns the label or "" on timeout.
+std::string GameWaitScreen(ToolContext& ctx, const json& labels, std::chrono::milliseconds timeout,
+                           json& state);
+/// All saved probes of the running game with current values.
+json GameProbes(ToolContext& ctx);
+/// Runs the saved route `name` of the running game on the calling thread (same runner, checks
+/// and progress reporting as route_run). Returns {ok, results, elapsed_ms}, or null with `error`
+/// set when the route does not exist.
+json RunRouteForTool(ToolContext& ctx, const std::string& name, std::stop_token stop,
+                     std::string& error);
+// perf_tools.cpp
+/// perf_sample's measurement as JSON (for route steps that measure at a checkpoint).
+json RunPerfSample(ToolContext& ctx, const json& args);
+
+/// Saves the current frame as a named per-game visual baseline (fingerprint + PNG).
+json BaselineSave(ToolContext& ctx, const std::string& name, std::string& error);
+/// Scores the current frame against a baseline: {score, pass, baseline_png}; optional PNG out.
+json BaselineCheck(ToolContext& ctx, const std::string& name, double threshold, std::string& error,
+                   std::vector<u8>* current_png);
+/// Stops a background route and a recording (server shutdown: they use the host).
+void StopGameStateWork();
 /// Ends memory watches and their sampling thread (server shutdown).
 void StopMemoryWork();
-// emulation_tools.cpp
-/// PNG of the capture layer (works paused/hidden), scaled to max_width. Empty under VTX-HLE,
-/// whose replay never renders that layer.
+/// PNG of the capture layer (works paused/hidden), scaled to max_width.
 std::optional<std::vector<u8>> RawCapturePng(ToolContext& ctx, u32 max_width, std::string& error);
-/// A presented-frame screenshot kept for when no new frame can be captured (paused).
-struct CachedScreenshot {
-    std::vector<u8> png;
-    u64 frame = 0; ///< Guest presents counted when it was taken.
-    std::chrono::steady_clock::time_point taken;
-};
-/// Stores `png` as the newest presented-frame screenshot.
-void RememberScreenshot(std::vector<u8> png, u64 frame);
-/// The newest screenshot CaptureScreenshot took, if any.
-[[nodiscard]] std::optional<CachedScreenshot> LastScreenshot();
-/// Host::CaptureScreenshotPng that also remembers the frame for FallbackFrame.
-std::optional<std::vector<u8>> CaptureScreenshot(ToolContext& ctx, u32 max_width,
-                                                 std::chrono::milliseconds timeout,
-                                                 std::string& error);
-/// An image when no frame is presented (paused): the capture layer, else the last presented
-/// screenshot. `source` names which one; nullopt (error set) when there is neither.
-std::optional<std::vector<u8>> FallbackFrame(ToolContext& ctx, u32 max_width, std::string& source,
-                                             std::string& error);
+
+// trace_tools.cpp: core observers feeding the timeline (installed while the server runs).
+/// Installs the unimplemented-command and crash hooks that post timeline events.
+void InstallTraceHooks();
+/// Clears all trace hooks, including the IPC and SVC ones the trace tools may have enabled.
+void RemoveTraceHooks();
 
 /// Set while the server shuts down: long waits in tools check it and return early.
 inline std::atomic<bool> g_server_stopping{false};
@@ -130,10 +94,11 @@ inline std::atomic<bool> g_server_stopping{false};
     return g_server_stopping.load(std::memory_order_relaxed);
 }
 /// Sleeps up to `duration`, returning early (false) when the server is stopping.
-inline bool SleepUnlessStopping(std::chrono::milliseconds duration) {
+inline bool SleepUnlessStopping(std::chrono::milliseconds duration,
+                                std::stop_token stop = {}) {
     const auto until = std::chrono::steady_clock::now() + duration;
     while (std::chrono::steady_clock::now() < until) {
-        if (ServerStopping()) {
+        if (ServerStopping() || stop.stop_requested()) {
             return false;
         }
         std::this_thread::sleep_for(
@@ -149,6 +114,37 @@ inline bool SleepUnlessStopping(std::chrono::milliseconds duration) {
 u64 PresentedFrames();
 /// Waits until `frames` more frames are presented. Returns the number actually presented
 /// (fewer on timeout, e.g. when paused or loading).
-u64 WaitFrames(u64 frames, std::chrono::milliseconds timeout);
+u64 WaitFrames(u64 frames, std::chrono::milliseconds timeout, std::stop_token stop = {});
+
+// game_state_tools.cpp
+/// Resolves "0x1234", "Module+0x10" or a pointer chain ("Module+0x10->0x8") to a guest address.
+/// Returns nullopt with error set.
+std::optional<u64> ResolveGuestAddress(ToolContext& ctx, const std::string& expr,
+                                       std::string& error);
+
+// settings_tools.cpp (shared so every tool applies the same hidden-settings rule)
+/// A setting agents may use, by config key: nullptr if unknown or hidden (credentials, serials,
+/// the MCP's own access settings).
+Settings::BasicSetting* FindAgentSetting(const std::string& name);
+/// Sets a setting from text the way settings_set does (enums also by name). Returns an error
+/// message, or "" on success.
+std::string SetSettingFromText(Settings::BasicSetting& setting, const std::string& value);
+
+// abtest_tools.cpp
+/// Stops a running ab_test and waits for it (server shutdown: it uses the host).
+void StopAbTestWork();
+/// Asks an ab_test started by `session` to stop (the session ended); does not wait.
+void StopSessionAbTest(const std::string& session);
+/// Stops and waits for the background route `session` started, if any (the session ended).
+void StopSessionRoutes(const std::string& session);
+
+// debugger_tools.cpp
+/// Debugger state (attached, running/paused, breakpoints, recent hits) for status and dashboard.
+json DebuggerStatusJson();
+/// Removes breakpoints and detaches from the GDB stub (server shutdown).
+void StopDebuggerWork();
+/// After a boot with the GDB stub on: waits (up to 30 s) for the stub to listen and attaches,
+/// which lets the waiting game run. Returns an error message or "".
+std::string AttachDebuggerAfterBoot(ToolContext& ctx);
 
 } // namespace Mcp
