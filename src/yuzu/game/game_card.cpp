@@ -82,6 +82,14 @@ QRectF GameCard::CartridgeLabelRect(const QRectF& cartridge_rect) {
             CartridgeLabel.width() * sx, CartridgeLabel.height() * sy};
 }
 
+QRectF GameCard::CartridgeBodyRect(const QRectF& cartridge_rect) {
+    const qreal sx = cartridge_rect.width() / CartridgeBase.width();
+    const qreal sy = cartridge_rect.height() / CartridgeBase.height();
+    return {cartridge_rect.left() + CartridgeBody.x() * sx,
+            cartridge_rect.top() + CartridgeBody.y() * sy,
+            CartridgeBody.width() * sx, CartridgeBody.height() * sy};
+}
+
 void GameCard::DrawCoverCropped(QPainter& painter, const QPixmap& pixmap,
                                 const QRectF& target) {
     if (pixmap.isNull() || target.isEmpty()) {

@@ -342,8 +342,15 @@ void DrawStackedCartridge(QPainter& p, const QPixmap& icon, const QRectF& slot, 
     }
     p.save();
     p.setTransform(tilt);
+    // The frame's slot carries a transparent margin and a faint baked shadow around the
+    // solid body. Clip and fog the body itself: washing the whole slot paints a translucent
+    // border around every stacked card, and a clip wider than the frame's own ~8%-width
+    // corners trims them.
+    const QRectF body = GameCard::CartridgeBodyRect(QRectF(0, 0, aw, ah));
+    const qreal body_radius =
+        GameCard::CartridgeBodyRadius * aw / GameCard::CartridgeBase.width();
     QPainterPath clip;
-    clip.addRoundedRect(QRectF(0, 0, aw, ah), aw * 0.10, aw * 0.10);
+    clip.addRoundedRect(body, body_radius, body_radius);
     p.setClipPath(clip);
     p.drawPixmap(QRectF(0, 0, aw, ah), frame,
                  QRectF(0, 0, frame.width(), frame.height()));
@@ -355,7 +362,7 @@ void DrawStackedCartridge(QPainter& p, const QPixmap& icon, const QRectF& slot, 
     GameCard::DrawCoverCropped(p, icon, label);
     p.restore();
     const int fog = std::min(FogMax, qRound(d * FogPerStep));
-    p.fillRect(QRectF(0, 0, aw, ah), WithAlpha(pal.color(QPalette::Window), fog));
+    p.fillRect(body, WithAlpha(pal.color(QPalette::Window), fog));
     p.restore();
 }
 
@@ -392,6 +399,17 @@ void DrawCard(QPainter& p, const QModelIndex& index, const QRectF& rect, qreal d
             const QRectF& cart = rect;
             const QPixmap frame = GameCard::CartridgePixmap(qRound(cart.height()), dpr);
             if (!frame.isNull()) {
+                // The frame's slot carries a transparent margin and a faint baked shadow
+                // around the solid body; clip to the body so the silhouette matches the
+                // stacked cards and nothing translucent hugs the card. The frame goes down
+                // first and the game art sits on its label, cover-cropped.
+                const QRectF body = GameCard::CartridgeBodyRect(cart);
+                const qreal body_radius =
+                    GameCard::CartridgeBodyRadius * cart.width() /
+                    GameCard::CartridgeBase.width();
+                QPainterPath body_clip;
+                body_clip.addRoundedRect(body, body_radius, body_radius);
+                p.setClipPath(body_clip);
                 // The frame first, the game art on its label: the label design shows through
                 // the art's transparent regions.
                 p.drawPixmap(cart, frame, QRectF(0, 0, frame.width(), frame.height()));
@@ -664,6 +682,11 @@ QModelIndex GameCarousel::indexAt(const QPoint& point) const {
         return {};
     }
     const CarouselMetrics m = MetricsFor(viewport()->size());
+    // The cartridge slot carries a transparent margin around the solid body, and the next
+    // card's art shows through it: hit-test the body, or a click on what looks like the
+    // neighbour's cartridge lands on the centered card's empty margin and selects nothing.
+    const bool cartridge = UISettings::values.game_icon_borders.GetValue() &&
+                           UISettings::values.game_cartridge_kind.GetValue() == 1;
     const int max_depth =
         std::clamp(int(UISettings::values.carousel_side_count.GetValue()), 1, MaxSideCount) + 1;
     int best = -1;
@@ -673,7 +696,9 @@ QModelIndex GameCarousel::indexAt(const QPoint& point) const {
         if (std::abs(depth) > max_depth) {
             continue;
         }
-        if (CardRect(depth, m).contains(QPointF(point)) &&
+        const QRectF hit = cartridge ? GameCard::CartridgeBodyRect(CardRect(depth, m))
+                                     : CardRect(depth, m);
+        if (hit.contains(QPointF(point)) &&
             (best < 0 || std::abs(depth) < std::abs(best_depth))) {
             best = position;
             best_depth = depth;

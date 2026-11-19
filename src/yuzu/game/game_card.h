@@ -26,6 +26,8 @@ public:
     static constexpr qreal CartridgeAspect = 232.0 / 324.0;
     static constexpr QSizeF CartridgeBase{232.0, 324.0};
     static constexpr QRectF CartridgeLabel{32.6, 39.5, 166.0, 234.0};
+    static constexpr QRectF CartridgeBody{13.0, 8.0, 205.0, 297.0};
+    static constexpr qreal CartridgeBodyRadius = 18.0;
 
     /// The cartridge frame rendered `height_px` logical pixels tall. Rendering the SVG on every
     /// card paint would be far too slow to scroll, so heights are quantized to 32-pixel buckets
@@ -33,6 +35,9 @@ public:
     static QPixmap CartridgePixmap(int height_px, qreal dpr);
     /// The label area of a cartridge frame placed at `cartridge_rect`.
     static QRectF CartridgeLabelRect(const QRectF& cartridge_rect);
+    /// The frame's solid body -- no transparent margin, no baked shadow -- placed at
+    /// `cartridge_rect`.
+    static QRectF CartridgeBodyRect(const QRectF& cartridge_rect);
     /// The pixmap centered and cover-cropped to fill `target`'s aspect.
     static void DrawCoverCropped(QPainter& painter, const QPixmap& pixmap, const QRectF& target);
 
