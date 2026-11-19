@@ -372,7 +372,11 @@ void DrawCard(QPainter& p, const QModelIndex& index, const QRectF& rect, qreal d
     if (icon.isNull()) {
         return;
     }
-    if (d < 1.0) {
+    const bool cartridge = borders && UISettings::values.game_cartridge_kind.GetValue() == 1;
+    // The cartridge's own solid frame is its outline: a translucent shadow halo or a
+    // selection ring drawn around it reads as an ugly transparent border, so neither is
+    // drawn in cartridge mode.
+    if (d < 1.0 && !cartridge) {
         // Only the card taking the center slot casts the full shadow.
         DrawCardShadow(p, rect, int((1.0 - d) * 13));
     }
@@ -382,7 +386,6 @@ void DrawCard(QPainter& p, const QModelIndex& index, const QRectF& rect, qreal d
         p.setOpacity(alpha);
     }
     const int side = icon.width();
-    const bool cartridge = borders && UISettings::values.game_cartridge_kind.GetValue() == 1;
 
     if (centered) {
         if (cartridge) {
@@ -464,7 +467,7 @@ void DrawCard(QPainter& p, const QModelIndex& index, const QRectF& rect, qreal d
     }
     p.restore();
 
-    if (centered && focused) {
+    if (centered && focused && !cartridge) {
         p.setBrush(Qt::NoBrush);
         p.setPen(QPen(pal.color(QPalette::Highlight), FocusRingWidth));
         p.drawRoundedRect(rect.adjusted(-1, -1, 1, 1), rect.width() * 0.08 + 1,
