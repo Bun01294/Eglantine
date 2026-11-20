@@ -51,6 +51,8 @@
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/physical_core.h"
+#include "core/hle/nvn/bridge.h"
+#include "core/hle/nvn/hle_runtime.h"
 #include "core/hle/service/acc/profile_manager.h"
 #include "core/hle/service/am/applet_manager.h"
 #include "core/hle/service/am/frontend/applets.h"
@@ -126,8 +128,6 @@ FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
     return vfs->OpenFile(path, FileSys::OpenMode::Read);
 }
 
-namespace {
-
 // Detect the platform before initializing the kernel memory layout and guest clock.
 bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id, std::size_t program_index) {
     FileSys::ProgramMetadata metadata;
@@ -185,6 +185,8 @@ bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id, std::siz
     return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
            metadata.IsSwitch2();
 }
+
+namespace {
 
 /// Frame spike recorder source: every application thread's CPU ticks, counting the running
 /// thread of each core up to now (the kernel only adds a thread's time when it switches out).
@@ -564,6 +566,8 @@ struct System::Impl {
         VideoCommon::Nx2Spikes::SetGuestThreadSource({});
         debug_service.reset();
         SetShuttingDown(true);
+        Core::NvnHle::Bridge::Shutdown();
+        Core::NvnHle::Hle::Runtime::Instance().Shutdown();
         Common::ADPF::Shutdown();
 
         // Reset per-game flags
@@ -592,6 +596,9 @@ struct System::Impl {
         host1x_core.reset();
         perf_stats.reset();
         cpu_manager.Shutdown();
+        // No guest thread can be inside an NVN call any more, and the renderer is gone: the
+        // Recorder (disconnected from the sink by Shutdown) and the guest memory can be freed.
+        Core::NvnHle::Hle::Runtime::Instance().Release();
         debugger.reset();
         kernel.Shutdown();
         stop_event = {};
