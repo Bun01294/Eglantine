@@ -161,7 +161,6 @@ inline constexpr VkPipelineStageFlags PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER_H
 
 inline constexpr VkPipelineStageFlags PIPELINE_STAGE_HOST = VK_PIPELINE_STAGE_HOST_BIT;
 
-
 /// Table holding Vulkan instance function pointers.
 struct InstanceDispatch {
     PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr{};
@@ -252,6 +251,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdPushDescriptorSetKHR vkCmdPushDescriptorSetKHR{};
     PFN_vkCmdPushDescriptorSetWithTemplateKHR vkCmdPushDescriptorSetWithTemplateKHR{};
     PFN_vkCmdResetQueryPool vkCmdResetQueryPool{};
+    PFN_vkCmdWriteTimestamp vkCmdWriteTimestamp{};
     PFN_vkCmdResolveImage vkCmdResolveImage{};
     PFN_vkCmdSetBlendConstants vkCmdSetBlendConstants{};
     PFN_vkCmdSetCullModeEXT vkCmdSetCullModeEXT{};
@@ -292,7 +292,6 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdSetColorBlendEnableEXT vkCmdSetColorBlendEnableEXT{};
     PFN_vkCmdSetColorBlendEquationEXT vkCmdSetColorBlendEquationEXT{};
     PFN_vkCmdWaitEvents vkCmdWaitEvents{};
-    PFN_vkCmdWriteTimestamp vkCmdWriteTimestamp{};
     PFN_vkCreateBuffer vkCreateBuffer{};
     PFN_vkCreateBufferView vkCreateBufferView{};
     PFN_vkCreateCommandPool vkCreateCommandPool{};
@@ -1291,6 +1290,11 @@ public:
         dld->vkCmdResetQueryPool(handle, query_pool, first, count);
     }
 
+    void WriteTimestamp(VkPipelineStageFlagBits stage, VkQueryPool query_pool,
+                        u32 query) const noexcept {
+        dld->vkCmdWriteTimestamp(handle, stage, query_pool, query);
+    }
+
     void BindDescriptorSets(VkPipelineBindPoint bind_point, VkPipelineLayout layout, u32 first,
                             Span<VkDescriptorSet> sets, Span<u32> dynamic_offsets) const noexcept {
         dld->vkCmdBindDescriptorSets(handle, bind_point, layout, first, sets.size(), sets.data(),
@@ -1628,11 +1632,6 @@ public:
         dld->vkCmdWaitEvents(handle, events.size(), events.data(), src_stage_mask, dst_stage_mask,
                              memory_barriers.size(), memory_barriers.data(), buffer_barriers.size(),
                              buffer_barriers.data(), image_barriers.size(), image_barriers.data());
-    }
-
-    void WriteTimestamp(VkPipelineStageFlagBits stage, VkQueryPool query_pool,
-                        u32 query) const noexcept {
-        dld->vkCmdWriteTimestamp(handle, stage, query_pool, query);
     }
 
     void BindVertexBuffers2EXT(u32 first_binding, u32 binding_count, const VkBuffer* buffers,

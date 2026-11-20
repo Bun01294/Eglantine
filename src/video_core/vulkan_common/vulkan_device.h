@@ -89,7 +89,6 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE(KHR, WorkgroupMemoryExplicitLayout, WORKGROUP_MEMORY_EXPLICIT_LAYOUT,                  \
             workgroup_memory_explicit_layout)
 
-
 // Define miscellaneous extensions which may be used by the implementation here.
 #define FOR_EACH_VK_EXTENSION(EXTENSION)                                                           \
     EXTENSION(EXT, ASTC_DECODE_MODE, astc_decode_mode)                                             \
@@ -280,8 +279,10 @@ public:
     enum class SeparatePool : u32 {
         SparsePages,
         DeviceBuffers,
+        TransientImages,
     };
     static constexpr VkDeviceSize SeparatePoolBlockSize = 16ULL << 20;
+    static constexpr VkDeviceSize TransientImageBlockSize = 128ULL << 20;
 
     /// The pool of that kind for a memory type, created on first use (null if that failed).
     /// Null for any allocator `user` but the device's own (externally synchronized) one: a VmaPool
@@ -315,6 +316,11 @@ public:
     /// Returns the main graphics queue.
     vk::Queue GetGraphicsQueue() const {
         return graphics_queue;
+    }
+
+    /// Nanoseconds per GPU timestamp tick.
+    float GetTimestampPeriod() const {
+        return properties.properties.limits.timestampPeriod;
     }
 
     /// Returns the main present queue.
@@ -1338,7 +1344,7 @@ private:
     VkInstance instance;         ///< Vulkan instance.
     VmaAllocator allocator{};    ///< VMA allocator.
     mutable std::mutex separate_pools_mutex;
-    mutable std::array<std::array<VmaPool, VK_MAX_MEMORY_TYPES>, 2> separate_pools{};
+    mutable std::array<std::array<VmaPool, VK_MAX_MEMORY_TYPES>, 3> separate_pools{};
     vk::DeviceDispatch dld;      ///< Device function pointers.
     vk::PhysicalDevice physical; ///< Physical device.
     vk::Device logical;          ///< Logical device.
