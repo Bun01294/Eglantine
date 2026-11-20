@@ -65,19 +65,17 @@ constexpr std::array<KindChoice, FileSys::Music::KindCount> KindRows{{
 
 } // namespace
 
-MusicExtractDialog::MusicExtractDialog(const FileSys::Music::SourceInfo& info,
-                                       QWidget* parent)
+MusicExtractDialog::MusicExtractDialog(const FileSys::Music::SourceInfo& info, QWidget* parent)
     : QDialog(parent), nup_cover(info.cover) {
-    setWindowTitle(tr("Extract Music"));
+    setWindowTitle(tr("Audio Explorer"));
     setModal(true);
     setMinimumWidth(520);
 
     const QString title = QString::fromStdString(info.game_title).trimmed();
-    auto* summary = new QLabel(
-        tr("%1 music stream(s), about %2 MB, found in %3.")
-            .arg(info.stream_count)
-            .arg(info.stream_bytes / (1024 * 1024))
-            .arg(title.isEmpty() ? tr("this game") : title));
+    auto* summary = new QLabel(tr("%1 music stream(s), about %2 MB, found in %3.")
+                                   .arg(info.stream_count)
+                                   .arg(info.stream_bytes / (1024 * 1024))
+                                   .arg(title.isEmpty() ? tr("this game") : title));
     summary->setWordWrap(true);
 
     auto* out_label = new QLabel(tr("Output folder:"));
@@ -110,16 +108,13 @@ MusicExtractDialog::MusicExtractDialog(const FileSys::Music::SourceInfo& info,
     kinds_grid->setVerticalSpacing(4);
     for (std::size_t index = 0; index < KindRows.size(); ++index) {
         const KindChoice& choice = KindRows[index];
-        auto* box = new QCheckBox(tr("%1 (%2)")
-                                      .arg(tr(choice.label))
-                                      .arg(info.kind_counts[index]));
+        auto* box = new QCheckBox(tr("%1 (%2)").arg(tr(choice.label)).arg(info.kind_counts[index]));
         box->setToolTip(tr(choice.tooltip));
         box->setChecked(info.kind_counts[index] > 0);
         box->setEnabled(info.kind_counts[index] > 0);
         connect(box, &QCheckBox::toggled, this, &MusicExtractDialog::UpdateOkEnabled);
         kind_boxes[index] = box;
-        kinds_grid->addWidget(box, static_cast<int>(index / 3),
-                              static_cast<int>(index % 3));
+        kinds_grid->addWidget(box, static_cast<int>(index / 3), static_cast<int>(index % 3));
     }
     auto* kinds_holder = new QWidget;
     kinds_holder->setLayout(kinds_grid);
@@ -181,18 +176,17 @@ MusicExtractDialog::MusicExtractDialog(const FileSys::Music::SourceInfo& info,
 
 void MusicExtractDialog::Browse() {
     const QString current = out_edit->text();
-    const QString dir = QFileDialog::getExistingDirectory(
-        this, tr("Select Music Output Folder"),
-        QDir(current).dirName().isEmpty() ? QString{} : current);
+    const QString dir =
+        QFileDialog::getExistingDirectory(this, tr("Select Music Output Folder"),
+                                          QDir(current).dirName().isEmpty() ? QString{} : current);
     if (!dir.isEmpty()) {
         out_edit->setText(QDir::toNativeSeparators(dir));
     }
 }
 
 void MusicExtractDialog::ChooseCover() {
-    const QString path =
-        QFileDialog::getOpenFileName(this, tr("Select Cover Art"), QString{},
-                                      tr("Images (*.png *.jpg *.jpeg);;All Files (*)"));
+    const QString path = QFileDialog::getOpenFileName(
+        this, tr("Select Cover Art"), QString{}, tr("Images (*.png *.jpg *.jpeg);;All Files (*)"));
     if (path.isEmpty()) {
         return;
     }
@@ -223,9 +217,8 @@ void MusicExtractDialog::UpdateCoverLabel() {
 }
 
 void MusicExtractDialog::UpdateOkEnabled() {
-    const bool any_kind =
-        std::any_of(kind_boxes.begin(), kind_boxes.end(),
-                    [](const QCheckBox* box) { return box->isChecked(); });
+    const bool any_kind = std::any_of(kind_boxes.begin(), kind_boxes.end(),
+                                      [](const QCheckBox* box) { return box->isChecked(); });
     ok_button->setEnabled(!out_edit->text().trimmed().isEmpty() && any_kind);
 }
 
@@ -234,8 +227,7 @@ std::filesystem::path MusicExtractDialog::OutDir() const {
 }
 
 FileSys::Music::Layout MusicExtractDialog::Layout() const {
-    return layout_flat->isChecked() ? FileSys::Music::Layout::Flat
-                                   : FileSys::Music::Layout::ByKind;
+    return layout_flat->isChecked() ? FileSys::Music::Layout::Flat : FileSys::Music::Layout::ByKind;
 }
 
 FileSys::Music::Encoding MusicExtractDialog::Encoding() const {
