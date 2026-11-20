@@ -1914,6 +1914,8 @@ void MainWindow::ConnectWidgetEvents() {
     connect(game_list, &GameList::PopulatingCompleted,
             [this] { multiplayer_state->UpdateGameList(game_list->GetModel()); });
     connect(game_list, &GameList::SaveConfig, this, &MainWindow::OnSaveConfig);
+    connect(game_list, &GameList::GameListModeRequested, this, &MainWindow::SetGameListMode);
+    connect(game_list, &GameList::GameIconSizeRequested, this, &MainWindow::SetGameIconSize);
 
     connect(game_list, &GameList::OpenPerGameGeneralRequested, this,
             &MainWindow::OnGameListOpenPerGameProperties);
@@ -2003,11 +2005,7 @@ void MainWindow::ConnectMenuEvents() {
 
         connect(action, &QAction::triggered, this, [this, size](bool checked) {
             if (checked) {
-                UISettings::values.game_icon_size.SetValue(size);
-                CheckIconSize();
-
-                game_list->UpdateIconSizes();
-                game_list->RefreshGameDirectory();
+                SetGameIconSize(size);
             }
         });
     }
@@ -2856,6 +2854,7 @@ void MainWindow::OnEmulationStopped() {
         firmware_label->setVisible(true);
     }
 
+    const QString stopped_game_path = current_game_path;
     current_game_path.clear();
 
     // When closing the game, destroy the GLWindow to clear the context after the game is closed
@@ -2873,6 +2872,9 @@ void MainWindow::OnEmulationStopped() {
     } else if (!boot_in_progress) {
         game_list->SetScanEnabled(true);
         game_list->PopulateAsync(UISettings::values.game_dirs);
+        if (!stopped_game_path.isEmpty()) {
+            game_list->ShowGameDetailsForPath(stopped_game_path);
+        }
     }
 }
 
@@ -3758,7 +3760,7 @@ bool MainWindow::ConfirmShutdownGame() {
 void MainWindow::OnLoadComplete() {
     loading_screen->OnLoadComplete();
 
-    perf_overlay = new PerformanceOverlay(this);
+    perf_overlay = new PerformanceOverlay(this, render_window);
     perf_overlay->setVisible(ui->action_Show_Performance_Overlay->isChecked());
 
     connect(perf_overlay, &PerformanceOverlay::closed, perf_overlay,
@@ -4060,6 +4062,18 @@ void MainWindow::SetTreeView() {
 
 void MainWindow::SetCarouselView() {
     SetGameListMode(Settings::GameListMode::CarouselView);
+}
+
+void MainWindow::SetGameIconSize(u32 size) {
+    UISettings::values.game_icon_size.SetValue(size);
+    const auto actions = game_size_actions->actions();
+    for (size_t i = 0; i < default_game_icon_sizes.size(); i++) {
+        actions.at(i)->setChecked(default_game_icon_sizes[i].first == size);
+    }
+    CheckIconSize();
+
+    game_list->UpdateIconSizes();
+    game_list->RefreshGameDirectory();
 }
 
 void MainWindow::CheckIconSize() {

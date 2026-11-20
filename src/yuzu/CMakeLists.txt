@@ -177,7 +177,6 @@ add_executable(yuzu
     install_dialog.h
     loading_screen.cpp
     loading_screen.h
-    loading_screen.ui
 
     main.cpp
 
@@ -251,10 +250,15 @@ add_executable(yuzu
     configuration/system/profile_avatar_dialog.h configuration/system/profile_avatar_dialog.cpp
     configuration/addon/mod_select_dialog.h configuration/addon/mod_select_dialog.cpp configuration/addon/mod_select_dialog.ui
 
-    render/performance_overlay.h render/performance_overlay.cpp render/performance_overlay.ui
+    render/performance_overlay.h render/performance_overlay.cpp
+    render/perf_sampler.h render/perf_sampler.cpp
     updater/update_dialog.h updater/update_dialog.cpp updater/update_dialog.ui
     game/common.h
     game/carousel.h game/carousel.cpp
+    game/home_background.h game/home_background.cpp
+    game/home_customize_panel.h game/home_customize_panel.cpp
+    game/home_side_panel.h game/home_side_panel.cpp
+    game/game_details_panel.h game/game_details_panel.cpp
 )
 
 set_target_properties(yuzu PROPERTIES OUTPUT_NAME "eglantine")
