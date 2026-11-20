@@ -331,7 +331,7 @@ TEST_CASE("MKW batched texture signatures keep every sampled line", "[nvn][mkw]"
         },
         batch);
     CHECK(gathered == signature);
-    CHECK(reads == (size <= 16384 ? 1 : 256));
+    CHECK(reads == (size <= 16384 ? 1u : 256u));
     if (size <= 16384) {
         CHECK(signature == Common::CityHash64(reinterpret_cast<const char*>(bytes.data()), size));
         if (size != 0) {
@@ -1446,7 +1446,7 @@ TEST_CASE("nvn memory: a large sparse texture is bound and uploaded tile by tile
                             .flags = POOL_CPU_CACHED});
     rig.context.MapVirtual(VIRTUAL_POOL, {{0, ALIAS_POOL, 0, TILE}});
     REQUIRE(read_tile(0, 0) == c);
-    CHECK(rig.context.Stats().uploads == (mario_kart_world ? 4 : 5));
+    CHECK(rig.context.Stats().uploads == (mario_kart_world ? 4u : 5u));
 
     // The cached physical users must follow a remap to another pool object.
     put_tile(0x30000, a);
@@ -1910,7 +1910,7 @@ TEST_CASE("nvn memory: MKW copies decoded ASTC 8x8 texels between UNORM and sRGB
          });
     Run(rig.context, rig.seq, std::move(list));
     CHECK(rig.context.Stats().ops_failed == 0);
-    CHECK(rig.context.Stats().ops_unsupported == (mario_kart_world ? 0 : 1));
+    CHECK(rig.context.Stats().ops_unsupported == (mario_kart_world ? 0u : 1u));
 }
 
 TEST_CASE("nvn memory: spills count device-local requests placed in host memory types", "[nvn]") {
@@ -2398,7 +2398,7 @@ TEST_CASE("MKW buffer lookup cache follows pool replacement and virtual remaps",
     };
     resolve(0x10120, 64, 1, 0x120);
     resolve(0x10120, 64, 1, 0x120);
-    CHECK(impl->mkw_resolve_hits == (impl->mario_kart_world ? 1 : 0));
+    CHECK(impl->mkw_resolve_hits == (impl->mario_kart_world ? 1u : 0u));
     impl->CreatePoolNow({.serial = 4, .guest_address = 0x10100, .size = 0x100});
     resolve(0x10120, 64, 4, 0x20);
     impl->DestroyNow(4);
