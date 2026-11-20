@@ -1046,6 +1046,7 @@ void GameDetailsPanel::ResetArt(bool hero) {
         QtCommon::GameArt::RemoveHero(game.program_id);
         hero_cache.remove(game.program_id);
         ReloadHero();
+        emit HeroChanged(game.program_id);
     } else {
         QtCommon::GameArt::RemoveIcon(game.program_id);
         emit IconChanged(game.program_id);
@@ -1061,6 +1062,7 @@ void GameDetailsPanel::SaveHero(u64 program_id, const QByteArray& image) {
     if (program_id == game.program_id) {
         ReloadHero();
     }
+    emit HeroChanged(program_id);
 }
 
 void GameDetailsPanel::SaveIcon(u64 program_id, const QByteArray& png) {

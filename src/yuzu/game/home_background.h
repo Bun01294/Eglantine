@@ -73,7 +73,7 @@ public:
     /// Scales `image` to cover `target`, cropping the overflow evenly on both sides.
     static void PaintCover(QPainter& painter, const QRect& target, const QImage& image);
     /// A game's banner, cover-cropped to `target` and softly blurred, as a backdrop. Cached
-    /// per size; a null pixmap when the game has no banner.
+    /// per size and file stamp; a null pixmap when the game has no banner.
     static QPixmap ScaledHero(u64 program_id, const QSize& target, qreal dpr);
     /// The stored kind value; anything outside Picture..Gradient reads as a picture.
     static Kind KindFromInt(int value) {

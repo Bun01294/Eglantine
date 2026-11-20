@@ -154,6 +154,8 @@ signals:
     void FavoriteToggled();
     void MoreRequested(const QPoint& global_pos);
     void IconChanged(u64 program_id);
+    /// The shown game's banner file was saved or removed.
+    void HeroChanged(u64 program_id);
     void OpenLocationRequested();
     void PrecompileShadersRequested();
     /// The full list of add-ons that should be disabled for the shown game.

@@ -179,21 +179,25 @@ void HomeBackground::PaintCover(QPainter& painter, const QRect& target, const QI
 }
 
 QPixmap HomeBackground::ScaledHero(u64 program_id, const QSize& target, qreal dpr) {
-    const QString key = QStringLiteral("eglantine-hero-backdrop-%1-%2x%3-%4")
-                            .arg(program_id)
-                            .arg(target.width())
-                            .arg(target.height())
-                            .arg(dpr);
-    QPixmap cached;
-    if (QPixmapCache::find(key, &cached)) {
-        return cached;
-    }
     if (program_id == 0) {
         return {};
     }
     const QString path = QtCommon::GameArt::HeroPath(program_id);
-    if (!QFileInfo::exists(path)) {
+    const QFileInfo info(path);
+    if (!info.isFile()) {
         return {};
+    }
+    // The file's stamp is part of the key: saving or removing a banner changes the pixels
+    // without changing the id, and a stale entry would keep the old image on screen.
+    const QString key = QStringLiteral("eglantine-hero-backdrop-%1-%2x%3-%4-%5")
+                            .arg(program_id)
+                            .arg(target.width())
+                            .arg(target.height())
+                            .arg(dpr)
+                            .arg(info.lastModified().toMSecsSinceEpoch());
+    QPixmap cached;
+    if (QPixmapCache::find(key, &cached)) {
+        return cached;
     }
     QImageReader reader(path);
     const QSize full = reader.size();

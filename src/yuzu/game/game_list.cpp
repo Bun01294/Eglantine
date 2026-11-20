@@ -26,6 +26,7 @@
 #include <QPainter>
 #include <QPointer>
 #include <QPropertyAnimation>
+#include <QResizeEvent>
 #include <QScrollBar>
 #include <QScroller>
 #include <QScrollerProperties>
@@ -132,7 +133,25 @@ public:
             Qt::QueuedConnection);
     }
 
+    /// Re-reads the current game's banner after its artwork file was changed or removed.
+    /// SetBannerGame normally ignores a repeat id, so reset it to force a fresh decode.
+    void RefreshBanner() {
+        const u64 id = m_banner_id;
+        m_banner_id = 0;
+        SetBannerGame(id);
+    }
+
 protected:
+    void resizeEvent(QResizeEvent* event) override {
+        QWidget::resizeEvent(event);
+        // The banner decodes at a given size, so re-read it at the new one; queued like a
+        // slide loads its banner, so the first paint at the new size stretches the old
+        // pixmap over the gap instead of blocking on the decode.
+        if (m_banner_id != 0 && !size().isEmpty()) {
+            RefreshBanner();
+        }
+    }
+
     void paintEvent(QPaintEvent*) override {
         QPainter p(this);
         PaintBackdrop(p);
@@ -165,12 +184,14 @@ private:
                         // The last banner ebbs away over the normal background.
                         p.setOpacity(1.0 - m_banner_alpha);
                     }
-                    p.drawPixmap(0, 0, m_banner_from);
+                    // A banner decoded at an older, smaller size must still cover the whole surface,
+                    // or the uncovered strip reads as a grey panel.
+                    p.drawPixmap(rect(), m_banner_from);
                     p.setOpacity(1.0);
                 }
                 if (has_to && m_banner_alpha > 0.0) {
                     p.setOpacity(m_banner_alpha);
-                    p.drawPixmap(0, 0, m_banner_to);
+                    p.drawPixmap(rect(), m_banner_to);
                     p.setOpacity(1.0);
                 }
                 // The same readability scrim the picture path applies.
@@ -751,6 +772,9 @@ void GameList::SetupGameDetails() {
         menu.exec(pos);
     });
     connect(details_panel, &GameDetailsPanel::IconChanged, this, &GameList::UpdateGameIcon);
+    // A saved or removed banner changes the backdrop pixels without changing the centered game.
+    connect(details_panel, &GameDetailsPanel::HeroChanged, this,
+            [this](u64) { surface->RefreshBanner(); });
 }
 
 void GameList::ShowGameDetailsForPath(const QString& path) {
