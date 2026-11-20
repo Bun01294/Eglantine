@@ -1322,7 +1322,7 @@ bool WriteOpus(const std::filesystem::path& path, const DecodedTrack& track,
     } else {
         mapping.resize(track.channels);
         for (u16 ch = 0; ch < track.channels; ++ch) {
-            mapping[ch] = ch;
+            mapping[ch] = static_cast<unsigned char>(ch);
         }
         ms_encoder.reset(opus_multistream_encoder_create(OpusRate, track.channels,
                                                          track.channels, 0, mapping.data(),
