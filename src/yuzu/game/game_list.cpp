@@ -512,7 +512,7 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
     // loose dump; other content types (installed NSPs, XCI) are not supported.
     QAction* extract_music = nullptr;
     if (is_nup_archive || FileSys::Nup::DumpRootFromMain(path)) {
-        extract_music = context_menu.addAction(tr("Dump Music"));
+        extract_music = context_menu.addAction(tr("Dump Audio"));
         extract_music->setEnabled(!nup_conversion_running);
     }
     QAction* extract_nup = nullptr;

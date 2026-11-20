@@ -72,10 +72,14 @@ MusicExtractDialog::MusicExtractDialog(const FileSys::Music::SourceInfo& info, Q
     setMinimumWidth(520);
 
     const QString title = QString::fromStdString(info.game_title).trimmed();
-    auto* summary = new QLabel(tr("%1 music stream(s), about %2 MB, found in %3.")
-                                   .arg(info.stream_count)
-                                   .arg(info.stream_bytes / (1024 * 1024))
-                                   .arg(title.isEmpty() ? tr("this game") : title));
+    auto* summary = new QLabel(
+        tr("Only unencrypted formats are supported. NSP files and any format that requires "
+           "decryption keys can't be used.\n\n"
+           "Extracted audio is for your personal use only and remains the property of Nintendo. "
+           "Eglantine does not support or allow its distribution.")
+            .arg(info.stream_count)
+            .arg(info.stream_bytes / (1024 * 1024))
+            .arg(title.isEmpty() ? tr("this game") : title));
     summary->setWordWrap(true);
 
     auto* out_label = new QLabel(tr("Output folder:"));
