@@ -307,6 +307,8 @@ struct PipelineBase {
     vk::Pipeline pipeline;
     vk::PipelineLayout layout;
     vk::DescriptorSetLayout set_layout; ///< null when the pipeline has no descriptors
+    /// Set BINDLESS_SET of the layout when a stage samples through the bindless table.
+    vk::DescriptorSetLayout bindless_layout;
     /// The descriptor set is pushed with vkCmdPushDescriptorSetKHR; otherwise it is allocated.
     bool push_descriptors{};
     /// Descriptor bindings of every stage in pipeline order, numbered as in the SPIR-V.

@@ -78,6 +78,8 @@ struct ConstBufferAddr {
     IR::U32 element_index{};
     u32 element_offset{};
     u32 element_stride{};
+    bool bindless{};         ///< the handle (`handle`) is only known at run time
+    IR::U32 handle;          ///< with `bindless`: the guest handle word, as the shader computes it
 };
 
 /// Window of 16-byte {u64 address, u32 size, u32 pad} buffer descriptors in the driver bank (c0)

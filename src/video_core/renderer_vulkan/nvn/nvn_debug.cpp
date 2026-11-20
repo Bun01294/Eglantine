@@ -68,6 +68,7 @@ Config Read() {
     config.dump_max = static_cast<u32>(EnvNumber("EDEN_NX2_NVN_DUMP_MAX", 400));
     config.dump_width = static_cast<u32>(EnvNumber("EDEN_NX2_NVN_DUMP_WIDTH", 0));
     config.dump_thumb = static_cast<u32>(EnvNumber("EDEN_NX2_NVN_DUMP_THUMB", 0));
+    config.dump_divisor = (std::max)(static_cast<u32>(EnvNumber("EDEN_NX2_NVN_DUMP_DIVISOR", 1)), 1u);
     config.face = static_cast<u32>(EnvNumber("EDEN_NX2_NVN_FACE", 0));
     config.equal_lequal = EnvFlag("EDEN_NX2_NVN_RELAX_DEPTH_EQUAL");
     config.cache_log = EnvFlag("EDEN_NX2_NVN_CACHE_LOG");
@@ -605,8 +606,12 @@ std::string WriteTga(const PendingDump& dump, std::span<const u8> pixels) {
         }
     }
     std::vector<u8> out(box.size() * 4);
+    const bool is_float = dump.format == VK_FORMAT_R16G16B16A16_SFLOAT ||
+                          dump.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
+                          dump.format == VK_FORMAT_R32G32B32A32_SFLOAT;
+    const float divisor = is_float ? static_cast<float>(Get().dump_divisor) : 1.0f;
     for (size_t i = 0; i < box.size(); ++i) {
-        const float n = static_cast<float>((std::max)(box_count[i], 1u));
+        const float n = static_cast<float>((std::max)(box_count[i], 1u)) * divisor;
         u8* o = out.data() + i * 4;
         o[0] = ToByte(box[i].b / n);
         o[1] = ToByte(box[i].g / n);

@@ -265,12 +265,8 @@ void DrawContext::AppendBindingDump(std::string& text, const PipelineBase& pipe)
         case VC::DescriptorKind::StorageImage: {
             const bool is_image = binding.kind == VC::DescriptorKind::StorageImage;
             for (u32 i = 0; i < binding.count; ++i) {
-                VC::HandleRef texture_ref = binding.texture;
-                VC::HandleRef sampler_ref = binding.sampler;
-                texture_ref.slot += i;
-                texture_ref.byte_offset += i * VC::HandleStride;
-                sampler_ref.slot += i;
-                sampler_ref.byte_offset += i * VC::HandleStride;
+                const VC::HandleRef texture_ref = VC::HandleElement(binding.texture, i);
+                const VC::HandleRef sampler_ref = VC::HandleElement(binding.sampler, i);
                 const u32 texture_word =
                     ReadBindingHandleWord(layout, binding, texture_ref,
                                           is_image ? VC::HandleWordKind::Image
@@ -300,9 +296,28 @@ void DrawContext::AppendBindingDump(std::string& text, const PipelineBase& pipe)
                     if (desc.view_of != 0) {
                         text += fmt::format(" view of t{:x}", desc.view_of);
                     }
+                    if (desc.view.set_levels || desc.view.set_layers) {
+                        text += fmt::format(" view levels {}+{} layers {}+{}",
+                                            desc.view.set_levels ? desc.view.base_level : 0,
+                                            desc.view.set_levels ? desc.view.nlevels : 0,
+                                            desc.view.set_layers ? desc.view.min_layer : 0,
+                                            desc.view.set_layers ? desc.view.nlayers : 0);
+                    }
+                    if (desc.set_swizzle || desc.view.set_swizzle) {
+                        text += fmt::format(" swizzle {:#x}", desc.set_swizzle ? desc.swizzle : 0xa9a);
+                        if (desc.view.set_swizzle) {
+                            text += fmt::format(" view swizzle {} {} {} {}", desc.view.swizzle[0],
+                                                desc.view.swizzle[1], desc.view.swizzle[2],
+                                                desc.view.swizzle[3]);
+                        }
+                    }
+                    if (desc.view.set_format) {
+                        text += fmt::format(" view format {}", desc.view.format);
+                    }
                     if (texture->storage) {
-                        text += fmt::format(" VkFormat {}",
-                                            static_cast<s32>(texture->storage->host.format));
+                        text += fmt::format(" VkFormat {} storage layers {} levels {}",
+                                            static_cast<s32>(texture->storage->host.format),
+                                            texture->storage->layers, texture->storage->levels);
                     }
                 } else {
                     text += " -> no texture";
@@ -329,9 +344,7 @@ void DrawContext::AppendBindingDump(std::string& text, const PipelineBase& pipe)
         case VC::DescriptorKind::UniformTexelBuffer:
             // BuildDescriptors binds a copy of the texture buffer's bytes (TexelBufferView).
             for (u32 i = 0; i < binding.count; ++i) {
-                VC::HandleRef texture_ref = binding.texture;
-                texture_ref.slot += i;
-                texture_ref.byte_offset += i * VC::HandleStride;
+                const VC::HandleRef texture_ref = VC::HandleElement(binding.texture, i);
                 const u32 texture_word =
                     ReadBindingHandleWord(layout, binding, texture_ref, VC::HandleWordKind::Texture)
                         .value_or(0);
@@ -393,7 +406,10 @@ bool DrawContext::ProbeDraw(const PipelineBase& pipe, u32 mode, u32 element_coun
                             u32 used_streams, bool mesh) {
     Probe::DrawInfo info;
     for (u32 stage = 0; stage < Probe::StageCount; ++stage) {
-        info.hashes[stage] = stages[stage].program_serial != 0 ? ProfStageHash(stage) : 0;
+        // A draw runs no compute stage: the one still bound belongs to the last dispatch.
+        info.hashes[stage] = stages[stage].program_serial != 0 && stage != STAGE_COMPUTE
+                                 ? ProfStageHash(stage)
+                                 : 0;
     }
     info.mode = mode;
     info.count = element_count;
@@ -542,6 +558,7 @@ bool DrawContext::ProbeDraw(const PipelineBase& pipe, u32 mode, u32 element_coun
     AppendBindingDump(text, pipe);
     text += '\n';
     Probe::WriteDump(*ticket, text);
+    ProbeNoteImages(fmt::format("{}-{}", ticket->path, ticket->index + 1), u64{2048} * 2048);
     LOG_INFO(Render_Vulkan, "[diag-draw] dump {} of {} of a draw with {:016x}: {}",
              ticket->index + 1, ticket->count, info.hashes[mesh ? 7 : 0], ticket->path);
     return skip;
@@ -590,6 +607,39 @@ void DrawContext::ProbeDispatchDump(const Probe::DumpTicket& ticket, const Pipel
     Probe::WriteDump(ticket, text);
     LOG_INFO(Render_Vulkan, "[diag-draw] dump {} of {} of a dispatch of {:016x}: {}",
              ticket.index + 1, ticket.count, hash, ticket.path);
+}
+
+void DrawContext::ProbeNoteImages(const std::string& prefix, u64 max_texels) {
+    u32 index = 0;
+    for (const DrawPlan::ImageBinding& b : draw_plan.bindings) {
+        ++index;
+        if (b.texture == nullptr || !b.texture->storage) {
+            continue;
+        }
+        const Storage& s = *b.texture->storage;
+        const u64 width = (std::max)(s.extent.width >> b.key.base_level, 1u);
+        const u64 height = (std::max)(s.extent.height >> b.key.base_level, 1u);
+        if (width * height > max_texels || (s.aspect & VK_IMAGE_ASPECT_COLOR_BIT) == 0) {
+            continue;
+        }
+        probe_images.push_back({b.texture->storage, b.key.base_level, b.key.base_layer,
+                                fmt::format("{}-b{}-{}{}-t{:x}-l{}-m{}.tga", prefix, index,
+                                            b.is_image ? "image" : "texture",
+                                            b.scratch ? "-copy" : "", b.texture->serial,
+                                            b.key.base_layer, b.key.base_level)});
+    }
+}
+
+void DrawContext::ProbeFlushImages() {
+    for (ProbeImage& image : probe_images) {
+        Debug::PendingDump pending;
+        pending.path = std::move(image.path);
+        pending.format = image.storage->host.format;
+        pending.thumb_width = 480;
+        host->HostDumpImage(*image.storage, image.level, image.layer, VK_IMAGE_ASPECT_COLOR_BIT,
+                            std::move(pending));
+    }
+    probe_images.clear();
 }
 
 } // namespace Vulkan::Nvn

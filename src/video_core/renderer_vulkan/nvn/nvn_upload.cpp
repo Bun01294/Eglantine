@@ -7,11 +7,16 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <deque>
 #include <mutex>
 #include <span>
 #include <thread>
+
+#include <fmt/format.h>
 
 #include "common/frame_stats.h"
 #include "common/cityhash.h"
@@ -239,6 +244,45 @@ void DecodeBlocks(const HostFormat& host, const BlockInfo& block, std::span<cons
     VideoCommon::DecompressBCn(blocks, out, copy, host.pixel_format);
 }
 
+/// EDEN_NX2_NVN_DUMP_ASTC=<dir>: the base level of every decoded ASTC texture of at least 256
+/// texels (TGA, at most 96 files), named by size, format and order, to look at what the decoder
+/// produced.
+void DumpDecodedLevel(const Storage& s, const UploadPlan& plan, const UploadPiece& piece,
+                      const u8* rgba) {
+    static const char* const directory = std::getenv("EDEN_NX2_NVN_DUMP_ASTC");
+    static std::atomic<u32> written{0};
+    if (directory == nullptr || *directory == 0 || plan.decode != UploadPlan::Decode::Astc ||
+        piece.level != 0 || piece.layer != 0 || piece.width < 256 || piece.slices != 1 ||
+        written.load(std::memory_order_relaxed) >= 96) {
+        return;
+    }
+    const u32 index = written.fetch_add(1, std::memory_order_relaxed);
+    if (index >= 96) {
+        return;
+    }
+    std::error_code error;
+    std::filesystem::create_directories(directory, error);
+    const std::string path = fmt::format("{}/astc-{:03}-{}x{}-fmt{:x}.tga", directory, index,
+                                         piece.width, piece.height, s.desc.format);
+    if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+        const std::array<u8, 18> header{0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                        static_cast<u8>(piece.width & 0xFF),
+                                        static_cast<u8>(piece.width >> 8),
+                                        static_cast<u8>(piece.height & 0xFF),
+                                        static_cast<u8>(piece.height >> 8), 32, 0x28};
+        std::fwrite(header.data(), 1, header.size(), file);
+        std::vector<u8> bgra(static_cast<size_t>(piece.width) * piece.height * 4);
+        for (size_t i = 0; i < bgra.size(); i += 4) {
+            bgra[i] = rgba[i + 2];
+            bgra[i + 1] = rgba[i + 1];
+            bgra[i + 2] = rgba[i];
+            bgra[i + 3] = rgba[i + 3];
+        }
+        std::fwrite(bgra.data(), 1, bgra.size(), file);
+        std::fclose(file);
+    }
+}
+
 UploadPlan PlanStorageUpload(const Storage& s, u64 guest_size) {
     UploadPlan plan;
     const BlockInfo block = FormatBlockInfo(s.desc.format);
@@ -355,6 +399,7 @@ void FillStorageUpload(const Storage& s, const UploadPlan& plan, const u8* guest
         if (plan.decode != UploadPlan::Decode::None) {
             DecodeBlocks(s.host, block, blocks, piece.width, piece.height, piece.slices,
                          std::span<u8>{destination, static_cast<size_t>(piece.staging_size)});
+            DumpDecodedLevel(s, plan, piece, destination);
         }
     };
     // Plain copies are memory-bound and small: only decodes and big unswizzles fan out.

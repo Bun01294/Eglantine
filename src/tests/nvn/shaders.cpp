@@ -328,6 +328,16 @@ TEST_CASE("NVN handle word classification", "[nvn][shaders]") {
     CHECK(ClassifyHandleWord(0, 0x80, T, &tables).source == S::Unsupported); // misaligned in table
     CHECK(ClassifyHandleWord(0, 0x94, I, &tables).source == S::ComputeImage);
     CHECK(ClassifyHandleWord(0, 0x94, I, &tables).slot == 1);
+    // A handle is a pool index whichever table holds it: texture ops on an image-table word and
+    // image ops on a texture-table word resolve to the table that holds the word.
+    CHECK(ClassifyHandleWord(0, 0x94, T, &tables).source == S::ComputeImage);
+    CHECK(ClassifyHandleWord(0, 0x94, T, &tables).slot == 1);
+    CHECK(ClassifyHandleWord(0, 0x84, I, &tables).source == S::ComputeTexture);
+    // Array elements: the next slot of a handle table, the next word of the same uniform buffer.
+    CHECK(HandleElement({S::Combined, 2, HandleBank, 0x30}, 3) ==
+          HandleRef{S::Combined, 5, HandleBank, 0x48});
+    CHECK(HandleElement({S::UniformBuffer, 6, 9, 0x300}, 2) ==
+          HandleRef{S::UniformBuffer, 6, 9, 0x310});
     CHECK(ClassifyHandleWord(0, 0x98, I, &tables).source == S::Unsupported); // misaligned
     CHECK(ClassifyHandleWord(0, 0xa4, I, &tables).source == S::Unsupported); // past the table
     // Handle decoding.

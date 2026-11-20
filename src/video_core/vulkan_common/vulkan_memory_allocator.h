@@ -165,8 +165,8 @@ namespace Vulkan {
                               AllocationKind kind = AllocationKind::Other) const;
 
         vk::Image CreateImage(const VkImageCreateInfo &ci, bool dedicated,
-                              AllocationKind kind) const {
-            return CreateImage(ci, dedicated, false, kind);
+                              AllocationKind kind, bool transient = false) const {
+            return CreateImage(ci, dedicated, transient, kind);
         }
 
         /// A sparse resident image with nothing bound (reads return zero, writes are dropped), or

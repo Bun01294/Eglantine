@@ -54,6 +54,17 @@ struct HandleRef {
     auto operator<=>(const HandleRef&) const = default;
 };
 
+/// Element `index` of the handle array that starts at `ref`: the word 8 bytes further per element.
+/// In a handle table that word is the next slot. In a uniform buffer the slot names the buffer, so
+/// it stays and only the offset moves (an array of handles the game wrote into one buffer).
+[[nodiscard]] constexpr HandleRef HandleElement(HandleRef ref, u32 index) noexcept {
+    ref.byte_offset += index * HandleStride;
+    if (ref.source != HandleSource::UniformBuffer) {
+        ref.slot += index;
+    }
+    return ref;
+}
+
 /// Where a storage buffer's {address, size} pair comes from.
 enum class StorageSource : u8 {
     None,
@@ -129,6 +140,9 @@ struct DescriptorLayout {
     /// A compute program that must run 32 threads per subgroup (the compact tensor helper
     /// shuffles across the warp): its pipeline asks for a required subgroup size of 32.
     bool requires_guest_warp{};
+    /// A stage samples through the replay's bindless table (set Shader::BINDLESS_SET): the
+    /// pipeline layout carries that set and the draw binds it.
+    bool uses_bindless_table{};
     u32 unsupported_count{};
 
     /// True when the pipeline needs push constants (rescaling or render area).

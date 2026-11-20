@@ -257,6 +257,9 @@ struct TextureDescriptor {
     /// Index in Info::handle_programs when the handle is computed at draw time (read from a
     /// storage buffer), ~0 when it is the constant buffer word above.
     u32 handle_program{~0U};
+    /// The shader reads the handle at run time (bindless_table.h): the descriptor names the
+    /// type's table of the replay's bindless set, not a texture of this draw.
+    bool bindless{};
     /// Bytes between the handles of an array's elements when nonzero, instead of
     /// 1 << size_shift (a set-bit indexed table, see ConstBufferAddr::element_stride).
     u32 element_stride{};

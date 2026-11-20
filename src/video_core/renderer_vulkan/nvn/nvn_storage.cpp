@@ -38,8 +38,11 @@ u32 Mip(u32 size, u32 level) {
 } // Anonymous namespace
 
 u64 Context::Impl::PollTick() {
-    // Idle ticks of one ordinary frame (64 ms, ~15 fps): not kept when the next present comes, so
-    // at a steady frame rate the clock moves one tick per present.
+    // Idle ticks of one ordinary frame are not kept when the next present comes, so at a steady
+    // frame rate the clock moves one tick per present. An ordinary frame is up to twice the
+    // recent frame length, and 64 ms at least. With the 64 ms alone every frame below ~15 fps
+    // kept its idle ticks: the clock ran by wall time (~7 ticks per present at 9 fps) and each
+    // present paid the texture checks of ~7 (Ocarina of Time, Hyrule Field).
     constexpr u64 IDLE_FRAME_TICKS = 4;
     const auto now = std::chrono::steady_clock::now();
     const u64 presents = stats.presents.load(std::memory_order_relaxed);
@@ -56,7 +59,13 @@ u64 Context::Impl::PollTick() {
         // stretch counts from the clock as it stands.
         const u64 idle_ticks = poll_tick - poll_tick_at_change;
         const u64 advance = presents > poll_presents_seen ? presents - poll_presents_seen : 0;
-        poll_tick_at_change += advance + (idle_ticks > IDLE_FRAME_TICKS ? idle_ticks : 0);
+        const u64 ordinary = (std::max)(IDLE_FRAME_TICKS, poll_frame_ticks_x8 / 4);
+        // The recent frame length (a stall counts as an ordinary frame at most).
+        const u64 frame_ms = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - poll_last_change).count());
+        const u64 frame_x8 = (std::min)(frame_ms / 2 / (std::max)(advance, u64{1}), ordinary * 8);
+        poll_frame_ticks_x8 = (poll_frame_ticks_x8 * 7 + frame_x8 + 4) / 8;
+        poll_tick_at_change += advance + (idle_ticks > ordinary ? idle_ticks : 0);
         poll_tick = (std::max)(poll_tick, poll_tick_at_change);
         poll_presents_seen = presents;
         poll_last_change = now;
@@ -89,10 +98,11 @@ bool Context::Impl::TakePoolCpuWrites(Pool& pool) {
                 }
             }
             // Textures of the pool must see raw writes even in Mario Kart World; only the mirror
-            // page exception is Mario Kart World specific.
-            ++pool.cpu_write_gen;
-            std::fill(pool.page_write_gen.begin(), pool.page_write_gen.end(),
-                      pool.cpu_write_gen);
+            // page exception is Mario Kart World specific. The store names no page: the textures
+            // lose their full baseline (DetectGuestChange), the pages are not marked written.
+            // Marking every page made each check of each texture of every split pool rehash the
+            // whole texture, at every raw store (Ocarina of Time: ~130 MB hashed per present).
+            pool.raw_write_gen = ++pool.cpu_write_gen;
         }
     }
     std::vector<std::pair<u64, u64>> writebacks;
@@ -266,8 +276,14 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
     const bool tracked = tex_hash_tracked && !watching && !pool.IsVirtual() &&
                          (pool.flags & PoolFlag::CpuNoAccess) == 0 && TakePoolCpuWrites(pool);
     const u32 tracked_gen = pool.cpu_write_gen;
-    if (tracked && !forced && s.cpu_trusted_gen != 0 &&
-        !PoolWrittenSince(pool, s.pool_offset, size, s.cpu_trusted_gen)) {
+    const bool trusted = tracked && !forced && s.cpu_trusted_gen != 0;
+    // A raw store completed since the full compare: it may have written any byte, so the check
+    // below is the one of an untracked texture (signature, full compare when due). Pages the
+    // tracker saw written are still compared first.
+    const bool raw_pending = trusted && pool.raw_write_gen > s.cpu_full_gen;
+    const bool written =
+        trusted && PoolWrittenSince(pool, s.pool_offset, size, s.cpu_trusted_gen);
+    if (trusted && !written && !raw_pending) {
         stats.cpu_checks_trusted.fetch_add(1, std::memory_order_relaxed);
         schedule_unchanged();
         return;
@@ -281,14 +297,13 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
         return Common::CityHash64(reinterpret_cast<const char*>(data + (begin - s.pool_offset)),
                                   static_cast<size_t>(end - begin));
     };
-    if (tracked && !forced && s.cpu_trusted_gen != 0) {
+    if (written) {
         s.wants_page_hashes = true;
     }
     // Some pages were written since the bytes were trusted: compare those pages only. Their old
     // hashes describe the contents (an upload drops them), so a page that differs means the
     // contents are stale, and equal pages mean the bytes are the trusted ones again.
-    if (tracked && !forced && s.cpu_trusted_gen != 0 &&
-        s.page_hashes.size() == last_page - first_page + 1 &&
+    if (written && s.page_hashes.size() == last_page - first_page + 1 &&
         last_page < pool.page_write_gen.size()) {
         std::vector<u8> page_scratch;
         const auto page_begin = std::chrono::steady_clock::now();
@@ -312,18 +327,20 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
                                     std::memory_order_relaxed);
             stats.hash_bytes.fetch_add(rehashed * Pool::MIRROR_PAGE, std::memory_order_relaxed);
             stats.cpu_pages_rehashed.fetch_add(rehashed, std::memory_order_relaxed);
-            if (!differs) {
-                stats.cpu_checks_pages.fetch_add(1, std::memory_order_relaxed);
-                s.cpu_trusted_gen = tracked_gen;
+            if (differs) {
+                stats.cpu_changes.fetch_add(1, std::memory_order_relaxed);
+                s.cpu_trusted_gen = 0;
+                s.page_hashes.clear();
+                s.dynamic = true;
+                s.force_upload = true;
+                return;
+            }
+            stats.cpu_checks_pages.fetch_add(1, std::memory_order_relaxed);
+            s.cpu_trusted_gen = tracked_gen;
+            if (!raw_pending) {
                 schedule_unchanged();
                 return;
             }
-            stats.cpu_changes.fetch_add(1, std::memory_order_relaxed);
-            s.cpu_trusted_gen = 0;
-            s.page_hashes.clear();
-            s.dynamic = true;
-            s.force_upload = true;
-            return;
         }
     }
     // A texture the CPU keeps writing parts of (a glyph atlas) shows new content only in a few
@@ -387,8 +404,14 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
             s.next_full_tick = tick + FULL_VERIFY_PRESENTS;
             // Taken before the bytes were read: a write since shows with a later generation.
             s.cpu_trusted_gen = (!changed && tracked) ? tracked_gen : 0;
-            s.page_hashes.clear();
-            if (s.cpu_trusted_gen != 0 && tex_page_hash && s.wants_page_hashes) {
+            s.cpu_full_gen = s.cpu_trusted_gen;
+            // The bytes are the baseline's again: page hashes taken of it still describe them.
+            const bool pages_current = s.cpu_trusted_gen != 0 &&
+                                       s.page_hashes.size() == last_page - first_page + 1;
+            if (!pages_current) {
+                s.page_hashes.clear();
+            }
+            if (s.cpu_trusted_gen != 0 && tex_page_hash && s.wants_page_hashes && !pages_current) {
                 s.page_hashes.resize(static_cast<size_t>(last_page - first_page + 1));
                 for (u64 page = first_page; page <= last_page; ++page) {
                     s.page_hashes[static_cast<size_t>(page - first_page)] = page_hash(data, page);
@@ -592,6 +615,7 @@ bool Context::Impl::EnsureImage(Storage& s) {
             const char* reason = "the device cannot create a sparse residency image";
             // Shared tile pages (SparseShareEnabled) need SPARSE_ALIASED images.
             s.image = allocator->CreateUnbackedImage(image_info, SparseShareEnabled());
+            ++s.image_gen;
             if (s.image && s.sparse->Attach(*this, s, reason)) {
                 s.current_layout = VK_IMAGE_LAYOUT_UNDEFINED;
                 stats.storages_created.fetch_add(1, std::memory_order_relaxed);
@@ -608,6 +632,7 @@ bool Context::Impl::EnsureImage(Storage& s) {
             s.origin = StorageOrigin::None;
         }
         s.image = allocator->CreateImage(image_info, false, AllocationKind::StorageImage);
+        ++s.image_gen;
     } catch (const vk::Exception& exception) {
         s.image_failed = true;
         stats.textures_failed.fetch_add(1, std::memory_order_relaxed);

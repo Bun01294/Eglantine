@@ -44,6 +44,9 @@ struct HostTranslateInfo {
     bool support_conditional_barrier{}; ///< True when the device supports barriers in conditional
                                         ///< control flow
     bool single_lane_geometry_subgroups{};
+    /// VTX-HLE graphics stages: a bindless texture handle that no per-draw handle program can
+    /// compute is looked up in the replay's bindless table at run time (bindless_table.h).
+    bool nvn_bindless_table{};
     /// VTX-HLE only: a global memory access whose address comes out of a memory load is never
     /// tied to a storage buffer (the search stops at loads); such accesses stay raw global memory
     /// (Profile::support_raw_global_memory).

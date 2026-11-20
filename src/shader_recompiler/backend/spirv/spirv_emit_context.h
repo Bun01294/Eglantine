@@ -47,6 +47,10 @@ struct TextureDefinition {
     u32 count;
     bool is_multisample;
     bool is_integer;
+    /// The array is the replay's bindless table of this type (bindless_table.h): `id` is the
+    /// array of images, indexed with the rebased handle word; `sampled_type` combines one with a
+    /// sampler of `bindless_samplers`.
+    bool bindless{};
 };
 
 struct TextureBufferDefinition {
@@ -462,6 +466,12 @@ public:
 
     // Sirit::Id doesn't play nice with *::set<>
     ::Common::unordered_set<u32> non_uniform_ids;
+
+    /// The sampler array of the bindless table (set BINDLESS_SET, binding 0); unset until a
+    /// bindless texture is declared.
+    Id bindless_samplers{};
+    Id bindless_sampler_type{};
+    Id bindless_sampler_pointer_type{};
 
     bool uses_nonuniform_sampled_image{};
     bool uses_nonuniform_storage_image{};

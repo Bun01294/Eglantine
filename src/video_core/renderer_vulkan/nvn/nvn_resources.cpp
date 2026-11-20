@@ -1242,6 +1242,7 @@ void Context::Impl::DestroyNow(u64 serial) {
     if (const auto it = textures.find(serial); it != textures.end()) {
         std::shared_ptr<Texture> texture = std::move(it->second);
         textures.erase(it);
+        texture_erased[(texture_epoch - 1) % texture_erased.size()] = serial;
         ++texture_epoch;
         // The image views of the draw path go with the texture, after the last submission that
         // used them completed.

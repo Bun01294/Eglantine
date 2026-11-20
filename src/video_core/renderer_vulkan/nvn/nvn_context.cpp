@@ -2379,12 +2379,156 @@ void Context::CollectStats(std::vector<VideoCommon::Nvn::SinkStat>& out) const {
     out.push_back({"raw_global_ranges_dropped", s.raw_global_ranges_dropped});
 }
 
-static void CollapsePendingPoolWrites(std::vector<Context::Impl::PendingPoolWrite>& writes) {
-    if (writes.size() < 4096) {
+namespace {
+
+constexpr u32 PENDING_BLOCK_SHIFT = 14;
+constexpr u64 PENDING_MAX_BLOCKS = 64;
+constexpr size_t PENDING_MAX_WRITES = 4096;
+
+bool PendingLive(const Context::Impl::PendingPoolWrite& write) {
+    return write.end > write.begin;
+}
+
+} // Anonymous namespace
+
+template <typename Visitor>
+bool Context::Impl::VisitPendingPoolWrites(u64 begin, u64 end, Visitor&& visit) const {
+    if (end <= begin || pending_pool_writes.size() == pending_dead) {
+        return false;
+    }
+    const u64 first = begin >> PENDING_BLOCK_SHIFT;
+    const u64 last = (end - 1) >> PENDING_BLOCK_SHIFT;
+    if (last - first >= PENDING_MAX_BLOCKS) {
+        for (u32 index = 0; index < static_cast<u32>(pending_pool_writes.size()); ++index) {
+            if (PendingLive(pending_pool_writes[index]) && visit(index)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    for (const u32 index : pending_wide) {
+        if (visit(index)) {
+            return true;
+        }
+    }
+    for (u64 block = first; block <= last; ++block) {
+        const auto it = pending_blocks.find(block);
+        if (it == pending_blocks.end()) {
+            continue;
+        }
+        for (const u32 index : it->second) {
+            if (visit(index)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void Context::Impl::IndexPendingPoolWrite(u32 index, bool add) {
+    const PendingPoolWrite& write = pending_pool_writes[index];
+    const auto apply = [&](std::vector<u32>& list) {
+        if (add) {
+            list.push_back(index);
+        } else if (const auto it = std::ranges::find(list, index); it != list.end()) {
+            *it = list.back();
+            list.pop_back();
+        }
+    };
+    const u64 first = write.begin >> PENDING_BLOCK_SHIFT;
+    const u64 last = (write.end - 1) >> PENDING_BLOCK_SHIFT;
+    if (last - first >= PENDING_MAX_BLOCKS) {
+        apply(pending_wide);
         return;
     }
-    std::vector<Context::Impl::PendingPoolWrite> collapsed;
-    for (const Context::Impl::PendingPoolWrite& write : writes) {
+    for (u64 block = first; block <= last; ++block) {
+        if (add) {
+            apply(pending_blocks[block]);
+        } else if (const auto it = pending_blocks.find(block); it != pending_blocks.end()) {
+            apply(it->second);
+        }
+    }
+}
+
+void Context::Impl::PushPendingPoolWrite(PendingPoolWrite&& write) {
+    if (!write.inline_bytes.empty()) {
+        ++pending_inline;
+    }
+    // (a write of a submission already passed is dropped by the next prune, as it always was)
+    if (write.seq <= pending_pruned_done) {
+        pending_prune_due = true;
+    }
+    pending_pool_writes.push_back(std::move(write));
+    IndexPendingPoolWrite(static_cast<u32>(pending_pool_writes.size() - 1), true);
+}
+
+void Context::Impl::RemovePendingPoolWrite(u32 index) {
+    PendingPoolWrite& write = pending_pool_writes[index];
+    if (!PendingLive(write)) {
+        return;
+    }
+    IndexPendingPoolWrite(index, false);
+    if (!write.inline_bytes.empty()) {
+        --pending_inline;
+    }
+    write = {};
+    ++pending_dead;
+}
+
+void Context::Impl::RemovePendingPoolWritesWithin(u64 begin, u64 end) {
+    thread_local std::vector<u32> contained;
+    contained.clear();
+    VisitPendingPoolWrites(begin, end, [&](u32 index) {
+        const PendingPoolWrite& write = pending_pool_writes[index];
+        if (write.begin >= begin && write.end <= end) {
+            contained.push_back(index);
+        }
+        return false;
+    });
+    for (const u32 index : contained) {
+        RemovePendingPoolWrite(index);
+    }
+    SettlePendingPoolWrites();
+}
+
+void Context::Impl::SettlePendingPoolWrites() {
+    while (!pending_pool_writes.empty() && !PendingLive(pending_pool_writes.back())) {
+        pending_pool_writes.pop_back();
+        --pending_dead;
+    }
+    if (pending_dead > 64 && pending_dead * 2 > pending_pool_writes.size()) {
+        std::erase_if(pending_pool_writes,
+                      [](const PendingPoolWrite& write) { return !PendingLive(write); });
+        pending_dead = 0;
+        RebuildPendingPoolIndex();
+    }
+}
+
+void Context::Impl::RebuildPendingPoolIndex() {
+    if (pending_blocks.size() > 4 * pending_pool_writes.size() + 1024) {
+        pending_blocks.clear();
+    } else {
+        for (auto& [block, list] : pending_blocks) {
+            list.clear();
+        }
+    }
+    pending_wide.clear();
+    for (u32 index = 0; index < static_cast<u32>(pending_pool_writes.size()); ++index) {
+        if (PendingLive(pending_pool_writes[index])) {
+            IndexPendingPoolWrite(index, true);
+        }
+    }
+}
+
+void Context::Impl::CollapsePendingPoolWrites() {
+    if (pending_pool_writes.size() - pending_dead < PENDING_MAX_WRITES) {
+        return;
+    }
+    std::vector<PendingPoolWrite> collapsed;
+    for (const PendingPoolWrite& write : pending_pool_writes) {
+        if (!PendingLive(write)) {
+            continue;
+        }
         const auto it = std::ranges::find_if(
             collapsed, [&](const auto& hull) { return hull.seq == write.seq; });
         if (it == collapsed.end()) {
@@ -2394,13 +2538,29 @@ static void CollapsePendingPoolWrites(std::vector<Context::Impl::PendingPoolWrit
             it->end = (std::max)(it->end, write.end);
         }
     }
-    writes = std::move(collapsed);
+    pending_pool_writes = std::move(collapsed);
+    pending_dead = 0;
+    pending_inline = 0;
+    pending_prune_due = true;
+    RebuildPendingPoolIndex();
 }
 
 void Context::Impl::PrunePendingPoolWrites() {
+    // Every write kept is of a submission that had not completed when the list was last pruned
+    // (or raised pending_prune_due), so there is nothing to drop until gpu_completed_seq moves.
     const u64 done = gpu_completed_seq.load(std::memory_order_acquire);
-    std::erase_if(pending_pool_writes,
-                  [done](const PendingPoolWrite& write) { return write.seq <= done; });
+    if (done == pending_pruned_done && !pending_prune_due) {
+        return;
+    }
+    pending_pruned_done = done;
+    pending_prune_due = false;
+    for (u32 index = 0; index < static_cast<u32>(pending_pool_writes.size()); ++index) {
+        const PendingPoolWrite& write = pending_pool_writes[index];
+        if (PendingLive(write) && write.seq <= done) {
+            RemovePendingPoolWrite(index);
+        }
+    }
+    SettlePendingPoolWrites();
 }
 
 void Context::Impl::NoteFlushedInlinePoolWrite(u64 address, const u8* data, u64 size, u64 seq) {
@@ -2409,11 +2569,9 @@ void Context::Impl::NoteFlushedInlinePoolWrite(u64 address, const u8* data, u64 
     }
     PrunePendingPoolWrites();
     const u64 end = address + size;
-    std::erase_if(pending_pool_writes, [address, end](const PendingPoolWrite& write) {
-        return write.begin >= address && write.end <= end;
-    });
-    CollapsePendingPoolWrites(pending_pool_writes);
-    pending_pool_writes.push_back(
+    RemovePendingPoolWritesWithin(address, end);
+    CollapsePendingPoolWrites();
+    PushPendingPoolWrite(
         {address, end, seq, std::vector<u8>(data, data + static_cast<size_t>(size))});
 }
 
@@ -2423,88 +2581,117 @@ void Context::Impl::NoteNonInlinePoolWrite(u64 address, u64 size, u64 seq) {
     }
     PrunePendingPoolWrites();
     const u64 end = address + size;
-    std::erase_if(pending_pool_writes, [address, end](const PendingPoolWrite& write) {
-        return write.begin >= address && write.end <= end;
-    });
-    for (PendingPoolWrite& write : pending_pool_writes) {
-        if (!write.inline_bytes.empty() && write.begin < end && address < write.end) {
-            write.inline_bytes.clear();
-        }
+    RemovePendingPoolWritesWithin(address, end);
+    if (pending_inline != 0) {
+        VisitPendingPoolWrites(address, end, [&](u32 index) {
+            PendingPoolWrite& write = pending_pool_writes[index];
+            if (!write.inline_bytes.empty() && write.begin < end && address < write.end) {
+                write.inline_bytes = {};
+                --pending_inline;
+            }
+            return false;
+        });
     }
     if (!pending_pool_writes.empty()) {
+        // (settled above: the last entry is a live write)
         PendingPoolWrite& last = pending_pool_writes.back();
         if (last.seq == seq && last.inline_bytes.empty() && address <= last.end &&
             last.begin <= end) {
+            const u32 index = static_cast<u32>(pending_pool_writes.size() - 1);
+            IndexPendingPoolWrite(index, false);
             last.begin = (std::min)(last.begin, address);
             last.end = (std::max)(last.end, end);
+            IndexPendingPoolWrite(index, true);
             return;
         }
     }
-    CollapsePendingPoolWrites(pending_pool_writes);
-    pending_pool_writes.push_back({address, end, seq, {}});
+    CollapsePendingPoolWrites();
+    PushPendingPoolWrite({address, end, seq, {}});
 }
 
 void Context::Impl::InvalidatePendingInlineBytes(u64 seq) {
     PrunePendingPoolWrites();
+    if (pending_inline == 0) {
+        return;
+    }
     for (PendingPoolWrite& write : pending_pool_writes) {
-        if (seq == 0 || write.seq == seq) {
-            write.inline_bytes.clear();
+        if (!write.inline_bytes.empty() && (seq == 0 || write.seq == seq)) {
+            write.inline_bytes = {};
+            --pending_inline;
         }
     }
 }
 
 void Context::Impl::InvalidatePendingInlineBytesOverlapping(u64 address, u64 size) {
-    if (size == 0 || pending_pool_writes.empty()) {
+    if (size == 0 || pending_pool_writes.size() == pending_dead) {
         return;
     }
     PrunePendingPoolWrites();
-    const u64 end = address + size;
-    for (PendingPoolWrite& write : pending_pool_writes) {
-        if (!write.inline_bytes.empty() && write.begin < end && address < write.end) {
-            write.inline_bytes.clear();
-        }
+    if (pending_inline == 0) {
+        return;
     }
+    const u64 end = address + size;
+    VisitPendingPoolWrites(address, end, [&](u32 index) {
+        PendingPoolWrite& write = pending_pool_writes[index];
+        if (!write.inline_bytes.empty() && write.begin < end && address < write.end) {
+            write.inline_bytes = {};
+            --pending_inline;
+        }
+        return false;
+    });
 }
 
 void Context::Impl::ErasePendingPoolWritesForSeq(u64 seq) {
-    std::erase_if(pending_pool_writes,
-                  [seq](const PendingPoolWrite& write) { return write.seq == seq; });
+    for (u32 index = 0; index < static_cast<u32>(pending_pool_writes.size()); ++index) {
+        const PendingPoolWrite& write = pending_pool_writes[index];
+        if (PendingLive(write) && write.seq == seq) {
+            RemovePendingPoolWrite(index);
+        }
+    }
+    SettlePendingPoolWrites();
 }
 
 bool Context::Impl::NeedsGpuFlushForUniform(u64 begin, u64 end, u64 current_seq) {
-    if (end <= begin || pending_pool_writes.empty()) {
+    if (end <= begin || pending_pool_writes.size() == pending_dead) {
         return false;
     }
     PrunePendingPoolWrites();
-    for (const PendingPoolWrite& write : pending_pool_writes) {
-        if (write.begin < end && begin < write.end &&
-            (write.inline_bytes.empty() || write.seq != current_seq)) {
-            return true;
-        }
-    }
-    return false;
+    return VisitPendingPoolWrites(begin, end, [&](u32 index) {
+        const PendingPoolWrite& write = pending_pool_writes[index];
+        return write.begin < end && begin < write.end &&
+               (write.inline_bytes.empty() || write.seq != current_seq);
+    });
 }
 
 void Context::Impl::ApplyPendingInlineWrites(u64 base_address, u8* dst, u64 size,
                                              u64 current_seq,
                                              std::vector<std::pair<u64, u64>>* written) const {
-    if (size == 0 || dst == nullptr || pending_pool_writes.empty()) {
+    if (size == 0 || dst == nullptr || pending_inline == 0) {
         return;
     }
     const u64 end = base_address + size;
-    for (const PendingPoolWrite& write : pending_pool_writes) {
-        if (write.seq != current_seq || write.inline_bytes.empty()) {
-            continue;
+    // In the order noted: a later update of the same bytes wins.
+    thread_local std::vector<u32> overlapping;
+    overlapping.clear();
+    VisitPendingPoolWrites(base_address, end, [&](u32 index) {
+        const PendingPoolWrite& write = pending_pool_writes[index];
+        if (write.seq == current_seq && !write.inline_bytes.empty() && write.begin < end &&
+            base_address < write.end) {
+            overlapping.push_back(index);
         }
+        return false;
+    });
+    std::ranges::sort(overlapping);
+    const auto repeated = std::ranges::unique(overlapping);
+    overlapping.erase(repeated.begin(), repeated.end());
+    for (const u32 index : overlapping) {
+        const PendingPoolWrite& write = pending_pool_writes[index];
         const u64 lo = (std::max)(write.begin, base_address);
         const u64 hi = (std::min)(write.end, end);
-        if (lo < hi) {
-            std::memcpy(dst + (lo - base_address),
-                        write.inline_bytes.data() + (lo - write.begin),
-                        static_cast<size_t>(hi - lo));
-            if (written != nullptr) {
-                written->emplace_back(lo - base_address, hi - base_address);
-            }
+        std::memcpy(dst + (lo - base_address), write.inline_bytes.data() + (lo - write.begin),
+                    static_cast<size_t>(hi - lo));
+        if (written != nullptr) {
+            written->emplace_back(lo - base_address, hi - base_address);
         }
     }
 }

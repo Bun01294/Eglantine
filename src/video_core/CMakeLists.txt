@@ -265,6 +265,7 @@ add_library(video_core STATIC
     renderer_vulkan/nvn/nvn_draw_clear.cpp
     renderer_vulkan/nvn/nvn_draw_debug.cpp
     renderer_vulkan/nvn/nvn_draw_probe.cpp
+    renderer_vulkan/nvn/nvn_bindless.cpp
     renderer_vulkan/nvn/nvn_draw_descriptors.cpp
     renderer_vulkan/nvn/nvn_draw_indirect.cpp
     renderer_vulkan/nvn/nvn_draw_log.cpp
@@ -723,6 +724,8 @@ if (ENABLE_NVIDIA_DLSS)
         set(STREAMLINE_INCLUDE_DIR "${streamline_SOURCE_DIR}/include")
     endif()
     target_sources(video_core PRIVATE
+        renderer_vulkan/nvn/nvn_game_dlss.cpp
+        renderer_vulkan/nvn/nvn_game_dlss.h
         renderer_vulkan/vk_streamline_dlss.cpp
         renderer_vulkan/vk_streamline_dlss.h
         vulkan_common/streamline.cpp

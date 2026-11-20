@@ -1108,6 +1108,9 @@ bool PipelineCache::Impl::Translate(const TranslateInput& in, TranslateOutput& o
         record.layout.uses_raw_global_memory = programs[stage].info.uses_raw_global_memory;
         record.layout.stores_raw_global_memory = programs[stage].info.stores_raw_global_memory;
         record.layout.raw_stores_written_through = VC::RawStoresWrittenThrough(programs[stage].info);
+        record.layout.uses_bindless_table = std::ranges::any_of(
+            programs[stage].info.texture_descriptors,
+            [](const Shader::TextureDescriptor& desc) { return desc.bindless; });
         record.layout.requires_guest_warp =
             is_compute && tensor_lowering == VideoCommon::NativeTensorLowering::Compact &&
             programs[stage].info.UsesWarpOps();

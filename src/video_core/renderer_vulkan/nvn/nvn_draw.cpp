@@ -1320,6 +1320,9 @@ void DrawContext::EndPass(BreakCause cause) {
         if (Debug::Tracing()) {
             DebugOnPassEnd();
         }
+        if (!probe_images.empty()) [[unlikely]] {
+            ProbeFlushImages();
+        }
         ++counters.pass_breaks;
         ++counters.break_causes[static_cast<size_t>(cause)];
         host->HostMarkWritten();
@@ -2551,6 +2554,11 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
     }
     if (!descriptors_built) {
         ++counters.draws_skipped;
+        return false;
+    }
+    if (active->descriptors.uses_bindless_table && !BindlessPrepare(plan)) {
+        ++counters.draws_skipped;
+        host->HostUnsupported("Draw", "the bindless texture table cannot be created");
         return false;
     }
     // Vertex layout of this draw (rebuilt only when the words or the pipeline's attribute reads

@@ -371,6 +371,8 @@ struct PipelineCache::Impl {
     // --- Vulkan objects -----------------------------------------------------------------------
     struct LayoutObjects {
         vk::DescriptorSetLayout set_layout;
+        /// Set BINDLESS_SET when a stage samples through the table (nvn_bindless.h).
+        vk::DescriptorSetLayout bindless_layout;
         vk::PipelineLayout layout;
         bool push_descriptors{};
         u32 push_constant_size{};

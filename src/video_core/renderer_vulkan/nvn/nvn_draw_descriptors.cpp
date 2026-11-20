@@ -649,7 +649,8 @@ namespace {
 /// Fills the c0 driver bank of a graphics stage. `mesh_dims`: the workgroup counts of the last
 /// 3D mesh-task draw, which the draw macro leaves in the bank (VC::DriverMeshDimsOffset).
 void FillDriverBank(u32 stage, const StageBindings& bindings, std::span<const u8> push_constants,
-                    const std::array<u32, 3>& mesh_dims, u8* out) {
+                    const std::array<u32, 3>& mesh_dims, u32 texture_pool_base,
+                    u32 sampler_pool_base, u8* out) {
     std::memset(out, 0, DRIVER_BANK_SIZE);
     if (stage < VC::ShaderStageCount) {
         const u32 base = VC::StorageBufferBase(static_cast<VC::ShaderStage>(stage));
@@ -671,6 +672,11 @@ void FillDriverBank(u32 stage, const StageBindings& bindings, std::span<const u8
     const float largest_point_size = 2047.0f;
     std::memcpy(out + 0x610, &largest_point_size, sizeof(largest_point_size));
     std::memcpy(out + VC::DriverMeshDimsOffset, mesh_dims.data(), sizeof(mesh_dims));
+    // The bases a shader adds to the handles it reads from memory (bindless_table.h).
+    std::memcpy(out + Shader::BINDLESS_DRIVER_TEXTURE_BASE, &texture_pool_base,
+                sizeof(texture_pool_base));
+    std::memcpy(out + Shader::BINDLESS_DRIVER_SAMPLER_BASE, &sampler_pool_base,
+                sizeof(sampler_pool_base));
 }
 
 /// Fills the c2 handle tables.
@@ -782,7 +788,9 @@ bool DrawContext::ViewKeyOf(const Texture& texture, const Storage& s, Shader::Te
         key.aspect = want_stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
     }
     key.base_level = (std::min)(level_base, s.levels - 1);
-    key.levels = texture.desc.view.set_levels
+    // A view cannot address zero levels or layers: a count of 0 (SetLevels / SetLayers with no
+    // range) is the full range from the base on.
+    key.levels = texture.desc.view.set_levels && texture.desc.view.nlevels != 0
                      ? (std::max<u32>)(1u, (std::min<u32>)(texture.desc.view.nlevels,
                                                            s.levels - key.base_level))
                      : s.levels - key.base_level;
@@ -793,7 +801,9 @@ bool DrawContext::ViewKeyOf(const Texture& texture, const Storage& s, Shader::Te
                         (s.create_flags & VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT) != 0;
     const u32 total_layers =
         s.type == VK_IMAGE_TYPE_3D ? (std::max)(s.extent.depth >> key.base_level, 1u) : s.layers;
-    const u32 layer_total = texture.desc.view.set_layers ? texture.desc.view.nlayers : total_layers;
+    const u32 layer_total = texture.desc.view.set_layers && texture.desc.view.nlayers != 0
+                                ? texture.desc.view.nlayers
+                                : total_layers;
     key.base_layer = (std::min)(layer_base, total_layers - 1);
     const u32 layer_count = (std::max)(1u, (std::min)(layer_total, total_layers - key.base_layer));
     // A storage image view must have the identity swizzle (0 = IDENTITY). A BC4/BC5 stand-in holds
@@ -1240,16 +1250,18 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                             BankCache& cache = driver_banks[stage];
                             const u64 seq = host->HostFlight().seq;
                             const u64 raw_generation = raw_table ? raw_table->generation + 1 : 0;
+                            const u64 pool_bases = u64{texture_pool_base} << 32 | sampler_pool_base;
                             const void* raw_device = raw_table ? raw_table->device.get() : nullptr;
                             if (cache.seq != seq || cache.a != storage_gen[stage] ||
                                 cache.b != push_gen[0] || cache.c != raw_generation ||
                                 cache.d != raw_device || cache.e != mesh_dims_gen ||
-                                cache.f != coverage_ring || cache.g != alias_generation) {
+                                cache.f != coverage_ring || cache.g != alias_generation ||
+                                cache.h != pool_bases) {
                                 u8* pointer = nullptr;
                                 cache.ref = AllocArena(DRIVER_BANK_SIZE, 256, &pointer);
                                 ++counters.driver_bank_uploads;
                                 FillDriverBank(stage, stages[stage], push_constants[0], mesh_dims,
-                                               pointer);
+                                               texture_pool_base, sampler_pool_base, pointer);
                                 if (raw_table != nullptr) {
                                     WriteRawGlobalTable(raw_table->device.get(), coverage_ring,
                                                         std::span<u8>{pointer, DRIVER_BANK_SIZE},
@@ -1263,6 +1275,7 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                                 cache.e = mesh_dims_gen;
                                 cache.f = coverage_ring;
                                 cache.g = alias_generation;
+                                cache.h = pool_bases;
                             }
                             ref = cache.ref;
                         }
@@ -1294,6 +1307,29 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                     break;
                 default: {
                     const u32 slot = binding.slot + i;
+                    const size_t block = binding.stage == VC::ShaderStage::Compute ? 1 : 0;
+                    if (slot + VC::FirstUniformBank == VC::PushConstantBank &&
+                        !push_constants[block].empty() &&
+                        (slot >= stages[stage].uniform.size() ||
+                         stages[stage].uniform[slot].size == 0)) {
+                        // The push constants, where the shader reads them when the game bound
+                        // no uniform buffer there (as the emulated path serves root table 0).
+                        BankCache& cache = push_banks[block];
+                        const u64 seq = host->HostFlight().seq;
+                        if (cache.seq != seq || cache.a != push_gen[block]) {
+                            u8* pointer = nullptr;
+                            cache.ref = AllocArena(VC::PushConstantBankSize, 256, &pointer);
+                            std::memset(pointer, 0, VC::PushConstantBankSize);
+                            std::memcpy(pointer, push_constants[block].data(),
+                                        (std::min<size_t>)(push_constants[block].size(),
+                                                           VC::PushConstantBankSize));
+                            cache.seq = seq;
+                            cache.a = push_gen[block];
+                        }
+                        scratch_buffers.push_back(
+                            {cache.ref.buffer, cache.ref.offset, VC::PushConstantBankSize});
+                        break;
+                    }
                     const SinkSite site{stage, slot};
                     scratch_buffers.push_back(buffer_info(
                         slot < stages[stage].uniform.size() ? stages[stage].uniform[slot]
@@ -1326,12 +1362,8 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
             const size_t first = scratch_images.size();
             bool binding_scaled = false;
             for (u32 i = 0; i < count; ++i) {
-                VC::HandleRef texture_ref = binding.texture;
-                VC::HandleRef sampler_ref = binding.sampler;
-                texture_ref.slot += i;
-                texture_ref.byte_offset += i * VC::HandleStride;
-                sampler_ref.slot += i;
-                sampler_ref.byte_offset += i * VC::HandleStride;
+                const VC::HandleRef texture_ref = VC::HandleElement(binding.texture, i);
+                const VC::HandleRef sampler_ref = VC::HandleElement(binding.sampler, i);
                 const u32 texture_word =
                     ReadBindingHandleWord(layout, binding, texture_ref,
                                           is_image ? VC::HandleWordKind::Image
@@ -2158,6 +2190,9 @@ void DrawContext::FinishImages(DrawPlan& plan) {
 bool DrawContext::PushPlan(PipelineBase& pipe, DrawPlan& plan, VkPipelineBindPoint bind_point) {
     FinishImages(plan);
     vk::CommandBuffer cmd = host->HostCmd();
+    if (pipe.descriptors.uses_bindless_table) {
+        BindlessBind(pipe, bind_point);
+    }
     if (cs_mode == CostSplit::Mode::NoBind && bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS &&
         pipe.layout) [[unlikely]] {
         // The pass's first class draw pushed for this layout: its descriptors and constants stay.

@@ -14,6 +14,8 @@
 #include <string>
 #include <string_view>
 
+#include <fmt/format.h>
+
 #include "common/common_types.h"
 #include "shader_recompiler/stage.h"
 
@@ -24,6 +26,12 @@ constexpr u32 DriverBank = 0;       ///< c0: driver table (storage-buffer descri
 constexpr u32 ProgramBank = 1;      ///< c1: the program's own constant segment (never bound)
 constexpr u32 HandleBank = 2;       ///< c2: texture/sampler/image handle tables
 constexpr u32 FirstUniformBank = 3; ///< c3..: uniform buffers bound by the game (slot = bank - 3)
+
+/// NVN2 shaders read the push-constant block as constant bank 24 (root table 0 of the hardware,
+/// 256 bytes; Maxwell3D::RootTables on the emulated path). The Ampere lowering turns bank 24 into
+/// bank 17, the last one the recompiler has, which games do not bind (uniform slot 14).
+constexpr u32 PushConstantBank = 17;
+constexpr u32 PushConstantBankSize = 0x100;
 
 /// Handle tables inside the handle bank. Every entry is 8 bytes; the handle is the first word.
 constexpr u32 HandleStride = 8;
@@ -301,21 +309,23 @@ struct HandleClassification {
         };
         const bool in_texture = in_table(compute->texture_offset, compute->texture_count);
         const bool in_image = in_table(compute->image_offset, compute->image_count);
-        if (want == HandleWant::Texture && in_texture) {
-            if ((offset - compute->texture_offset) % HandleStride != 0) {
+        // A handle word is an index into the pool whichever table holds it: a shader may sample
+        // (texture op) a handle of its image table, or run image ops on one of its texture table.
+        const bool texture_table = in_texture;
+        if (in_texture || in_image) {
+            const u32 base = texture_table ? compute->texture_offset : compute->image_offset;
+            if ((offset - base) % HandleStride != 0) {
                 return unsupported("misaligned compute handle offset");
             }
-            return {HandleSource::ComputeTexture, (offset - compute->texture_offset) / HandleStride,
+            return {texture_table ? HandleSource::ComputeTexture : HandleSource::ComputeImage,
+                    (offset - base) / HandleStride,
                     {}};
         }
-        if (want == HandleWant::Image && in_image) {
-            if ((offset - compute->image_offset) % HandleStride != 0) {
-                return unsupported("misaligned compute handle offset");
-            }
-            return {HandleSource::ComputeImage, (offset - compute->image_offset) / HandleStride,
-                    {}};
-        }
-        return unsupported("compute handle outside the texture/image tables");
+        return unsupported(fmt::format(
+            "compute handle outside the texture/image tables (textures {}x at {:#x}, images {}x at "
+            "{:#x})",
+            compute->texture_count, compute->texture_offset, compute->image_count,
+            compute->image_offset));
     }
     if (bank == ProgramBank) {
         return unsupported("handle read from the program constant bank");

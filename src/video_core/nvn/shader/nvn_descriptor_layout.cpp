@@ -304,6 +304,11 @@ DescriptorLayout BuildDescriptorLayout(std::span<const StageInfo> stages,
 
         // 5. Textures.
         for (const Shader::TextureDescriptor& desc : info.texture_descriptors) {
+            if (desc.bindless) {
+                // In the table's set, not numbered with the draw's descriptors (as EmitSPIRV).
+                layout.uses_bindless_table = true;
+                continue;
+            }
             auto entry = Make(binding, DescriptorKind::CombinedImageSampler,
                               DescriptorRole::Texture, stage, desc.count);
             entry.type = desc.type;
@@ -312,6 +317,12 @@ DescriptorLayout BuildDescriptorLayout(std::span<const StageInfo> stages,
             entry.is_integer = desc.is_integer;
             if (desc.handle_program != ~0U) {
                 ApplyHandleProgram(entry, info, desc.handle_program);
+            } else if (desc.element_stride != 0) {
+                // A set-bit indexed table (EDEN_NX2_SET_BIT_ARRAYS): its elements are
+                // element_stride bytes apart, not consecutive handle slots.
+                ApplyHandles(entry, HandleResult{.issue = fmt::format(
+                                                     "set-bit handle table (element stride {})",
+                                                     desc.element_stride)});
             } else {
                 ApplyHandles(entry, ResolveHandles(desc.has_secondary, desc.cbuf_index,
                                                    desc.cbuf_offset, desc.shift_left,
