@@ -248,22 +248,83 @@ void DrawContext::BindlessSync(bool force) {
     std::vector<Run> runs;
     std::vector<VkDescriptorImageInfo> infos;
     std::vector<std::shared_ptr<Storage>> storages;
+    storages.reserve(state.storages.size());
     std::array<VkImageView, TEXTURE_BINDINGS + 1> want{};
     std::array<VkImageLayout, TEXTURE_BINDINGS + 1> want_layout{};
+    // The textures erased since the last sync: their node pointers are dead. With more erased
+    // than the ring holds, every entry is looked up again.
+    bool lookup_all = state.entries.empty();
+    if (lookup_all) {
+        state.entries.resize(Shader::BINDLESS_TEXTURE_CAPACITY);
+    }
+    thread_local std::vector<u64> erased;
+    erased.clear();
+    if (!lookup_all) {
+        const u64 erases = impl.texture_epoch - state.entries_epoch;
+        if (erases > impl.texture_erased.size()) {
+            lookup_all = true;
+        } else {
+            for (u64 n = state.entries_epoch - 1; n != impl.texture_epoch - 1; ++n) {
+                erased.push_back(impl.texture_erased[n % impl.texture_erased.size()]);
+            }
+            std::ranges::sort(erased);
+        }
+    }
+    state.entries_epoch = impl.texture_epoch;
+    const u64 erased_min = erased.empty() ? ~u64{0} : erased.front();
+    const u64 erased_max = erased.empty() ? 0 : erased.back();
+    const auto has_data = [](const Storage& s) {
+        // Only what has an image holding the game's data: the table never creates one (a texture
+        // the game registers and never uses would cost its memory).
+        return s.image && !s.image_failed && s.contents_valid && s.samples == VK_SAMPLE_COUNT_1_BIT;
+    };
     for (u32 id = 0; id < count; ++id) {
+        // Pool slot 0 is "no texture" (the rebased handle keeps id 0 at 0).
+        const u64 serial = id != 0 && id < texture_ids.size() ? texture_ids[id] : 0;
+        BindlessState::Entry& entry = state.entries[id];
+        if (!lookup_all && serial == entry.serial) {
+            if (serial == 0) {
+                continue; // (written as the stand-ins when the registration went)
+            }
+            const bool alive =
+                entry.texture != nullptr &&
+                (serial < erased_min || serial > erased_max ||
+                 !std::ranges::binary_search(erased, serial));
+            if (alive) {
+                const Texture& texture = **entry.texture;
+                const Storage* const s = texture.storage.get();
+                if (s == entry.storage &&
+                    (s == nullptr || (s->image_gen == entry.image_gen &&
+                                      s->host.format == entry.format &&
+                                      has_data(*s) == entry.ready &&
+                                      (!entry.ready || ReadLayoutOf(*s) == entry.layout)))) {
+                    if (entry.any) {
+                        storages.push_back(texture.storage);
+                    }
+                    continue;
+                }
+            }
+        }
         for (u32 binding = 1; binding <= TEXTURE_BINDINGS; ++binding) {
             want[binding] = state.dummy[binding];
             want_layout[binding] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         }
-        // Pool slot 0 is "no texture" (the rebased handle keeps id 0 at 0).
-        if (id != 0 && id < texture_ids.size() && texture_ids[id] != 0) {
+        entry = {};
+        entry.serial = serial;
+        if (serial != 0) {
             const std::shared_ptr<Texture>& texture = TextureOfId(id);
+            if (texture) {
+                // (TextureOfId returns the node of Impl::textures)
+                entry.texture = &texture;
+                entry.storage = texture->storage.get();
+            }
             if (texture && texture->storage) {
                 Storage& s = *texture->storage;
-                // Only what has an image holding the game's data: the table never creates one
-                // (a texture the game registers and never uses would cost its memory).
-                if (s.image && !s.image_failed && s.contents_valid &&
-                    s.samples == VK_SAMPLE_COUNT_1_BIT) {
+                entry.image_gen = s.image_gen;
+                entry.format = s.host.format;
+                entry.ready = has_data(s);
+                if (entry.ready) {
+                    entry.layout = ReadLayoutOf(s);
                     const s32 target = texture->desc.view.set_target ? texture->desc.view.target
                                                                      : texture->desc.target;
                     const bool is_integer =
@@ -279,9 +340,11 @@ void DrawContext::BindlessSync(bool force) {
                         }
                         const VkImageView view = resources.GetView(*texture, key);
                         if (!view) {
+                            // (not remembered: the next sync asks for the view again)
+                            entry.texture = nullptr;
                             continue;
                         }
-                        const VkImageLayout layout = ReadLayoutOf(s);
+                        const VkImageLayout layout = entry.layout;
                         for (const u32 klass : {0u, 1u, 2u}) {
                             // Float and depth-compare samplers share the views; an integer
                             // sampler takes only an integer format.
@@ -295,6 +358,7 @@ void DrawContext::BindlessSync(bool force) {
                         any = true;
                     }
                     if (any) {
+                        entry.any = true;
                         storages.push_back(texture->storage);
                     }
                 }
@@ -430,7 +494,8 @@ void DrawContext::BindlessPrime(DrawPlan& plan) {
         state.prime_bytes = 0;
         state.prime_count = 0;
     }
-    if (budget_bytes == 0 || state.prime_count >= BUDGET_COUNT || state.prime_bytes >= budget_bytes) {
+    if (budget_bytes == 0 || state.prime_count >= BUDGET_COUNT || state.prime_bytes >= budget_bytes ||
+        state.prime_exhausted_seq == seq) {
         return;
     }
     const std::vector<u64>& texture_ids = submission->texture_pool_snapshot.Values();
@@ -466,10 +531,15 @@ void DrawContext::BindlessPrime(DrawPlan& plan) {
         state.dirty = true;
         if (++state.prime_count >= BUDGET_COUNT || state.prime_bytes >= budget_bytes) {
             id = id + 1 < count ? id + 1 : 1;
-            break;
+            state.prime_cursor = id;
+            return;
         }
     }
     state.prime_cursor = id;
+    // A whole lap found nothing more to create: the registrations change only between
+    // submissions, so the rest of this one skips the walk. Every bindless draw walked the whole
+    // pool once each texture had its image (Ocarina of Time: ~13% of the replay thread).
+    state.prime_exhausted_seq = seq;
 }
 
 bool DrawContext::BindlessPrepare(DrawPlan& plan) {

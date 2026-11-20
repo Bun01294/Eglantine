@@ -743,6 +743,23 @@ private:
         std::vector<VkSampler> written_samplers;
         /// The storages of the entries that hold an image (their layouts are checked per draw).
         std::vector<std::shared_ptr<Storage>> storages;
+        /// What entry `id` was last written from. While the registration, the texture, its
+        /// storage and that storage's image are the same, the entry holds what it should and the
+        /// sync leaves it (the pool has tens of thousands of registrations; walking each one's
+        /// views at every submission was ~10% of the replay thread in Ocarina of Time).
+        struct Entry {
+            u64 serial{};
+            /// The texture's node of Impl::textures (null: none); dies when the serial is erased.
+            const std::shared_ptr<Texture>* texture{};
+            const Storage* storage{};
+            u32 image_gen{};
+            VkFormat format{};
+            VkImageLayout layout{};
+            bool ready{}; ///< the storage had an image holding the game's data
+            bool any{};   ///< the entry holds a view of it
+        };
+        std::vector<Entry> entries;
+        u64 entries_epoch{}; ///< Impl::texture_epoch the node pointers were checked at
         u64 synced_seq{~u64{0}};
         const void* synced_textures{};
         const void* synced_samplers{};
@@ -757,6 +774,8 @@ private:
         u64 prime_bytes{};
         u32 prime_count{};
         u32 prime_cursor{1};
+        /// Submission whose walk of the pool found nothing left to create (BindlessPrime).
+        u64 prime_exhausted_seq{~u64{0}};
         u32 primed_total{};
     } bindless;
     /// Creates the table on first use; false when the device cannot hold it.

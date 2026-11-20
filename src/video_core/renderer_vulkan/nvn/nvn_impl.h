@@ -178,6 +178,11 @@ struct Pool {
     /// Lets a CPU-sourced texture skip its hash (Storage::cpu_trusted_gen). Replay thread.
     std::vector<u32> page_write_gen;
     u32 cpu_write_gen{1};
+    /// Split pools: `cpu_write_gen` when a completed raw store last may have changed any guest
+    /// byte of the pool past the tracker (0: never). Names no page, so it is kept apart from
+    /// `page_write_gen`: a texture full-compared before it is checked as an untracked one until
+    /// its next full compare (Storage::cpu_full_gen).
+    u32 raw_write_gen{0};
     /// Imported pools: the persistent device-local copy that storage bindings and indirect
     /// arguments use (EDEN_NX2_NVN_POOL_MIRROR, nvn_pool_mirror.h; not Backing::Mirror). Null until
     /// the first use that wants one. Replay thread only.
@@ -265,6 +270,9 @@ inline constexpr u64 DEFAULT_STORAGE_TRIM_AGE_PRESENTS = 0;
 
 struct Storage : std::enable_shared_from_this<Storage> {
     vk::Image image;
+    /// Counts the images made for the storage (EnsureImage): what was derived from `image` (the
+    /// bindless table's entries) is stale when it moved.
+    u32 image_gen{0};
     HostFormat host;
     TextureLayoutDesc desc;
     TextureLayout layout;
@@ -332,6 +340,9 @@ struct Storage : std::enable_shared_from_this<Storage> {
     /// later `page_write_gen`, the CPU did not write it and a check needs no hash
     /// (Impl::tex_hash_tracked).
     u32 cpu_trusted_gen{0};
+    /// The pool's `cpu_write_gen` at the full hash behind `cpu_trusted_gen` (the page compares
+    /// move only that one on). A later Pool::raw_write_gen: bytes no page write names may differ.
+    u32 cpu_full_gen{0};
     /// CityHash64 of the storage's part of each pool page (Pool::MIRROR_PAGE grid, first page at
     /// pool_offset / MIRROR_PAGE), taken with the full hash that set `cpu_trusted_gen`: a check
     /// after a tracked write rehashes only the written pages. Empty: not taken.
@@ -1066,8 +1077,33 @@ struct Context::Impl {
         u64 seq;
         std::vector<u8> inline_bytes;
     };
+    /// In the order noted. A removed write stays as a dead entry (begin == end) until the list is
+    /// compacted, so the positions the index holds stay valid.
     std::vector<PendingPoolWrite> pending_pool_writes;
+    size_t pending_dead{};   ///< dead entries of the list
+    size_t pending_inline{}; ///< live writes that hold inline bytes
+    /// gpu_completed_seq at the last prune, and whether a write at or below it was noted since
+    /// (nothing else can be pruned until it moves).
+    u64 pending_pruned_done{~u64{0}};
+    bool pending_prune_due{false};
+    /// Positions of the live writes by 16 KiB block of their range, and of those spanning too
+    /// many blocks. Kept current with every change: draws ask per uniform binding and note
+    /// several writes each, with thousands of writes pending (a scan of the list per question
+    /// was ~25% of the replay thread in Ocarina of Time).
+    std::unordered_map<u64, std::vector<u32>> pending_blocks;
+    std::vector<u32> pending_wide;
     bool noting_inline_pool_write{false};
+    void IndexPendingPoolWrite(u32 index, bool add);
+    void PushPendingPoolWrite(PendingPoolWrite&& write);
+    void RemovePendingPoolWrite(u32 index);
+    void RemovePendingPoolWritesWithin(u64 begin, u64 end);
+    void SettlePendingPoolWrites();
+    void RebuildPendingPoolIndex();
+    void CollapsePendingPoolWrites();
+    /// visit(position) for each live write that may overlap [begin, end), until it returns true
+    /// (a write may come more than once). The visitor must not add or remove writes.
+    template <typename Visitor>
+    bool VisitPendingPoolWrites(u64 begin, u64 end, Visitor&& visit) const;
     void PrunePendingPoolWrites();
     void NoteFlushedInlinePoolWrite(u64 address, const u8* data, u64 size, u64 seq);
     void NoteNonInlinePoolWrite(u64 address, u64 size, u64 seq);
@@ -1098,6 +1134,9 @@ struct Context::Impl {
     std::unordered_map<u64, u64> last_use; ///< serial -> last seq that retained it
     /// Bumped whenever an entry of `textures` is erased (cached node pointers die).
     u64 texture_epoch{1};
+    /// The serials erased last: erase number n (texture_epoch - 1 when it happened) is at
+    /// n % size. Lets a holder of many node pointers drop only the dead ones.
+    std::array<u64, 4096> texture_erased{};
     /// Bumped when a `storage_index` node is erased (Storage::pool_index).
     u64 storage_index_epoch{1};
     /// Replay thread: recently used (serial -> seq) so that NoteUse of an already noted serial does
@@ -1217,6 +1256,8 @@ struct Context::Impl {
     /// `poll_tick` at the last new present: the idle ticks of the current stretch count from here.
     u64 poll_tick_at_change{0};
     std::chrono::steady_clock::time_point poll_last_change{};
+    /// Recent time between presents in eighths of a tick: what an ordinary frame is (PollTick).
+    u64 poll_frame_ticks_x8{0};
     u64 full_hash_tick{~u64{0}};
     u64 full_hash_bytes{0};
     [[nodiscard]] u64 PollTick();
