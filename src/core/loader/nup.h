@@ -52,10 +52,14 @@ public:
     ResultStatus ReadIcon(std::vector<u8>& buffer) override;
     ResultStatus ReadTitle(std::string& title) override;
     ResultStatus ReadDisplayVersion(std::string& version) override;
+    ResultStatus ReadAddOnContent(std::vector<std::pair<u64, u32>>& out_content) override;
     ResultStatus ReadControlData(FileSys::NACP& control) override;
     ResultStatus ReadNSOModules(Modules& modules) override;
 
 private:
+    /// Base title whose DLC IDs this container's add-on content uses (edition metadata aware).
+    [[nodiscard]] u64 AddonApplicationId() const;
+
     std::unique_ptr<FileSys::NupContainer> nup;
     std::unique_ptr<AppLoader> secondary_loader;
 

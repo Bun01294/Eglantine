@@ -206,10 +206,7 @@ AppLoader::LoadResult AppLoader_NUP::Load(Kernel::KProcess& process, Core::Syste
 
     // Publish only after loading succeeds, before the guest can enumerate content.
     // Switch 2 edition programs can retain their Switch 1 application's DLC IDs.
-    const u64 addon_application_id = nacp_file && nacp_file->GetDLCBaseTitleId() != 0
-                                         ? FileSys::GetBaseTitleID(nacp_file->GetDLCBaseTitleId())
-                                         : base_title_id;
-    FileSys::SetLooseAOC(nup->GetAddonRomFS(addon_application_id));
+    FileSys::SetLooseAOC(nup->GetAddonRomFS(AddonApplicationId()));
 
     system.GetFileSystemController().RegisterProcess(
         process.GetProcessId(), base_title_id,
@@ -293,6 +290,25 @@ ResultStatus AppLoader_NUP::ReadDisplayVersion(std::string& version) {
     }
     // Keep authentic control bytes intact while honoring the selected update and UI overrides.
     version = display_version.empty() ? nacp_file->GetVersionString() : display_version;
+    return ResultStatus::Success;
+}
+
+u64 AppLoader_NUP::AddonApplicationId() const {
+    return nacp_file && nacp_file->GetDLCBaseTitleId() != 0
+               ? FileSys::GetBaseTitleID(nacp_file->GetDLCBaseTitleId())
+               : base_title_id;
+}
+
+ResultStatus AppLoader_NUP::ReadAddOnContent(std::vector<std::pair<u64, u32>>& out_content) {
+    if (nup->GetStatus() != ResultStatus::Success) {
+        return nup->GetStatus();
+    }
+    if (!has_program) {
+        return ResultStatus::ErrorNotInitialized;
+    }
+    for (const auto& package : nup->GetAddonPackages(AddonApplicationId())) {
+        out_content.emplace_back(package.title_id, package.version);
+    }
     return ResultStatus::Success;
 }
 

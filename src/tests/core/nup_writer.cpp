@@ -897,6 +897,25 @@ TEST_CASE("NUP exposes only the newest DLC RomFS for the running application", "
         REQUIRE(nup.GetStatus() == Loader::ResultStatus::Success);
         addons = nup.GetAddonRomFS(TitleId);
         REQUIRE(nup.GetAddonRomFS(0x0400ABCD00030000ULL).empty());
+        // Listing matches the mounted selection without opening any RomFS.
+        const auto packages = nup.GetAddonPackages(TitleId);
+        REQUIRE(packages.size() == 2);
+        REQUIRE(packages[0].title_id == TitleId + 0x1001);
+        REQUIRE(packages[0].version == 65536);
+        REQUIRE(packages[1].title_id == TitleId + 0x1002);
+        REQUIRE(packages[1].version == 0);
+        REQUIRE(nup.GetAddonPackages(0x0400ABCD00030000ULL).empty());
+    }
+    // The loader reports the same selection to frontends listing add-on content.
+    {
+        Loader::AppLoader_NUP loader{real.OpenFile(archive.string(), FileSys::OpenMode::Read)};
+        std::vector<std::pair<u64, u32>> content;
+        REQUIRE(loader.ReadAddOnContent(content) == Loader::ResultStatus::Success);
+        REQUIRE(content.size() == 2);
+        REQUIRE(content[0].first == TitleId + 0x1001);
+        REQUIRE(content[0].second == 65536);
+        REQUIRE(content[1].first == TitleId + 0x1002);
+        REQUIRE(content[1].second == 0);
     }
     // Published RomFS files must retain their backing container after loader teardown.
     REQUIRE(addons.size() == 2);
@@ -947,6 +966,12 @@ TEST_CASE("NUP preserves edition control metadata and legacy DLC ownership", "[n
     const auto data = FileSys::ExtractRomFS(addons[0].second);
     REQUIRE(data);
     REQUIRE(Read(data->GetFile("addon.bin")) == "addon data");
+    // The edition program follows its NACP to the legacy DLC base, not its own title ID.
+    std::vector<std::pair<u64, u32>> content;
+    REQUIRE(loader.ReadAddOnContent(content) == Loader::ResultStatus::Success);
+    REQUIRE(content.size() == 1);
+    REQUIRE(content[0].first == 0x0100ABCD00011001ULL);
+    REQUIRE(content[0].second == 0);
     REQUIRE(StatusAfterPatch(ReadAll(archive), [](std::string& bytes_, u64 toc) {
                 const u64 meta = Le(bytes_, toc + 0x30 + 0x20, 8);
                 REQUIRE(Le(bytes_, meta, 2) == 1); // The first TLV is the NPDM.
