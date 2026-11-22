@@ -561,6 +561,8 @@ TEST_CASE("Ampere FSWZADD.NDV keeps its swizzle", "[video_core][ampere]") {
     REQUIRE(static_cast<bool>(lowered));
     const u64 swizzled = FindMaxwell(lowered, 0x50f8, 48);
     REQUIRE(swizzled != 0);
+    CHECK((swizzled & 0xff) == 12);
+    CHECK(((swizzled >> 8) & 0xff) == 12);
     CHECK(((swizzled >> 20) & 0xff) == 0x49);
     CHECK(((swizzled >> 28) & 0xff) == 0xcc);
 }
@@ -573,10 +575,22 @@ TEST_CASE("Ampere TEX.NDV becomes Maxwell TEX.NDV", "[video_core][ampere]") {
     }};
     const auto lowered = LowerToMaxwell(code);
     REQUIRE(static_cast<bool>(lowered));
+    REQUIRE(lowered.instructions.size() >= 4);
+    CHECK((lowered.instructions[0] >> 48) == 0x5c98);
+    CHECK((lowered.instructions[0] & 0xff) == 250);
+    CHECK(((lowered.instructions[0] >> 20) & 0xff) == 74);
+    CHECK((lowered.instructions[1] >> 48) == 0x5c98);
+    CHECK((lowered.instructions[1] & 0xff) == 251);
+    CHECK(((lowered.instructions[1] >> 20) & 0xff) == 75);
+    CHECK((lowered.instructions[2] >> 48) == 0x5c98);
+    CHECK((lowered.instructions[2] & 0xff) == 252);
+    CHECK(((lowered.instructions[2] >> 20) & 0xff) == 12);
     const u64 tex = FindMaxwell(lowered, 0x30, 58);
     REQUIRE(tex != 0);
     CHECK(((tex >> 28) & 7) == 4); // 3D
     CHECK(((tex >> 35) & 1) == 1); // NDV
+    CHECK(((tex >> 50) & 1) == 0); // DC 0
+    CHECK(((tex >> 54) & 1) == 0); // offset mode 0
 }
 
 TEST_CASE("Ampere MOV with a one-lane quad mask writes only that lane", "[video_core][ampere]") {
