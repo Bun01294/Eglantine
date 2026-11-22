@@ -901,16 +901,18 @@ void GameList::LoadGameDetailsExtras() {
         GameDetailsExtras extras{.program_id = program_id, .path = path};
 
         FileSys::VirtualFile update_raw;
+        std::vector<std::pair<u64, u32>> packed_add_ons;
         if (const auto file = Core::GetGameFileFromPath(vfs_, path.toStdString())) {
             if (const auto loader = Loader::GetLoader(system_, file)) {
                 loader->ReadUpdateRaw(update_raw);
+                loader->ReadAddOnContent(packed_add_ons);
             }
         }
         const FileSys::PatchManager patch_manager{program_id, system_.GetFileSystemController(),
                                                   system_.GetContentProvider()};
         // Same rules as the per-game Add-Ons tab: one update at most is enabled.
         bool has_enabled_update = false;
-        for (const auto& patch : patch_manager.GetPatches(update_raw)) {
+        for (const auto& patch : patch_manager.GetPatches(update_raw, packed_add_ons)) {
             GameAddOn add_on;
             add_on.name = QString::fromStdString(patch.name);
             add_on.version = QString::fromStdString(patch.version);
