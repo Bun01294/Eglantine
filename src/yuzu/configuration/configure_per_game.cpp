@@ -218,7 +218,7 @@ void ConfigurePerGame::LoadFromFile(FileSys::VirtualFile file_) {
     // Which graphics path the game gets decides what the Graphics pages grey out: VTX-HLE only
     // exists for Switch 2 programs, and a running game keeps the path it started on.
     ConfigurationShared::VtxHleGrey& vtx_hle = builder->VtxHle();
-    vtx_hle.SetSwitch2Program(Core::IsSwitch2Program(file, title_id, 0));
+    vtx_hle.SetSwitch2Program(Loader::IsSwitch2Program(file, title_id, 0));
     vtx_hle.SetTargetIsRunningGame(system.IsPoweredOn() &&
                                    title_id == system.GetApplicationProcessProgramID());
     LoadConfiguration();

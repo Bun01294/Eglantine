@@ -136,10 +136,6 @@ struct PerfStatsResults;
 FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
                                          const std::string& path);
 
-/// Whether `file` (program `program_id`, `program_index`) is a Switch 2 program.
-[[nodiscard]] bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id,
-                                    std::size_t program_index);
-
 /// Enumeration representing the return values of the System Initialize and Load process.
 enum class SystemResultStatus : u32 {
     Success,             ///< Succeeded
