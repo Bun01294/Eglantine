@@ -1350,10 +1350,13 @@ void Context::Impl::CompleteMain() {
             counters_engine->Complete(*flight->counters, guest.load(std::memory_order_acquire));
         }
         if (flight->raw_writes) {
-            const u64 next_epoch = split_raw_epoch.fetch_add(1, std::memory_order_release) + 1;
+            const u64 next_epoch = split_raw_epoch.load(std::memory_order_relaxed) + 1;
             if (flight->raw_writes_unaliased) {
+                // Publish unaliased epoch before split_raw_epoch (release) so observing the new
+                // split_raw_epoch (acquire) guarantees observing its unaliased update.
                 split_raw_epoch_unaliased.store(next_epoch, std::memory_order_release);
             }
+            split_raw_epoch.store(next_epoch, std::memory_order_release);
         }
         if (flight->gpu_prof && gpu_profiler) {
             // Timestamps: read after the timeline value was reached, never on the replay thread.

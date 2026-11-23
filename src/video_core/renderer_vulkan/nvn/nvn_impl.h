@@ -343,6 +343,7 @@ struct Storage : std::enable_shared_from_this<Storage> {
     /// while the page tracker watched the pool (0: never). While no page under the storage has a
     /// later `page_write_gen`, the CPU did not write it and a check needs no hash
     /// (Impl::tex_hash_tracked).
+    u64 cpu_trusted_pool{0};
     u32 cpu_trusted_gen{0};
     /// The pool's `cpu_write_gen` at the full hash behind `cpu_trusted_gen` (the page compares
     /// move only that one on). A later Pool::raw_write_gen: bytes no page write names may differ.
@@ -463,6 +464,10 @@ struct InFlight {
     bool submitted{false};
     VkSemaphore semaphore{VK_NULL_HANDLE}; ///< Null: nothing was submitted, complete at once.
     u64 value{};
+    /// Replay thread only: highest timeline value actually accepted by vkQueueSubmit for this
+    /// flight, and whether a batched submit containing a piece of this flight failed.
+    u64 gpu_submitted_value{0};
+    bool failed{false};
 
     std::vector<vk::Buffer> staging;
     vk::Buffer download;
@@ -1611,6 +1616,7 @@ struct Context::Impl {
             VkCommandBuffer cmd{VK_NULL_HANDLE};
             u32 signal_count{0};
             u64 flight_seq{0};
+            InFlight* flight{nullptr};
             VkSemaphore queue_timeline{VK_NULL_HANDLE};
             u64 queue_signal_value{0};
         };

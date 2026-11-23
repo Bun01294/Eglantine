@@ -206,9 +206,9 @@ u64 KeepCpuWritten(std::vector<Range>& ranges, UniformSnapshotPools& pools,
             }
             flush_arm();
 
-            const bool epoch_unchanged =
-                pool.write_epoch &&
-                pool.write_epoch->load(std::memory_order_acquire) == pool.epoch_clean;
+            const u64 cur_epoch =
+                pool.write_epoch ? pool.write_epoch->load(std::memory_order_acquire) : 0;
+            const bool epoch_unchanged = pool.write_epoch && cur_epoch == pool.epoch_clean;
             if (!epoch_unchanged) {
                 u64 sub_first = 0;
                 bool in_sub = false;
@@ -225,9 +225,11 @@ u64 KeepCpuWritten(std::vector<Range>& ranges, UniformSnapshotPools& pools,
                 };
                 for (u64 page = first; page <= last; ++page) {
                     UniformSnapshotPageState& state = cpu.written[page];
-                    if ((state.written == 0 || state.written < recent) &&
-                        state.checked != current_present) {
-                        state.checked = current_present;
+                    const bool stale = state.written == 0 || state.written < recent;
+                    const bool needs_check =
+                        stale && (!pool.write_epoch || state.checked != cur_epoch);
+                    if (needs_check) {
+                        state.checked = cur_epoch;
                         if (!in_sub) {
                             sub_first = page;
                             in_sub = true;

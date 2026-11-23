@@ -452,13 +452,27 @@ void Context::Impl::EnsureBacking(Pool& pool) {
     if (deferred_mirror) {
         std::scoped_lock lock{backing_mutex};
         if (!pool.buffer) {
-            pool.buffer = CreateHostBuffer(pool.size, pool_usage, MemoryUsage::DeviceLocal,
-                                           AllocationKind::PoolBuffer);
-            pool.mirror_pages.assign(
-                static_cast<size_t>((pool.size + Pool::MIRROR_PAGE - 1) / Pool::MIRROR_PAGE),
-                Pool::MirrorPage{});
-            if (!pool.split_runs.empty()) {
-                split_alias_generation.fetch_add(1, std::memory_order_release);
+            try {
+                pool.buffer = CreateHostBuffer(pool.size, pool_usage, MemoryUsage::DeviceLocal,
+                                               AllocationKind::PoolBuffer);
+                pool.mirror_pages.assign(
+                    static_cast<size_t>((pool.size + Pool::MIRROR_PAGE - 1) / Pool::MIRROR_PAGE),
+                    Pool::MirrorPage{});
+                if (!pool.split_runs.empty()) {
+                    split_alias_generation.fetch_add(1, std::memory_order_release);
+                }
+            } catch (const std::exception& exception) {
+                LOG_WARNING(Render_Vulkan,
+                            "[nvn] deferred mirror buffer allocation failed for pool {:#x} "
+                            "({} MiB): {}",
+                            pool.address, pool.size >> 20, exception.what());
+                pool.buffer = {};
+                pool.mirror_pages.clear();
+                pool.backing = Pool::Backing::None;
+                ++pool_generation;
+                if (!pool.split_runs.empty()) {
+                    split_alias_generation.fetch_add(1, std::memory_order_release);
+                }
             }
         }
     }
@@ -1019,10 +1033,11 @@ std::shared_ptr<Texture> Context::Impl::BuildTexture(const VC::TextureDesc& d) {
     }
 
     storage->create_flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-    if (!host->depth && !host->stencil && storage->samples == VK_SAMPLE_COUNT_1_BIT &&
+    if (storage->samples == VK_SAMPLE_COUNT_1_BIT &&
         storage->extent.width == storage->extent.height && storage->layers % 6 == 0 &&
         (target == TexTarget::Cubemap || target == TexTarget::CubemapArray ||
-         (target == TexTarget::Dim2DArray && storage->layers >= 6 && layout.size < (u64{8} << 20)))) {
+         (!host->depth && !host->stencil && target == TexTarget::Dim2DArray &&
+          storage->layers >= 6 && layout.size < (u64{8} << 20)))) {
         storage->create_flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     }
     if (storage->type == VK_IMAGE_TYPE_3D) {

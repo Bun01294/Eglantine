@@ -1009,11 +1009,15 @@ void Recorder::Abort() {
             segment.ended = true;
         }
     }
-    if (submitted_segments != 0) {
+    std::erase_if(impl.submit_batch.entries,
+                  [&](const Context::Impl::SubmitBatch::Entry& e) { return e.flight_seq == flight.seq; });
+    std::erase_if(impl.submit_batch.marks,
+                  [&](const Context::Impl::SubmitBatch::Mark& m) { return m.flight == &flight; });
+    if (flight.gpu_submitted_value != 0) {
         // Early pieces of this submission are on the GPU and use its arena, staging and
         // resources, which a failed flight releases at once: let them finish first.
         const VkSemaphore semaphore = *queue.timeline;
-        const u64 value = segments[submitted_segments - 1].signal_value;
+        const u64 value = flight.gpu_submitted_value;
         const VkSemaphoreWaitInfo wait_info{
             .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
             .pNext = nullptr,
@@ -2119,6 +2123,24 @@ void Recorder::UploadStorage(Storage& s) {
     if (size == 0) {
         return;
     }
+    const bool cpu_visible = pool.IsVirtual() || (pool.flags & PoolFlag::CpuNoAccess) == 0;
+    u64 upload_tracked_pool = 0;
+    u32 upload_tracked_gen = 0;
+    if (cpu_visible && impl.tex_hash_tracked) {
+        // Sample the physical pool's write generation before GuestBytes gathers the data so any
+        // concurrent CPU write after the gather shows a strictly newer generation.
+        Pool* track_pool = &pool;
+        u64 track_offset = s.pool_offset;
+        const bool resolved =
+            !pool.IsVirtual() ||
+            (impl.ResolveVirtualRange(pool, track_offset, size, track_pool, track_offset) &&
+             track_pool != nullptr);
+        if (resolved && (track_pool->flags & PoolFlag::CpuNoAccess) == 0 &&
+            impl.TakePoolCpuWrites(*track_pool)) {
+            upload_tracked_pool = track_pool->serial;
+            upload_tracked_gen = track_pool->cpu_write_gen;
+        }
+    }
     const auto log_begin = std::chrono::steady_clock::now();
     std::vector<u8> scratch;
     const u8* data = impl.GuestBytes(pool, s.pool_offset, size, scratch);
@@ -2143,25 +2165,12 @@ void Recorder::UploadStorage(Storage& s) {
     }
     // Hash before the fill: bytes a decoder rewrites meanwhile must look changed at the next check
     // (the image holds what the fill read, the hash must not describe newer bytes).
-    const bool cpu_visible = pool.IsVirtual() || (pool.flags & PoolFlag::CpuNoAccess) == 0;
     const auto log_planned = std::chrono::steady_clock::now();
     if (cpu_visible) {
-        u32 upload_tracked_gen = 0;
-        if (impl.tex_hash_tracked) {
-            Pool* track_pool = &pool;
-            u64 track_offset = s.pool_offset;
-            const bool resolved =
-                !pool.IsVirtual() ||
-                (impl.ResolveVirtualRange(pool, track_offset, size, track_pool, track_offset) &&
-                 track_pool != nullptr);
-            if (resolved && (track_pool->flags & PoolFlag::CpuNoAccess) == 0 &&
-                impl.TakePoolCpuWrites(*track_pool)) {
-                upload_tracked_gen = track_pool->cpu_write_gen;
-            }
-        }
         const auto begin = std::chrono::steady_clock::now();
         s.guest_hash = HashGuestBytes(data, size);
         s.sample_hash = SampleGuestBytes(data, size, impl.mario_kart_world);
+        s.cpu_trusted_pool = upload_tracked_pool;
         s.cpu_trusted_gen = upload_tracked_gen;
         s.cpu_full_gen = upload_tracked_gen;
         s.page_hashes.clear();
@@ -2363,6 +2372,7 @@ void Recorder::SyncSparse(Storage& s, bool will_overwrite) {
             ++next_tail;
         }
         const StagingRange staging = AllocStaging(total, 64);
+        std::vector<u64> tile_pools(tile_offsets.size(), 0);
         std::vector<u32> tile_gens(tile_offsets.size(), 0);
         if (impl.tex_hash_tracked) {
             for (size_t i = 0; i < tile_offsets.size(); ++i) {
@@ -2373,6 +2383,7 @@ void Recorder::SyncSparse(Storage& s, bool will_overwrite) {
                                              SPARSE_TILE_BYTES, phys, phys_offset) &&
                     phys != nullptr && (phys->flags & PoolFlag::CpuNoAccess) == 0 &&
                     impl.TakePoolCpuWrites(*phys)) {
+                    tile_pools[i] = phys->serial;
                     tile_gens[i] = phys->cpu_write_gen;
                 }
             }
@@ -2410,7 +2421,7 @@ void Recorder::SyncSparse(Storage& s, bool will_overwrite) {
                 .imageExtent = {rect.width, rect.height, 1},
             });
             sparse.SetTileHash(id, hashes[i]);
-            sparse.SetTileVerifiedGen(id, tile_gens[i]);
+            sparse.SetTileVerifiedGen(id, tile_pools[i], tile_gens[i]);
         }
         for (size_t i = 0; i < tail_offsets.size(); ++i) {
             const u32 layer = uploads.tails[first_tail + i];
@@ -6341,6 +6352,7 @@ void Recorder::SubmitSegments(std::span<const VkSemaphore> binary_signals) {
             entry.wait_stages.assign(segment.wait_semaphores.size(), ALL_STAGES);
             entry.cmd = segment.raw;
             entry.flight_seq = flight.seq;
+            entry.flight = &flight;
             entry.queue_timeline = *queue.timeline;
             entry.queue_signal_value = segment.signal_value;
             impl.submit_batch.entries.push_back(std::move(entry));
@@ -6441,6 +6453,10 @@ void Recorder::SubmitSegments(std::span<const VkSemaphore> binary_signals) {
         }
         vk::Check(result);
     }
+    if (count != 0) {
+        flight.gpu_submitted_value =
+            (std::max)(flight.gpu_submitted_value, segments.back().signal_value);
+    }
     if (impl.mario_kart_world && count != 0) {
         impl.mkw_last_submit_semaphore = *queue.timeline;
         impl.mkw_last_submit_value = segments.back().signal_value;
@@ -6486,7 +6502,7 @@ void Recorder::FlushAndWait() {
 }
 
 void Recorder::MaybeSubmitEarly() {
-    if (impl.submit_batch.batching) {
+    if (impl.submit_batch.batching && !Debug::Get().upload_log) {
         return;
     }
     const Debug::Config& config = Debug::Get();
@@ -6580,6 +6596,13 @@ VC::StreamItem::Step SubmissionItem::Advance(bool release) {
         // included), so no guest wait hangs.
         recorder.reset();
         impl.stats.dropped_after_device_loss.fetch_add(1, std::memory_order_relaxed);
+        impl.FailFlight(*flight);
+        return {.done = true, .progressed = true};
+    }
+    if (flight->failed) {
+        // An earlier batched piece of this parked submission failed to submit: abort rather than
+        // resuming past GPU commands that never ran.
+        recorder.reset();
         impl.FailFlight(*flight);
         return {.done = true, .progressed = true};
     }
@@ -6766,6 +6789,12 @@ void Context::Impl::FlushSubmitBatch() {
                 }
                 vk::Check(result);
             }
+            for (const SubmitBatch::Entry& entry : entries) {
+                if (entry.flight) {
+                    entry.flight->gpu_submitted_value =
+                        (std::max)(entry.flight->gpu_submitted_value, entry.queue_signal_value);
+                }
+            }
             if (mario_kart_world) {
                 mkw_last_submit_semaphore = entries.back().queue_timeline;
                 mkw_last_submit_value = entries.back().queue_signal_value;
@@ -6775,6 +6804,11 @@ void Context::Impl::FlushSubmitBatch() {
             }
         }
     } catch (...) {
+        for (const SubmitBatch::Entry& entry : entries) {
+            if (entry.flight) {
+                entry.flight->failed = true;
+            }
+        }
         for (const SubmitBatch::Mark& mark : marks) {
             if (mark.flight) {
                 FailFlight(*mark.flight);

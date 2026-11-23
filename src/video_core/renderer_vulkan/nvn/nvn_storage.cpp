@@ -90,9 +90,11 @@ bool Context::Impl::TakePoolCpuWrites(Pool& pool) {
     if (!pool.split_runs.empty()) {
         // Raw stores reach a split pool's guest bytes past the tracker: once one completed, every
         // page is hashed again before it is trusted (unless write-through alias kept mirrors current).
+        // Load split_raw_epoch (acquire) before split_raw_epoch_unaliased (acquire) to pair with
+        // the completion thread's reverse release store order.
+        const u64 raw_epoch = split_raw_epoch.load(std::memory_order_acquire);
         pool.split_raw_epoch_unaliased_seen =
             split_raw_epoch_unaliased.load(std::memory_order_acquire);
-        const u64 raw_epoch = split_raw_epoch.load(std::memory_order_acquire);
         if (raw_epoch != pool.split_raw_epoch_seen) {
             pool.split_raw_epoch_seen = raw_epoch;
             if (!mario_kart_world) {
@@ -294,6 +296,12 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
     const bool tracked = tex_hash_tracked && !watching && single_physical &&
                          (check_pool->flags & PoolFlag::CpuNoAccess) == 0 &&
                          TakePoolCpuWrites(*check_pool);
+    if (tracked && s.cpu_trusted_pool != check_pool->serial) {
+        s.cpu_trusted_pool = check_pool->serial;
+        s.cpu_trusted_gen = 0;
+        s.cpu_full_gen = 0;
+        s.page_hashes.clear();
+    }
     const u32 tracked_gen = check_pool->cpu_write_gen;
     const bool trusted = tracked && !forced && s.cpu_trusted_gen != 0;
     // A raw store completed since the full compare: it may have written any byte, so the check
@@ -372,8 +380,7 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
     const bool compressed = s.desc.format != 0 && FormatBlockInfo(s.desc.format).width > 1;
     const bool every_check =
         forced || s.dynamic || ((!trusted || written) && size <= SMALL_STORAGE && !compressed);
-    const bool skip_raw_full = compressed && trusted && !written && raw_pending;
-    bool full = every_check || (!skip_raw_full && tick >= s.next_full_tick);
+    bool full = every_check || tick >= s.next_full_tick;
     if (full && !every_check) {
         // The scheduled full compares of the rest share a byte budget per present (a 2 GB texture
         // set has ~20 MB due each present otherwise): one that does not fit stays due and is
@@ -424,6 +431,7 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
             hashed += size;
             s.next_full_tick = tick + FULL_VERIFY_PRESENTS;
             // Taken before the bytes were read: a write since shows with a later generation.
+            s.cpu_trusted_pool = (!changed && tracked) ? check_pool->serial : 0;
             s.cpu_trusted_gen = (!changed && tracked) ? tracked_gen : 0;
             s.cpu_full_gen = s.cpu_trusted_gen;
             // The bytes are the baseline's again: page hashes taken of it still describe them.
@@ -963,7 +971,7 @@ void Context::Impl::MapVirtualNow(u64 pool_serial, const std::vector<VC::Virtual
         return;
     }
     Pool& pool = *found->second;
-    if (mario_kart_world && !mappings.empty()) {
+    if (!mappings.empty()) {
         ++mkw_mapping_generation;
     }
     PoolIndex* const index = [&]() -> PoolIndex* {
@@ -1098,11 +1106,12 @@ void Context::Impl::VerifySparse(Storage& s) {
             TakePoolCpuWrites(*phys)) {
             before_gen = phys->cpu_write_gen;
             const u32 verified_gen = sparse.TileVerifiedGen(id);
-            if (verified_gen != 0 &&
+            const bool same_pool = sparse.TileVerifiedPool(id) == phys->serial;
+            if (same_pool && verified_gen != 0 &&
                 (before_gen == verified_gen ||
                  (phys->raw_write_gen <= verified_gen &&
                   !PoolWrittenSince(*phys, phys_offset, SPARSE_TILE_BYTES, verified_gen)))) {
-                sparse.SetTileVerifiedGen(id, before_gen);
+                sparse.SetTileVerifiedGen(id, phys->serial, before_gen);
                 continue;
             }
         }
@@ -1113,8 +1122,8 @@ void Context::Impl::VerifySparse(Storage& s) {
         if (Common::CityHash64(reinterpret_cast<const char*>(bytes.data()), bytes.size()) !=
             sparse.TileHash(id)) {
             sparse.MarkTileDirty(id);
-        } else if (before_gen != 0) {
-            sparse.SetTileVerifiedGen(id, before_gen);
+        } else if (before_gen != 0 && phys != nullptr) {
+            sparse.SetTileVerifiedGen(id, phys->serial, before_gen);
         }
     }
 }

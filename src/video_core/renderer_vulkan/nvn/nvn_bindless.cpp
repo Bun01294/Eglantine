@@ -314,10 +314,14 @@ void DrawContext::BindlessSync(bool force) {
         entry = {};
         entry.serial = serial;
         if (serial != 0) {
-            const std::shared_ptr<Texture>& texture = TextureOfId(id);
-            if (texture) {
-                // (TextureOfId returns the node of Impl::textures)
-                entry.texture = &texture;
+            const auto tex_it = impl.textures.find(serial);
+            const std::shared_ptr<Texture>* const texture_ptr =
+                tex_it != impl.textures.end() ? &tex_it->second : nullptr;
+            const std::shared_ptr<Texture>& texture =
+                texture_ptr != nullptr ? *texture_ptr : TextureOfId(0);
+            if (texture_ptr != nullptr && texture) {
+                // Stable pointer to the Impl::textures map node (never a replaceable cache slot).
+                entry.texture = texture_ptr;
                 entry.storage = texture->storage.get();
             }
             if (texture && texture->storage) {
