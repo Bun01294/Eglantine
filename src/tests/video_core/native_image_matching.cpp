@@ -135,6 +135,46 @@ TEST_CASE("A single-mip target is level 0 of a single-layer mip chain at the sam
         layered.layer_stride = CalculateLayerStride(layered);
         CHECK_FALSE(IsLayerStrideCompatible(layered, target));
     }
+    SECTION("Different GOB layouts stay separate") {
+        auto other = target;
+        other.maxwell_gob_layout = !chain.maxwell_gob_layout;
+        CHECK_FALSE(IsLayerStrideCompatible(chain, other));
+    }
+}
+
+TEST_CASE("An image starting inside a mip chain matches the mip it starts at",
+          "[video_core][native_image_matching]") {
+    ImageInfo chain;
+    chain.type = ImageType::e2D;
+    chain.format = PixelFormat::R16G16B16A16_FLOAT;
+    chain.size = {64, 64, 1};
+    chain.resources = {.levels = 2, .layers = 1};
+    chain.block = {0, 0, 0};
+    chain.layer_stride = CalculateLayerStride(chain);
+    chain.maybe_unaligned_layer_stride = CalculateLayerSize(chain);
+    const ImageBase chain_image{chain, Address, 0x200000};
+    const u32 mip1 = chain_image.mip_level_offsets[1];
+    REQUIRE(mip1 != 0);
+
+    auto single = chain;
+    single.resources.levels = 1;
+    SECTION("The 32x32 mip itself joins the chain") {
+        single.size = {32, 32, 1};
+        single.layer_stride = CalculateLayerStride(single);
+        single.maybe_unaligned_layer_stride = CalculateLayerSize(single);
+        const auto joined = ResolveOverlap(single, Address + mip1, 0x200000 + mip1, chain_image,
+                                           true, false, false);
+        REQUIRE(joined);
+        CHECK(joined->gpu_addr == Address);
+        CHECK(joined->resources.levels == 2);
+    }
+    SECTION("A 128x128 image whose own mip 1 is 64x64 does not") {
+        single.size = {128, 128, 1};
+        single.layer_stride = CalculateLayerStride(single);
+        single.maybe_unaligned_layer_stride = CalculateLayerSize(single);
+        CHECK_FALSE(ResolveOverlap(single, Address + mip1, 0x200000 + mip1, chain_image, true,
+                                   false, false));
+    }
 }
 
 TEST_CASE("Attachment sub-extents preserve tiled storage and sampled texture dimensions",
